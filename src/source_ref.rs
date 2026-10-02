@@ -37,6 +37,9 @@ pub struct SourceRef {
     pub quality: usize,
     #[serde(with = "serde_regex")]
     pub(crate) pattern: Regex,
+    /// The string form of `pattern`, kept for lnav.
+    #[serde(skip)]
+    pub pattern_str: String,
     pub(crate) args: Vec<FormatArgument>,
     pub(crate) vars: Vec<String>,
 }
@@ -84,6 +87,7 @@ impl SourceRef {
                 name,
                 text,
                 quality,
+                pattern_str: matcher.as_str().to_string(),
                 pattern: matcher,
                 args,
                 vars: vec![],
