@@ -15,12 +15,15 @@ impl CodeSource {
     where
         I: io::Read,
     {
-        let mut buffer = String::new();
-        match input.read_to_string(&mut buffer) {
+        let mut bytes = Vec::new();
+        match input.read_to_end(&mut bytes) {
+            // Source files are not always UTF-8, so replace any invalid sequences instead of
+            // giving up on the whole file.
             Ok(_) => Ok(CodeSource {
                 filename: path.to_string_lossy().to_string(),
                 info,
-                buffer,
+                buffer: String::from_utf8(bytes)
+                    .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned()),
             }),
             Err(err) => Err(LogError::CannotReadSourceFile {
                 path: PathBuf::from(path),

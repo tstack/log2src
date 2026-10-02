@@ -2,7 +2,7 @@ use crate::{CodeSource, QueryResult, SourceLanguage};
 use core::fmt;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
+use std::str::Chars;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum FormatArgument {
@@ -37,8 +37,6 @@ pub struct SourceRef {
     pub quality: usize,
     #[serde(with = "serde_regex")]
     pub(crate) pattern: Regex,
-    #[serde(skip)]
-    pub pattern_str: String,
     pub(crate) args: Vec<FormatArgument>,
     pub(crate) vars: Vec<String>,
 }
@@ -46,7 +44,6 @@ pub struct SourceRef {
 struct MessageMatcher {
     matcher: Regex,
     quality: usize,
-    pattern: String,
     args: Vec<FormatArgument>,
 }
 
@@ -70,7 +67,6 @@ impl SourceRef {
         };
         if let Some(MessageMatcher {
             matcher,
-            pattern,
             mut args,
             quality,
         }) = build_matcher(result.raw, &unquoted, code.info.language)
@@ -89,7 +85,6 @@ impl SourceRef {
                 text,
                 quality,
                 pattern: matcher,
-                pattern_str: pattern,
                 args,
                 vars: vec![],
             })
@@ -100,6 +95,11 @@ impl SourceRef {
 
     pub fn captures<'a>(&self, line: &'a str) -> Option<Captures<'a>> {
         self.pattern.captures(line)
+    }
+
+    /// The regex used to match log messages to this statement.
+    pub fn pattern(&self) -> &Regex {
+        &self.pattern
     }
 }
 
@@ -130,101 +130,200 @@ fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<Mess
     let mut quality = 0;
     for cap in language.get_placeholder_regex().captures_iter(text) {
         let placeholder = cap.get(0).unwrap();
-        let subtext = escape_ignore_newlines(raw, &text[last_end..placeholder.start()]);
+        if !raw && is_unicode_escape(&text[..placeholder.start()]) {
+            // Something like Rust's "\u{1F600}" is an escape and not a placeholder.
+            continue;
+        }
+        let subtext = literal_to_regex(raw, language, &text[last_end..placeholder.start()]);
         quality += subtext.chars().filter(|c| !c.is_whitespace()).count();
         pattern.push_str(subtext.as_str());
         last_end = placeholder.end();
         pattern.push_str("(.+)");
         args.push(language.captures_to_format_arg(&cap));
     }
-    let subtext = escape_ignore_newlines(raw, &text[last_end..]);
+    let subtext = literal_to_regex(raw, language, &text[last_end..]);
     quality += subtext.chars().filter(|c| !c.is_whitespace()).count();
     if quality == 0 {
         None
     } else {
         pattern.push_str(subtext.as_str());
         pattern.push('$');
-        Some(MessageMatcher {
-            matcher: Regex::new(pattern.as_str()).unwrap(),
-            quality,
-            pattern,
-            args,
-        })
+        // A pattern that does not compile is not usable, so skip the log statement.
+        Regex::new(pattern.as_str())
+            .ok()
+            .map(|matcher| MessageMatcher {
+                matcher,
+                quality,
+                args,
+            })
     }
 }
 
-/// Regex for finding values that need to be escaped in a string-literal.  The components are
-/// as follows:
-///
-/// * `[.*+?^${}()|\[\]]` - Characters that are used in regexes and need to be escaped.
-/// * `[\n\r\t]` - White space characters that we should turn into regex escape sequences.
-/// * `\\[0-7]{3}|\\0` - Regex does not support octal escape-sequences, so we need to turn
-///   them into a hex escape.
-/// * `\\N\{[^}]+}` - Python named-Unicode escape that is turned into a `\w` since it would be
-///   challenging to get the names all right.
-static ESCAPE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"([.*+?^${}()|\[\]])|([\n\r\t])|(\\[0-7]{3}|\\0)|(\\N\{[^}]+})"#).unwrap()
-});
+/// Check if the text ends with a `\u` that is not itself escaped.
+fn is_unicode_escape(prefix: &str) -> bool {
+    match prefix.strip_suffix('u') {
+        Some(rest) => (rest.len() - rest.trim_end_matches('\\').len()) % 2 == 1,
+        None => false,
+    }
+}
 
-/// Regex for finding values that need to be escaped in a raw string-literal.  The components are
-/// as follows:
-///
-/// * `[.*+?^${}()|\[\]]` - Characters that are used in regexes and need to be escaped.
-/// * `[\n\r\t]` - White space characters that we should turn into regex escape sequences.
-/// * `\\` - A backslash
-static RAW_ESCAPE_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"([.*+?^${}()|\[\]])|([\n\r\t])|(\\)"#).unwrap());
+/// Append a regex that matches the given character literally.
+fn push_regex_literal(out: &mut String, c: char) {
+    match c {
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '.' | '*' | '+' | '?' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '[' | ']' | '\\' => {
+            out.push('\\');
+            out.push(c);
+        }
+        c if c.is_control() => out.push_str(&format!("\\x{:02X}", c as u32)),
+        c => out.push(c),
+    }
+}
 
-/// Escape special chars except newlines and carriage returns in order to support multiline strings
-fn escape_ignore_newlines(raw: bool, segment: &str) -> String {
-    const HEX_CHARS: [char; 16] = [
-        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
-    ];
-
-    let mut result = String::with_capacity(segment.len() * 2);
-    let mut last_end = 0;
-    let regex = if raw {
-        &RAW_ESCAPE_REGEX
-    } else {
-        &ESCAPE_REGEX
-    };
-    for cap in regex.captures_iter(segment) {
-        let overall_range = cap.get(0).unwrap().range();
-        result.push_str(segment[last_end..overall_range.start].as_ref());
-        last_end = overall_range.end;
-        if let Some(c) = cap.get(1) {
-            result.push('\\');
-            result.push_str(c.as_str());
-        } else if let Some(c) = cap.get(2) {
-            match c.as_str() {
-                "\n" => result.push_str("\\n"),
-                "\r" => result.push_str("\\r"),
-                "\t" => result.push_str("\\t"),
-                _ => unreachable!(),
+/// Consume up to `max` hex digits and return their value, if there were any.
+fn take_hex(chars: &mut Chars, max: usize) -> Option<u32> {
+    let mut value: u32 = 0;
+    let mut count = 0;
+    while count < max {
+        match chars.clone().next().and_then(|c| c.to_digit(16)) {
+            Some(digit) => {
+                value = value.saturating_mul(16).saturating_add(digit);
+                chars.next();
+                count += 1;
             }
-        } else if let Some(c) = cap.get(3) {
-            if raw {
-                result.push('\\');
-                result.push_str(c.as_str());
-            } else {
-                let c = c.as_str();
-                let c = &c[1..];
-                let c = u8::from_str_radix(c, 8).unwrap();
-                result.push('\\');
-                result.push('x');
-                result.push(HEX_CHARS[(c >> 4) as usize]);
-                result.push(HEX_CHARS[(c & 0xf) as usize]);
-            }
-        } else if let Some(_c) = cap.get(4) {
-            // XXX This is the fancy Python "\N{...}" escape sequence.  Ideally, we'd interpret the
-            // name of the escape, but that seems like a lot of work.  So, we'll just match any
-            // character.
-            result.push_str("\\w");
-        } else {
-            unreachable!();
+            None => break,
         }
     }
-    result.push_str(segment[last_end..].as_ref());
+    (count > 0).then_some(value)
+}
+
+/// Decode a `\uXXXX` escape, which Java and Python use for UTF-16 code units, so a surrogate
+/// pair spread across two escapes needs to be combined into one character.
+fn take_utf16_escape(chars: &mut Chars) -> Option<char> {
+    // Java allows any number of 'u's in a unicode escape.
+    while chars.clone().next() == Some('u') {
+        chars.next();
+    }
+    let high = take_hex(chars, 4)?;
+    if (0xD800..0xDC00).contains(&high) {
+        let mut ahead = chars.clone();
+        if ahead.next() == Some('\\') && ahead.next() == Some('u') {
+            if let Some(low @ 0xDC00..0xE000) = take_hex(&mut ahead, 4) {
+                *chars = ahead;
+                return char::from_u32(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00));
+            }
+        }
+    }
+    char::from_u32(high)
+}
+
+/// Convert a segment of a string-literal from the source code into a regex that matches the
+/// text the literal produces at runtime.  Escape sequences are decoded into the characters they
+/// represent and then any characters that are special to regexes are escaped.
+fn literal_to_regex(raw: bool, language: SourceLanguage, segment: &str) -> String {
+    let mut result = String::with_capacity(segment.len() * 2);
+    let mut chars = segment.chars();
+    while let Some(c) = chars.next() {
+        if raw || c != '\\' {
+            push_regex_literal(&mut result, c);
+            continue;
+        }
+        let Some(esc) = chars.next() else {
+            push_regex_literal(&mut result, '\\');
+            break;
+        };
+        let remaining = chars.as_str().len();
+        let decoded = match esc {
+            '\n' | '\r' => {
+                // A line continuation, which does not produce any characters.
+                if esc == '\r' && chars.clone().next() == Some('\n') {
+                    chars.next();
+                }
+                if language == SourceLanguage::Rust {
+                    // Rust also skips the whitespace at the start of the next line.
+                    while chars.clone().next().is_some_and(char::is_whitespace) {
+                        chars.next();
+                    }
+                }
+                continue;
+            }
+            'n' => Some('\n'),
+            'r' => Some('\r'),
+            't' => Some('\t'),
+            'a' if language != SourceLanguage::Rust => Some('\x07'),
+            'b' if language != SourceLanguage::Rust => Some('\x08'),
+            'e' if language == SourceLanguage::Cpp => Some('\x1B'),
+            'f' if language != SourceLanguage::Rust => Some('\x0C'),
+            'v' if matches!(language, SourceLanguage::Cpp | SourceLanguage::Python) => Some('\x0B'),
+            's' if language == SourceLanguage::Java => Some(' '),
+            '0' if language == SourceLanguage::Rust => Some('\0'),
+            '0'..='7' => {
+                let mut value = esc.to_digit(8).unwrap();
+                for _ in 0..2 {
+                    match chars.clone().next().and_then(|c| c.to_digit(8)) {
+                        Some(digit) => {
+                            value = value * 8 + digit;
+                            chars.next();
+                        }
+                        None => break,
+                    }
+                }
+                char::from_u32(value)
+            }
+            'x' if language != SourceLanguage::Java => {
+                // C++ hex escapes consume as many digits as are present.
+                let max = if language == SourceLanguage::Cpp {
+                    8
+                } else {
+                    2
+                };
+                take_hex(&mut chars, max).and_then(char::from_u32)
+            }
+            'u' if language == SourceLanguage::Rust => {
+                let mut ahead = chars.clone();
+                if ahead.next() == Some('{') {
+                    let value = take_hex(&mut ahead, 6);
+                    if ahead.next() == Some('}') {
+                        chars = ahead;
+                    }
+                    value.and_then(char::from_u32)
+                } else {
+                    None
+                }
+            }
+            'u' => take_utf16_escape(&mut chars),
+            'U' if matches!(language, SourceLanguage::Cpp | SourceLanguage::Python) => {
+                take_hex(&mut chars, 8).and_then(char::from_u32)
+            }
+            'N' if language == SourceLanguage::Python && chars.clone().next() == Some('{') => {
+                // The Python named-Unicode escape.  Ideally, we'd interpret the name, but that
+                // seems like a lot of work.  So, we'll just match any character.
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                }
+                result.push('.');
+                continue;
+            }
+            // Python keeps the backslash for unrecognized escapes.
+            _ if language == SourceLanguage::Python && !matches!(esc, '\\' | '\'' | '"') => {
+                push_regex_literal(&mut result, '\\');
+                Some(esc)
+            }
+            _ => Some(esc),
+        };
+        match decoded {
+            Some(c) => push_regex_literal(&mut result, c),
+            // The escape was well-formed, but its value is not a valid character, like a lone
+            // surrogate.  We don't know what the runtime will produce, so match anything.
+            None if chars.as_str().len() != remaining => result.push('.'),
+            // Fall back to treating a malformed escape as literal text.
+            None => push_regex_literal(&mut result, esc),
+        }
+    }
     result
 }
 
@@ -236,10 +335,9 @@ mod tests {
     fn test_build_matcher_needs_escape() {
         let MessageMatcher {
             matcher,
-            pattern: _pat,
             args: _args,
             ..
-        } = build_matcher(false, "{}) {}, {} \\033", SourceLanguage::Rust).unwrap();
+        } = build_matcher(false, "{}) {}, {} \\033", SourceLanguage::Cpp).unwrap();
         assert_eq!(
             Regex::new(r#"(?s)^(.+)\) (.+), (.+) \x1B$"#)
                 .unwrap()
@@ -330,17 +428,73 @@ mod tests {
 
     #[test]
     fn test_build_matcher_raw() {
-        let MessageMatcher { matcher, .. } = build_matcher(
-            true,
-            "Hard-coded \\Windows\\Path",
-            SourceLanguage::Rust,
-        )
-            .unwrap();
+        let MessageMatcher { matcher, .. } =
+            build_matcher(true, "Hard-coded \\Windows\\Path", SourceLanguage::Rust).unwrap();
         assert_eq!(
             Regex::new(r#"(?s)^Hard-coded \\Windows\\Path$"#)
                 .unwrap()
                 .as_str(),
             matcher.as_str()
         );
+    }
+
+    #[test]
+    fn test_literal_to_regex_escapes() {
+        use SourceLanguage::*;
+        let cases: &[(SourceLanguage, &str, &str)] = &[
+            // A C backspace is not a regex word boundary.
+            (Cpp, r"\b%c", r"\x08%c"),
+            (Cpp, r"\a\f\v\e", r"\x07\x0C\x0B\x1B"),
+            (Cpp, r"\x41\x4a", "AJ"),
+            (Cpp, r"\101\0", r"A\x00"),
+            (Cpp, r#"\"quoted\" \\path\?"#, r#""quoted" \\path\?"#),
+            (Cpp, r"\u00e9\U0001F600", "é😀"),
+            (Rust, r"caf\u{e9} \u{1F600}", "café 😀"),
+            (Rust, r"\x41\0", r"A\x00"),
+            (Rust, "one \\\n      two", "one two"),
+            (Java, r"tab\there\s", r"tab\there "),
+            (Java, r"\u00e9 \uuu0041 \uD83D\uDE00", "é A 😀"),
+            (Python, r"\N{BULLET} item", ". item"),
+            (Python, r"C:\dir\x41", r"C:\\dirA"),
+            (Python, "one \\\n  two", "one   two"),
+            // Malformed escapes are treated as literal text.
+            (Rust, r"\u{zz}", "u\\{zz\\}"),
+            (Cpp, r"\xg", "xg"),
+            // Escapes for values that are not valid characters match any character.
+            (Java, r"\uD83D!", ".!"),
+            (Rust, r"\u{110000}x", ".x"),
+            (Cpp, r"\xFFFFFFFF.", r".\."),
+            // Regex meta-characters still get escaped.
+            (
+                Cpp,
+                "a.b*c(d)[e]{f}|^$+?",
+                r"a\.b\*c\(d\)\[e\]\{f\}\|\^\$\+\?",
+            ),
+        ];
+        for (language, input, expected) in cases {
+            assert_eq!(
+                literal_to_regex(false, *language, input),
+                *expected,
+                "input {:?} for {:?}",
+                input,
+                language
+            );
+            assert!(Regex::new(expected).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_build_matcher_backspace_is_not_word_boundary() {
+        let MessageMatcher { matcher, .. } =
+            build_matcher(false, r"\b%c", SourceLanguage::Cpp).unwrap();
+        assert!(!matcher.is_match("zqx1 vwk2 jjq3"));
+        assert!(matcher.is_match("\x08/"));
+    }
+
+    #[test]
+    fn test_build_matcher_rust_unicode_escape() {
+        let MessageMatcher { matcher, .. } =
+            build_matcher(false, r"bullet \u{2022} {}", SourceLanguage::Rust).unwrap();
+        assert!(matcher.is_match("bullet • 42"));
     }
 }

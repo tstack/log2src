@@ -99,11 +99,7 @@ impl SourceHierContent {
                     .filter(|entry| {
                         !is_ignored_dir(&entry.0) && {
                             let child_path = path.join(&entry.0);
-                            let is_dir = entry
-                                .1
-                                .as_ref()
-                                .map(|m| m.is_dir())
-                                .unwrap_or(false);
+                            let is_dir = entry.1.as_ref().map(|m| m.is_dir()).unwrap_or(false);
                             !is_gitignored(gi, &child_path, is_dir)
                         }
                     })
@@ -500,6 +496,30 @@ impl SourceHierTree {
         }
     }
 
+    /// Forget that the file at the given path was scanned so that the next scan reports it as
+    /// a new file again, e.g. after it could not be read.
+    pub fn mark_unscanned(&mut self, path: &Path) {
+        let Ok(sub_path) = path.strip_prefix(&self.root_path) else {
+            return;
+        };
+        let mut node = &mut self.root_node;
+        for component in sub_path.components() {
+            let Component::Normal(name) = component else {
+                return;
+            };
+            node = match &mut node.content {
+                SourceHierContent::Directory { entries } => match entries.get_mut(name) {
+                    Some(child) => child,
+                    None => return,
+                },
+                _ => return,
+            };
+        }
+        if let SourceHierContent::File { .. } = node.content {
+            node.last_scan_time = None;
+        }
+    }
+
     pub fn find_file(&self, path: &Path) -> Vec<(PathBuf, SourceFileInfo)> {
         let path_to_find = if path.is_absolute() {
             match path.strip_prefix(&self.root_path) {
@@ -645,6 +665,39 @@ mod test {
         tree.sync();
         let deleted_dir_events: Vec<ScanEvent> = tree.scan().map(redact_event).collect();
         assert_yaml_snapshot!(deleted_dir_events);
+    }
+
+    #[test]
+    fn test_mark_unscanned() {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let root = temp_dir.path();
+        fs::create_dir(root.join("src")).unwrap();
+        File::create(root.join("src/main.rs"))
+            .unwrap()
+            .write(b"fn main() {}")
+            .unwrap();
+        File::create(root.join("src/lib.rs"))
+            .unwrap()
+            .write(b"fn lib() {}")
+            .unwrap();
+
+        let mut tree = SourceHierTree::from(root);
+        tree.sync();
+        assert_eq!(tree.scan().count(), 2);
+        assert_eq!(tree.scan().count(), 0);
+
+        let main_path = root.join("src/main.rs");
+        tree.mark_unscanned(&main_path);
+        tree.mark_unscanned(&root.join("src/missing.rs"));
+        tree.mark_unscanned(Path::new("/elsewhere/main.rs"));
+        let paths: Vec<PathBuf> = tree
+            .scan()
+            .map(|event| match event {
+                ScanEvent::NewFile(path, _) => path,
+                ScanEvent::DeletedFile(path, _) => panic!("unexpected delete of {:?}", path),
+            })
+            .collect();
+        assert_eq!(paths, vec![main_path]);
     }
 
     #[test]

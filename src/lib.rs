@@ -3,7 +3,7 @@ use indicatif::HumanBytes;
 use itertools::Itertools;
 use miette::Diagnostic;
 use rayon::prelude::*;
-use regex::{Captures, Regex, RegexSet};
+use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -22,12 +22,14 @@ use tree_sitter::Language;
 
 mod code_source;
 mod log_format;
+mod prefilter;
 mod progress;
 mod source_hier;
 mod source_query;
 mod source_ref;
 
 // TODO: doesn't need to be exposed if we can clean up the arguments to do_mapping
+use crate::prefilter::Prefilter;
 use crate::progress::WorkGuard;
 use crate::source_hier::{ScanEvent, SourceFileID, SourceHierContent, SourceHierTree};
 use crate::source_ref::{CallSite, FormatArgument};
@@ -140,7 +142,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "1")]
+    #[serde(rename = "2")]
     Current,
 }
 
@@ -175,34 +177,9 @@ pub struct StatementsInFile {
     pub path: String,
     id: SourceFileID,
     pub log_statements: Vec<SourceRef>,
-    /// A single matcher for all log statements.
-    /// XXX If there are too many in the file, the RegexSet constructor
-    /// will fail with CompiledTooBig. We should probably fall back to
-    /// manually trying each one at that point...
-    #[serde(skip)]
-    pub matcher: Option<RegexSet>,
 }
 
 impl StatementsInFile {
-    /// When loading from the cache, we need to fill in the pattern string and populate the
-    /// RegexSet matcher.
-    fn try_creating_matcher(&mut self) {
-        for stmt in self.log_statements.iter_mut() {
-            if stmt.pattern_str.is_empty() {
-                stmt.pattern_str = stmt.pattern.to_string();
-            }
-        }
-        if self.matcher.is_some() {
-            return;
-        }
-        let patterns = self
-            .log_statements
-            .iter()
-            .map(|s| s.pattern_str.as_str())
-            .collect::<Vec<&str>>();
-        self.matcher = RegexSet::new(&patterns).ok();
-    }
-
     fn to_lookup_pair(&self) -> Option<(String, SourceFileID)> {
         PATH_TO_NAME_REGEX
             .captures(&self.path)
@@ -222,6 +199,47 @@ pub struct SourceTree {
     /// to the source file IDs to speed up matches.
     #[serde(skip)]
     pub file_name_to_sources: HashMap<String, Vec<SourceFileID>>,
+    /// Finds the candidate statements for a log message, rebuilt after loading/extracting.
+    #[serde(skip)]
+    prefilter: Option<Prefilter>,
+}
+
+impl SourceTree {
+    fn rebuild_prefilter(&mut self) {
+        self.prefilter = Some(Prefilter::new(self.files_with_statements.values()));
+    }
+
+    /// Find the highest quality statement that matches the given log message.
+    fn find_best_match(&self, log_ref: &LogRef) -> Option<&SourceRef> {
+        let prefilter = self.prefilter.as_ref()?;
+        let body = log_ref.body();
+        let filename = match log_ref.details {
+            Some(LogDetails {
+                file: Some(filename),
+                ..
+            }) => Some(filename),
+            _ => None,
+        };
+        let file_ids = filename.and_then(|name| self.file_name_to_sources.get(name));
+        let mut candidates: Vec<&SourceRef> = Vec::new();
+        prefilter.candidates(body, |(file_id, index)| {
+            let Some(sif) = self.files_with_statements.get(&file_id) else {
+                return;
+            };
+            let in_file = match (filename, file_ids) {
+                (None, _) => true,
+                (Some(_), Some(ids)) => ids.contains(&file_id),
+                (Some(name), None) => sif.path.contains(name),
+            };
+            if in_file {
+                candidates.extend(sif.log_statements.get(index));
+            }
+        });
+        candidates.sort_by(|lhs, rhs| rhs.quality.cmp(&lhs.quality));
+        candidates
+            .into_iter()
+            .find(|src_ref| src_ref.pattern.is_match(body))
+    }
 }
 
 /// Collection of root paths to their tree of source files
@@ -243,6 +261,8 @@ fn to_cached_name(path: &Path) -> String {
 pub struct ExtractLogSummary {
     pub deleted: u64,
     pub new: u64,
+    /// Problems encountered while reading source files.
+    pub errors: Vec<LogError>,
 }
 
 impl ExtractLogSummary {
@@ -282,7 +302,6 @@ impl LogMatcher {
                     source: Arc::new(err),
                 })?;
         for sif in decoded_root.files_with_statements.values_mut() {
-            sif.try_creating_matcher();
             sif.to_lookup_pair().into_iter().for_each(|(name, sid)| {
                 decoded_root
                     .file_name_to_sources
@@ -291,6 +310,7 @@ impl LogMatcher {
                     .push(sid);
             });
         }
+        decoded_root.rebuild_prefilter();
         Ok(decoded_root)
     }
 
@@ -406,6 +426,7 @@ impl LogMatcher {
                     tree: SourceHierTree::from(&path),
                     files_with_statements: HashMap::new(),
                     file_name_to_sources: HashMap::new(),
+                    prefilter: None,
                 });
         }
         Ok(())
@@ -462,18 +483,26 @@ impl LogMatcher {
         tracker.begin_step("Extracting log statements".to_string());
         self.roots.iter_mut().for_each(|(_path, coll)| {
             let guard = tracker.doing_work(coll.tree.stats().files as u64, "files".to_string());
+            let mut unreadable: Vec<PathBuf> = Vec::new();
             for event_chunk in &coll.tree.scan().chunks(10) {
                 let sources = event_chunk
                     .flat_map(|event| match event {
                         ScanEvent::NewFile(path, info) => {
-                            retval.new += 1;
-                            match File::open(&path) {
-                                Ok(file) => match CodeSource::new(&path, info, file) {
-                                    Ok(cs) => Some(cs),
-                                    Err(_) => todo!(),
-                                },
-                                Err(_) => {
-                                    todo!()
+                            let res = File::open(&path)
+                                .map_err(|err| LogError::CannotReadSourceFile {
+                                    path: path.clone(),
+                                    source: Arc::new(err),
+                                })
+                                .and_then(|file| CodeSource::new(&path, info, file));
+                            match res {
+                                Ok(cs) => {
+                                    retval.new += 1;
+                                    Some(cs)
+                                }
+                                Err(err) => {
+                                    retval.errors.push(err);
+                                    unreadable.push(path);
+                                    None
                                 }
                             }
                         }
@@ -496,6 +525,11 @@ impl LogMatcher {
                         coll.files_with_statements.insert(sif.id, sif);
                     });
             }
+            // The scan marked these as done, but they need to be retried on the next run.
+            unreadable
+                .iter()
+                .for_each(|path| coll.tree.mark_unscanned(path));
+            coll.rebuild_prefilter();
         });
         tracker.end_step(format!(
             "{} found",
@@ -511,83 +545,45 @@ impl LogMatcher {
 
     /// Attempt to match the given log message.
     pub fn match_log_statement<'a>(&self, log_ref: &LogRef<'a>) -> Option<LogMapping<'a>> {
-        for (_path, coll) in &self.roots {
-            let matches = if let Some(LogDetails {
-                file: Some(filename),
-                body: Some(body),
+        self.roots
+            .values()
+            .find_map(|coll| coll.find_best_match(log_ref))
+            .map(|src_ref| self.to_log_mapping(log_ref, src_ref))
+    }
+
+    #[doc(hidden)]
+    pub fn rebuild_prefilters(&mut self) {
+        self.roots
+            .values_mut()
+            .for_each(SourceTree::rebuild_prefilter);
+    }
+
+    /// Iterate over all of the log statements that were found.
+    pub fn statements(&self) -> impl Iterator<Item = &SourceRef> {
+        self.roots
+            .values()
+            .flat_map(|coll| coll.files_with_statements.values())
+            .flat_map(|sif| sif.log_statements.iter())
+    }
+
+    fn to_log_mapping<'a>(&self, log_ref: &LogRef<'a>, src_ref: &SourceRef) -> LogMapping<'a> {
+        let exception_trace = match log_ref {
+            LogRef {
+                details:
+                    Some(LogDetails {
+                        trace: Some(trace), ..
+                    }),
                 ..
-            }) = log_ref.details
-            {
-                if let Some(sources) = coll.file_name_to_sources.get(filename) {
-                    sources
-                        .iter()
-                        .flat_map(|path| coll.files_with_statements.get(path))
-                        .flat_map(|stmts| {
-                            let file_matches =
-                                stmts.matcher.as_ref().expect("have RegexSet").matches(body);
-                            match file_matches.iter().next() {
-                                None => None,
-                                Some(index) => stmts.log_statements.get(index),
-                            }
-                        })
-                        .collect::<Vec<&SourceRef>>()
-                } else {
-                    // XXX this block and the else are basically the same, try to refactor
-                    coll.files_with_statements
-                        .values()
-                        .filter(|stmts| stmts.path.contains(filename))
-                        .flat_map(|stmts| {
-                            let file_matches =
-                                stmts.matcher.as_ref().expect("have RegexSet").matches(body);
-                            match file_matches.iter().next() {
-                                None => None,
-                                Some(index) => stmts.log_statements.get(index),
-                            }
-                        })
-                        .collect::<Vec<&SourceRef>>()
-                }
-            } else {
-                coll.files_with_statements
-                    .par_iter()
-                    .flat_map(|src_ref_coll| {
-                        let file_matches = src_ref_coll
-                            .1
-                            .matcher
-                            .as_ref()
-                            .expect("have RegexSet")
-                            .matches(log_ref.body());
-                        match file_matches.iter().next() {
-                            None => None,
-                            Some(index) => src_ref_coll.1.log_statements.get(index),
-                        }
-                    })
-                    .collect::<Vec<&SourceRef>>()
-            };
-            if let Some(src_ref) = matches
-                .iter()
-                .sorted_by(|lhs, rhs| rhs.quality.cmp(&lhs.quality))
-                .next()
-            {
-                let exception_trace = match log_ref {
-                    LogRef {
-                        details:
-                            Some(LogDetails {
-                                trace: Some(trace), ..
-                            }),
-                        ..
-                    } => trace.to_exception_trace(self),
-                    _ => Vec::new(),
-                };
-                let variables = extract_variables(log_ref, src_ref);
-                return Some(LogMapping {
-                    log_ref: log_ref.clone(),
-                    src_ref: Some((*src_ref).clone()),
-                    variables,
-                    exception_trace,
-                });
-            }
+            } => trace.to_exception_trace(self),
+            _ => Vec::new(),
+        };
+        let variables = extract_variables(log_ref, src_ref);
+        LogMapping {
+            log_ref: log_ref.clone(),
+            src_ref: Some(src_ref.clone()),
+            variables,
+            exception_trace,
         }
-        None
     }
 }
 
@@ -744,9 +740,11 @@ impl SourceLanguage {
                             (argument_list (template_expression
                                 template_argument: (string_literal) @arguments))
                             (argument_list . (string_literal) @arguments)
+                            ; java.util.logging's log(Level, String, ...) or a SLF4J Marker
+                            (argument_list . [(field_access) (identifier)] . (string_literal) @arguments)
                         ]
                         (#match? @object-name "log(ger)?|LOG(GER)?")
-                        (#match? @method-name "fine|debug|info|warn|trace|error")
+                        (#match? @method-name "^log$|fine|debug|info|warn|trace|error")
                     )
                 "#
             }
@@ -1092,7 +1090,12 @@ pub fn extract_variables<'a>(log_ref: &LogRef<'a>, src_ref: &'a SourceRef) -> Ve
                     .unwrap_or("<unknown>")
                     .to_string(),
                 FormatArgument::Placeholder => {
-                    let res = src_ref.vars[placeholder_index].to_string();
+                    let res = src_ref
+                        .vars
+                        .get(placeholder_index)
+                        .map(|s| s.as_str())
+                        .unwrap_or("<unknown>")
+                        .to_string();
 
                     placeholder_index += 1;
                     res
@@ -1153,14 +1156,11 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
             if matched.is_empty() {
                 None
             } else {
-                let mut sif = StatementsInFile {
+                Some(StatementsInFile {
                     path: matched.first().unwrap().source_path.clone(),
                     id: code.info.id,
                     log_statements: matched,
-                    matcher: None,
-                };
-                sif.try_creating_matcher();
-                Some(sif)
+                })
             }
         })
         .collect()
@@ -1414,6 +1414,38 @@ fn main() {
                 value: "JvmPauseMonitor-n0".to_string()
             },]
         );
+    }
+
+    const TEST_JUL_SRC: &str = r#"""
+  void load(ClassLoader cl, Exception e) {
+    LOGGER.log(Level.FINE, "Loading driver configuration via classloader {0}", cl);
+    LOGGER.log(Level.WARNING, "Unexpected interrupt while executing onClean", e);
+    LOGGER.isLoggable(Level.FINE);
+    LOG.info("not a {}", "statement");
+  }
+"""#;
+
+    #[test]
+    fn test_extract_java_util_logging() {
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.java"), TEST_JUL_SRC);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        assert_eq!(src_refs.len(), 3);
+        assert_eq!(src_refs[2].text, r#""not a {}""#);
+        let line = "Loading driver configuration via classloader jdk.internal.loader";
+        let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+        assert_eq!(link_to_source(&log_ref, &src_refs), Some(&src_refs[0]));
+        let vars = extract_variables(&log_ref, &src_refs[0]);
+        assert_eq!(
+            vars,
+            vec![VariablePair {
+                expr: "cl".to_string(),
+                value: "jdk.internal.loader".to_string()
+            },]
+        );
+        assert_eq!(src_refs[1].line_no, 4);
     }
 
     const CPP_SOURCE: &str = r#"

@@ -299,7 +299,11 @@ fn main() -> miette::Result<()> {
         .discover_sources(&tracker)
         .into_iter()
         .for_each(|err| eprintln!("{:?}", Report::new(err)));
-    let extract_summary = log_matcher.extract_log_statements(&tracker);
+    let mut extract_summary = log_matcher.extract_log_statements(&tracker);
+    extract_summary
+        .errors
+        .drain(..)
+        .for_each(|err| eprintln!("{:?}", Report::new(err)));
     if log_matcher.is_empty() {
         return Err(LogError::NoLogStatements.into());
     }
