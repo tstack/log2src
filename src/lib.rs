@@ -142,7 +142,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "4")]
+    #[serde(rename = "5")]
     Current,
 }
 
@@ -758,7 +758,8 @@ impl SourceLanguage {
                         (expression_statement
                             (call_expression
                                 function: (_) @fname
-                                arguments: (argument_list (string_literal) @arguments)
+                                arguments: (argument_list
+                                    [(string_literal) (concatenated_string)] @arguments)
                             )
                         )
                         (#not-match? @fname "snprintf|sprintf")
@@ -1127,7 +1128,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
             for result in results {
                 // println!("node.kind()={:?} range={:?}", result.kind, result.range);
                 match result.kind.as_str() {
-                    "string_literal" | "string" => {
+                    "string_literal" | "string" | "concatenated_string" => {
                         accepting_args = false;
                         if let Some(src_ref) = SourceRef::new(code, result) {
                             matched.push(src_ref);
@@ -1476,7 +1477,8 @@ fn main() {
 
     #[test]
     fn test_rejected_literal_args_are_dropped() {
-        let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_REJECTED_LITERAL_SOURCE);
+        let code =
+            CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_REJECTED_LITERAL_SOURCE);
         let src_refs = extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
@@ -1510,6 +1512,37 @@ fn main() {
             log_warning("positive line %d", line);
     }
     "#;
+
+    const CPP_CONCAT_SOURCE: &str = r#"
+    void open_href(const char* path, unsigned long line, uint64_t size) {
+        log_info(
+            "Opening href with external editor: "
+            "%s:%lu:%lu",
+            path,
+            line,
+            0);
+        log_debug("read %" PRIu64 " bytes", size);
+        log_debug("unknown " SOME_MACRO " text", size);
+    }
+    "#;
+
+    #[test]
+    fn test_cpp_concatenated_string() {
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_CONCAT_SOURCE);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        assert_eq!(src_refs.len(), 2);
+        assert_eq!(
+            src_refs[0].pattern().as_str(),
+            "(?s)^Opening href with external editor: (.+):(.+):(.+)$"
+        );
+        assert_eq!((src_refs[0].line_no, src_refs[0].end_line_no), (4, 8));
+        assert_eq!(src_refs[0].vars, vec!["path", "line", "0"]);
+        assert_eq!(src_refs[1].pattern().as_str(), "(?s)^read (.+) bytes$");
+        assert_eq!(src_refs[1].vars, vec!["size"]);
+    }
 
     #[test]
     fn test_cpp_nested_statements() {

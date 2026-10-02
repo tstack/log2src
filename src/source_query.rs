@@ -50,14 +50,21 @@ impl<'a> SourceQuery<'a> {
             let mut got_string_literal = false;
             for capture in m.captures {
                 let mut child = capture.node;
+                let mut concat_pattern = None;
                 match child.kind() {
-                    "string_literal" | "string" => {
+                    "string_literal" | "string" | "concatenated_string" => {
                         if self.source_language == SourceLanguage::Cpp
                             && !Self::in_function_body(child)
                         {
                             // Calls at file scope are macros like TEST_CASE("...") or
                             // _Pragma("...") and not log statements.
                             break;
+                        }
+                        if child.kind() == "concatenated_string" {
+                            match self.concatenated_pattern(child) {
+                                Some(pattern) => concat_pattern = Some(pattern),
+                                None => break,
+                            }
                         }
                         // only return results after the format string literal, other captures
                         // are not relevant.
@@ -77,7 +84,7 @@ impl<'a> SourceQuery<'a> {
                         kind: capture.node.kind().to_string(),
                         range: capture.node.range(),
                         name_range: Self::find_fn_range(child),
-                        pattern: None,
+                        pattern: concat_pattern.take(),
                         args: vec![],
                         raw: false,
                     });
@@ -141,6 +148,31 @@ impl<'a> SourceQuery<'a> {
         results
     }
 
+    /// Join the pieces of a C++ concatenated string, like `"abc " "def"`, into the contents of
+    /// a single string-literal.  Returns None if a piece cannot be resolved, like a macro.
+    fn concatenated_pattern(&self, node: Node) -> Option<String> {
+        let mut pattern = String::new();
+        let mut cursor = node.walk();
+        for piece in node.named_children(&mut cursor) {
+            let text = &self.source[piece.start_byte()..piece.end_byte()];
+            match piece.kind() {
+                "string_literal" => {
+                    // Skip any prefix, like L or u8, and the quotes.
+                    let start = text.find('"')? + 1;
+                    let end = text.rfind('"')?;
+                    pattern.push_str(text.get(start..end)?);
+                }
+                // The <cinttypes> macros, like "%" PRIu64, finish a conversion specification.
+                // Some grammar versions wrap the macro name in an ERROR node.
+                "identifier" | "ERROR" if is_inttypes_macro(text) => {
+                    pattern.push('d');
+                }
+                _ => return None,
+            }
+        }
+        Some(pattern)
+    }
+
     fn in_function_body(node: Node) -> bool {
         let mut curr = node.parent();
         while let Some(parent) = curr {
@@ -200,4 +232,10 @@ impl<'a> SourceQuery<'a> {
             }
         }
     }
+}
+
+/// Check for a format macro from <cinttypes>, like PRIu64 or SCNd32.
+fn is_inttypes_macro(text: &str) -> bool {
+    (text.starts_with("PRI") || text.starts_with("SCN"))
+        && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
