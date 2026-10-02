@@ -302,6 +302,10 @@ impl LogMatcher {
                     source: Arc::new(err),
                 })?;
         for sif in decoded_root.files_with_statements.values_mut() {
+            // The pattern string is not serialized, so fill it in from the regex.
+            for stmt in sif.log_statements.iter_mut() {
+                stmt.pattern_str = stmt.pattern.to_string();
+            }
             sif.to_lookup_pair().into_iter().for_each(|(name, sid)| {
                 decoded_root
                     .file_name_to_sources
