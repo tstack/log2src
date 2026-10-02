@@ -162,6 +162,15 @@ fn main() {
     println!("prefilter build alone: {:?}", start.elapsed());
 
     let stmts: Vec<&SourceRef> = matcher.statements().collect();
+    if let Ok(path) = std::env::var("DUMP_STATEMENTS") {
+        let mut out: Vec<String> = stmts
+            .iter()
+            .map(|s| format!("{}:{}\t{}", s.source_path, s.line_no, s.text.replace('\n', " ")))
+            .collect();
+        out.sort();
+        std::fs::write(path, out.join("\n")).unwrap();
+        return;
+    }
     let mut lines: Vec<Line> = Vec::new();
     for stmt in &stmts {
         if let Some(body) = synthesize(stmt.pattern().as_str()) {

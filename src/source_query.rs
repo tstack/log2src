@@ -4,12 +4,13 @@ use tree_sitter::{
 };
 
 use crate::source_ref::FormatArgument;
-use crate::CodeSource;
+use crate::{CodeSource, SourceLanguage};
 
 pub struct SourceQuery<'a> {
     pub source: &'a str,
     tree: Tree,
     language: Language,
+    source_language: SourceLanguage,
 }
 
 pub(crate) struct QueryResult {
@@ -35,6 +36,7 @@ impl<'a> SourceQuery<'a> {
             source,
             tree,
             language,
+            source_language: code.info.language,
         }
     }
 
@@ -50,6 +52,13 @@ impl<'a> SourceQuery<'a> {
                 let mut child = capture.node;
                 match child.kind() {
                     "string_literal" | "string" => {
+                        if self.source_language == SourceLanguage::Cpp
+                            && !Self::in_function_body(child)
+                        {
+                            // Calls at file scope are macros like TEST_CASE("...") or
+                            // _Pragma("...") and not log statements.
+                            break;
+                        }
                         // only return results after the format string literal, other captures
                         // are not relevant.
                         got_string_literal = true;
@@ -130,6 +139,17 @@ impl<'a> SourceQuery<'a> {
         });
 
         results
+    }
+
+    fn in_function_body(node: Node) -> bool {
+        let mut curr = node.parent();
+        while let Some(parent) = curr {
+            if parent.kind() == "compound_statement" {
+                return true;
+            }
+            curr = parent.parent();
+        }
+        false
     }
 
     fn find_fn_range(node: Node) -> Range<usize> {

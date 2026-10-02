@@ -142,7 +142,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "3")]
+    #[serde(rename = "4")]
     Current,
 }
 
@@ -755,12 +755,10 @@ impl SourceLanguage {
             SourceLanguage::Cpp => {
                 r#"
                     (
-                        (compound_statement
-                            (expression_statement
-                                (call_expression
-                                    function: (_) @fname
-                                    arguments: (argument_list (string_literal) @arguments)
-                                )
+                        (expression_statement
+                            (call_expression
+                                function: (_) @fname
+                                arguments: (argument_list (string_literal) @arguments)
                             )
                         )
                         (#not-match? @fname "snprintf|sprintf")
@@ -1487,6 +1485,51 @@ fn main() {
         assert_eq!(src_refs[0].line_no, 3);
         assert_eq!(src_refs[0].end_line_no, 3);
         assert_eq!(src_refs[0].vars, vec!["line".to_string()]);
+    }
+
+    const CPP_NESTED_SOURCE: &str = r#"
+    TEST_CASE("not a log statement") {
+        CHECK(true);
+    }
+
+    _Pragma("GCC diagnostic ignored \"-Wunused\"")
+
+    bool open_request(int line, int kind) {
+    #ifdef HAVE_RUST_DEPS
+        log_info("sending line %d", line);
+        return true;
+    #else
+        return false;
+    #endif
+        switch (kind) {
+            case 1:
+                log_debug("kind one %d", kind);
+                break;
+        }
+        if (line > 0)
+            log_warning("positive line %d", line);
+    }
+    "#;
+
+    #[test]
+    fn test_cpp_nested_statements() {
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_NESTED_SOURCE);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let found: Vec<(usize, &str)> = src_refs
+            .iter()
+            .map(|s| (s.line_no, s.text.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (10, r#""sending line %d""#),
+                (17, r#""kind one %d""#),
+                (21, r#""positive line %d""#),
+            ]
+        );
     }
 
     #[test]
