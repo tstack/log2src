@@ -142,7 +142,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "2")]
+    #[serde(rename = "3")]
     Current,
 }
 
@@ -1120,6 +1120,9 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
         .par_iter()
         .flat_map(|code| {
             let mut matched = vec![];
+            // The "args" results belong to the string literal that precedes them, so they need
+            // to be dropped if that literal was not usable as a log statement.
+            let mut accepting_args = false;
             let src_query = SourceQuery::new(code);
             let query = code.info.language.get_query();
             let results = src_query.query(query, None);
@@ -1127,12 +1130,14 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                 // println!("node.kind()={:?} range={:?}", result.kind, result.range);
                 match result.kind.as_str() {
                     "string_literal" | "string" => {
+                        accepting_args = false;
                         if let Some(src_ref) = SourceRef::new(code, result) {
                             matched.push(src_ref);
+                            accepting_args = true;
                         }
                     }
                     "args" | "this" => {
-                        if !matched.is_empty() {
+                        if accepting_args {
                             let range = result.range;
                             let source = code.buffer.as_str();
                             let text = source[range.start_byte..range.end_byte].to_string();
@@ -1459,6 +1464,30 @@ fn main() {
         printf("Hello, %s!", argv[1]);
     }
     "#;
+
+    const CPP_REJECTED_LITERAL_SOURCE: &str = r#"
+    void scan(int line) {
+        log_debug("scanned %d", line);
+    }
+
+    void result(sqlite3_context* ctx) {
+        sqlite3_result_text(
+            ctx, "", 0, SQLITE_STATIC);
+    }
+    "#;
+
+    #[test]
+    fn test_rejected_literal_args_are_dropped() {
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_REJECTED_LITERAL_SOURCE);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        assert_eq!(src_refs.len(), 1);
+        assert_eq!(src_refs[0].line_no, 3);
+        assert_eq!(src_refs[0].end_line_no, 3);
+        assert_eq!(src_refs[0].vars, vec!["line".to_string()]);
+    }
 
     #[test]
     fn test_basic_cpp() {
