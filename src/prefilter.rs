@@ -5,7 +5,7 @@ use regex_syntax::hir::{Hir, HirKind};
 use std::collections::HashMap;
 
 /// Identifies a single log statement: the file it is in and its index in that file's
-/// `log_statements`.
+/// `statements()`.
 pub(crate) type StatementID = (SourceFileID, usize);
 
 /// A prefilter for finding the log statements that could possibly match a log message.
@@ -31,7 +31,7 @@ impl Prefilter {
         let mut always = Vec::new();
 
         for sif in files {
-            for (index, stmt) in sif.log_statements.iter().enumerate() {
+            for (index, stmt) in sif.statements().enumerate() {
                 let sid = (sif.id, index);
                 match longest_literal(stmt.pattern.as_str()) {
                     Some(lit) => {

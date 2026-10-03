@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -21,6 +21,7 @@ use thiserror::Error;
 use tree_sitter::Language;
 
 mod code_source;
+mod java_symbols;
 mod log_format;
 mod prefilter;
 mod progress;
@@ -29,8 +30,9 @@ mod source_query;
 mod source_ref;
 
 // TODO: doesn't need to be exposed if we can clean up the arguments to do_mapping
+use crate::java_symbols::{JavaSymbols, MessageRef, StringConstant};
 use crate::prefilter::Prefilter;
-use crate::progress::WorkGuard;
+use crate::progress::{ProgressReader, WorkGuard};
 use crate::source_hier::{ScanEvent, SourceFileID, SourceHierContent, SourceHierTree};
 use crate::source_ref::{CallSite, FormatArgument};
 pub use code_source::CodeSource;
@@ -142,7 +144,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "5")]
+    #[serde(rename = "11")]
     Current,
 }
 
@@ -176,10 +178,35 @@ where
 pub struct StatementsInFile {
     pub path: String,
     id: SourceFileID,
-    pub log_statements: Vec<SourceRef>,
+    /// The statements with a string-literal message.  Use `statements()` to also get the ones
+    /// whose message is a constant.
+    log_statements: Vec<SourceRef>,
+    /// The statements whose message is a constant.  The constants are usually defined in other
+    /// files, so these are rebuilt by `SourceTree::resolve_message_refs()` instead of cached.
+    #[serde(skip)]
+    resolved_statements: Vec<SourceRef>,
+    /// The Java string constants defined in this file.
+    constants: Vec<StringConstant>,
+    /// The Java log calls in this file whose message is a constant.
+    message_refs: Vec<MessageRef>,
 }
 
 impl StatementsInFile {
+    /// Iterate over all of the statements, the ones with a string-literal message first.
+    pub fn statements(&self) -> impl Iterator<Item = &SourceRef> {
+        self.log_statements
+            .iter()
+            .chain(self.resolved_statements.iter())
+    }
+
+    /// Get a statement by its index in `statements()`.
+    fn statement(&self, index: usize) -> Option<&SourceRef> {
+        match index.checked_sub(self.log_statements.len()) {
+            None => self.log_statements.get(index),
+            Some(resolved_index) => self.resolved_statements.get(resolved_index),
+        }
+    }
+
     fn to_lookup_pair(&self) -> Option<(String, SourceFileID)> {
         PATH_TO_NAME_REGEX
             .captures(&self.path)
@@ -204,7 +231,45 @@ pub struct SourceTree {
     prefilter: Option<Prefilter>,
 }
 
+/// The outcome of resolving the log calls that use message constants.
+#[derive(Default)]
+struct MessageRefSummary {
+    resolved: usize,
+    /// The constant could not be found, e.g. it is defined in a library.
+    not_found: usize,
+    /// The constant has no literal text to match, like "{}".
+    no_text: usize,
+}
+
 impl SourceTree {
+    /// Turn the log calls whose message is a constant into statements.  The constants are
+    /// usually defined in other files, so this needs to be redone whenever any file changes.
+    fn resolve_message_refs(&mut self) -> MessageRefSummary {
+        // Sort by path so the same definition wins when a constant name is duplicated.
+        let mut files: Vec<&StatementsInFile> = self.files_with_statements.values().collect();
+        files.sort_by(|lhs, rhs| lhs.path.cmp(&rhs.path));
+        let constants =
+            java_symbols::constants_by_name(files.into_iter().flat_map(|sif| sif.constants.iter()));
+        let mut summary = MessageRefSummary::default();
+        for sif in self.files_with_statements.values_mut() {
+            sif.resolved_statements.clear();
+            for message_ref in &sif.message_refs {
+                let Some(value) = java_symbols::resolve(message_ref, &constants) else {
+                    summary.not_found += 1;
+                    continue;
+                };
+                match SourceRef::from_message_ref(&sif.path, message_ref, value) {
+                    Some(src_ref) => {
+                        sif.resolved_statements.push(src_ref);
+                        summary.resolved += 1;
+                    }
+                    None => summary.no_text += 1,
+                }
+            }
+        }
+        summary
+    }
+
     fn rebuild_prefilter(&mut self) {
         self.prefilter = Some(Prefilter::new(self.files_with_statements.values()));
     }
@@ -232,7 +297,7 @@ impl SourceTree {
                 (Some(name), None) => sif.path.contains(name),
             };
             if in_file {
-                candidates.extend(sif.log_statements.get(index));
+                candidates.extend(sif.statement(index));
             }
         });
         candidates.sort_by(|lhs, rhs| rhs.quality.cmp(&lhs.quality));
@@ -279,8 +344,8 @@ impl LogMatcher {
         }
     }
 
-    fn load_cache_entry(path: &Path, mut file: &File) -> Result<SourceTree, LogError> {
-        let mut reader = BufReader::new(&mut file);
+    fn load_cache_entry(path: &Path, input: impl Read) -> Result<SourceTree, LogError> {
+        let mut reader = BufReader::new(input);
         let mut header_str = String::new();
         reader
             .read_line(&mut header_str)
@@ -314,6 +379,7 @@ impl LogMatcher {
                     .push(sid);
             });
         }
+        decoded_root.resolve_message_refs();
         decoded_root.rebuild_prefilter();
         Ok(decoded_root)
     }
@@ -328,15 +394,24 @@ impl LogMatcher {
         let mut old_roots: HashMap<PathBuf, SourceTree> = HashMap::new();
         let mut retval: Vec<LogError> = Vec::new();
         std::mem::swap(&mut self.roots, &mut old_roots);
-        let work_guard = tracker.doing_work(old_roots.len() as u64, "root".to_string());
+        let entries: Vec<(PathBuf, SourceTree, PathBuf, u64)> = old_roots
+            .into_iter()
+            .map(|(root_path, old_root)| {
+                let cached_path = cache.location.join(to_cached_name(&root_path));
+                let size = fs::metadata(&cached_path).map_or(0, |meta| meta.len());
+                (root_path, old_root, cached_path, size)
+            })
+            .collect();
+        let total_size = entries.iter().map(|entry| entry.3).sum();
+        let work_guard = tracker.doing_work(total_size, "bytes".to_string());
         let mut found = 0;
         let mut not_found = 0;
         let mut skipped = 0;
-        for (root_path, old_root) in old_roots.into_iter() {
-            let cached_name = to_cached_name(&root_path);
-            let cached_path = cache.location.join(&cached_name);
-            let new_root = if let Ok(mut file) = File::open(&cached_path) {
-                match Self::load_cache_entry(&cached_path, &mut file) {
+        for (root_path, old_root, cached_path, size) in entries {
+            let start = work_guard.completed();
+            let new_root = if let Ok(file) = File::open(&cached_path) {
+                let reader = ProgressReader::new(file, &work_guard);
+                match Self::load_cache_entry(&cached_path, reader) {
                     Ok(new_root) => {
                         found += 1;
                         new_root
@@ -352,7 +427,8 @@ impl LogMatcher {
                 old_root
             };
             self.roots.insert(root_path, new_root);
-            work_guard.inc(1);
+            // An entry that was skipped will not have been read all the way through.
+            work_guard.inc(size.saturating_sub(work_guard.completed() - start));
         }
         tracker.end_step(format!(
             "found {}; skipped {}; not found {}",
@@ -414,9 +490,7 @@ impl LogMatcher {
 
     /// True if no log statements are recognized by this matcher.
     pub fn is_empty(&self) -> bool {
-        self.roots
-            .iter()
-            .all(|(_path, coll)| coll.files_with_statements.is_empty())
+        self.statements().next().is_none()
     }
 
     /// Add a source root path
@@ -484,11 +558,17 @@ impl LogMatcher {
     /// Scan the source files looking for potential log statements.
     pub fn extract_log_statements(&mut self, tracker: &ProgressTracker) -> ExtractLogSummary {
         let mut retval = ExtractLogSummary::default();
+        let mut ref_summary = MessageRefSummary::default();
         tracker.begin_step("Extracting log statements".to_string());
         self.roots.iter_mut().for_each(|(_path, coll)| {
-            let guard = tracker.doing_work(coll.tree.stats().files as u64, "files".to_string());
+            let events: Vec<ScanEvent> = coll.tree.scan().collect();
+            let new_files = events
+                .iter()
+                .filter(|event| matches!(event, ScanEvent::NewFile(..)))
+                .count();
+            let guard = tracker.doing_work(new_files as u64, "files".to_string());
             let mut unreadable: Vec<PathBuf> = Vec::new();
-            for event_chunk in &coll.tree.scan().chunks(10) {
+            for event_chunk in &events.into_iter().chunks(10) {
                 let sources = event_chunk
                     .flat_map(|event| match event {
                         ScanEvent::NewFile(path, info) => {
@@ -506,6 +586,7 @@ impl LogMatcher {
                                 Err(err) => {
                                     retval.errors.push(err);
                                     unreadable.push(path);
+                                    guard.inc(1);
                                     None
                                 }
                             }
@@ -533,16 +614,20 @@ impl LogMatcher {
             unreadable
                 .iter()
                 .for_each(|path| coll.tree.mark_unscanned(path));
+            let summary = coll.resolve_message_refs();
+            ref_summary.resolved += summary.resolved;
+            ref_summary.not_found += summary.not_found;
+            ref_summary.no_text += summary.no_text;
             coll.rebuild_prefilter();
         });
-        tracker.end_step(format!(
-            "{} found",
-            self.roots
-                .iter()
-                .flat_map(|(_path, coll)| coll.files_with_statements.values())
-                .map(|stmts| stmts.log_statements.len())
-                .sum::<usize>()
-        ));
+        let mut found = format!("{} found", self.statements().count());
+        if ref_summary.resolved + ref_summary.not_found + ref_summary.no_text > 0 {
+            found.push_str(&format!(
+                " ({} with a message constant; {} constants not found, {} without text)",
+                ref_summary.resolved, ref_summary.not_found, ref_summary.no_text
+            ));
+        }
+        tracker.end_step(found);
 
         retval
     }
@@ -567,7 +652,7 @@ impl LogMatcher {
         self.roots
             .values()
             .flat_map(|coll| coll.files_with_statements.values())
-            .flat_map(|sif| sif.log_statements.iter())
+            .flat_map(|sif| sif.statements())
     }
 
     fn to_log_mapping<'a>(&self, log_ref: &LogRef<'a>, src_ref: &SourceRef) -> LogMapping<'a> {
@@ -743,12 +828,29 @@ impl SourceLanguage {
                         arguments: [
                             (argument_list (template_expression
                                 template_argument: (string_literal) @arguments))
-                            (argument_list . (string_literal) @arguments)
+                            (argument_list . [(string_literal) (binary_expression)] @arguments)
                             ; java.util.logging's log(Level, String, ...) or a SLF4J Marker
-                            (argument_list . [(field_access) (identifier)] . (string_literal) @arguments)
+                            (argument_list . [(field_access) (identifier)] .
+                                [(string_literal) (binary_expression)] @arguments)
                         ]
                         (#match? @object-name "log(ger)?|LOG(GER)?")
                         (#match? @method-name "^log$|fine|debug|info|warn|trace|error")
+                    )
+                    ; A message that is a constant, like log.info(Messages.LOG_STARTING, name)
+                    (method_invocation
+                        object: (identifier) @object-name
+                        name: (identifier) @method-name
+                        arguments: (argument_list . [(identifier) (field_access)] @message-ref)
+                        (#match? @object-name "log(ger)?|LOG(GER)?")
+                        (#match? @method-name "fine|debug|info|warn|trace|error")
+                    )
+                    ; java.util.logging's log(Level, String, ...) with a constant message
+                    (method_invocation
+                        object: (identifier) @object-name
+                        name: (identifier) @method-name
+                        arguments: (argument_list . (_) . [(identifier) (field_access)] @message-ref)
+                        (#match? @object-name "log(ger)?|LOG(GER)?")
+                        (#eq? @method-name "log")
                     )
                 "#
             }
@@ -773,7 +875,7 @@ impl SourceLanguage {
                       (call
                         function: (_) @func
                         arguments: (argument_list .
-                          (string) @args
+                          [(string) (concatenated_string)] @args
                         )
                       )
                     )
@@ -1118,25 +1220,50 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
     sources
         .par_iter()
         .flat_map(|code| {
+            /// Where the "args" results go.  They belong to the message that precedes them, so
+            /// they need to be dropped if that message was not usable.
+            enum ArgsTarget {
+                None,
+                Statement,
+                MessageRef,
+            }
+
             let mut matched = vec![];
-            // The "args" results belong to the string literal that precedes them, so they need
-            // to be dropped if that literal was not usable as a log statement.
-            let mut accepting_args = false;
+            let mut message_refs: Vec<MessageRef> = vec![];
+            let mut args_target = ArgsTarget::None;
             let src_query = SourceQuery::new(code);
+            let symbols = (code.info.language == SourceLanguage::Java)
+                .then(|| JavaSymbols::extract(&src_query))
+                .unwrap_or_default();
             let query = code.info.language.get_query();
             let results = src_query.query(query, None);
             for result in results {
                 // println!("node.kind()={:?} range={:?}", result.kind, result.range);
                 match result.kind.as_str() {
-                    "string_literal" | "string" | "concatenated_string" => {
-                        accepting_args = false;
+                    "string_literal" | "string" | "concatenated_string" | "binary_expression" => {
+                        args_target = ArgsTarget::None;
                         if let Some(src_ref) = SourceRef::new(code, result) {
                             matched.push(src_ref);
-                            accepting_args = true;
+                            args_target = ArgsTarget::Statement;
                         }
                     }
+                    "message_ref" => {
+                        let range = result.range;
+                        let text = &code.buffer[range.start_byte..range.end_byte];
+                        message_refs.push(MessageRef {
+                            line_no: range.start_point.row + 1,
+                            end_line_no: range.end_point.row + 1,
+                            column: range.start_point.column,
+                            name: code.buffer[result.name_range].to_string(),
+                            qualified_name: result.qualified_name,
+                            text: text.to_string(),
+                            vars: vec![],
+                            candidates: symbols.candidates(text, range.start_byte),
+                        });
+                        args_target = ArgsTarget::MessageRef;
+                    }
                     "args" | "this" => {
-                        if accepting_args {
+                        if !matches!(args_target, ArgsTarget::None) {
                             let range = result.range;
                             let source = code.buffer.as_str();
                             let text = source[range.start_byte..range.end_byte].to_string();
@@ -1149,10 +1276,17 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                                 .iter()
                                 .all(|&s| s != text.to_lowercase())
                             {
-                                let length = matched.len() - 1;
-                                let prior_result: &mut SourceRef = matched.get_mut(length).unwrap();
-                                prior_result.end_line_no = result.range.end_point.row + 1;
-                                prior_result.vars.push(text.trim().to_string());
+                                let end_line_no = result.range.end_point.row + 1;
+                                let var = text.trim().to_string();
+                                if let ArgsTarget::MessageRef = args_target {
+                                    let prior = message_refs.last_mut().unwrap();
+                                    prior.end_line_no = end_line_no;
+                                    prior.vars.push(var);
+                                } else {
+                                    let prior = matched.last_mut().unwrap();
+                                    prior.end_line_no = end_line_no;
+                                    prior.vars.push(var);
+                                }
                             }
                         }
                     }
@@ -1161,13 +1295,16 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                 // println!("*****");
             }
             guard.inc(1);
-            if matched.is_empty() {
+            if matched.is_empty() && message_refs.is_empty() && symbols.constants.is_empty() {
                 None
             } else {
                 Some(StatementsInFile {
-                    path: matched.first().unwrap().source_path.clone(),
+                    path: code.filename.clone(),
                     id: code.info.id,
                     log_statements: matched,
+                    resolved_statements: vec![],
+                    constants: symbols.constants,
+                    message_refs,
                 })
             }
         })
@@ -1456,6 +1593,314 @@ fn main() {
         assert_eq!(src_refs[1].line_no, 4);
     }
 
+    const TEST_JAVA_CONCAT_SRC: &str = r#"""
+  void run(String name, String host, int a, int b) {
+    LOGGER.log(Level.FINE, "Can''t find our classloader for the Driver; "
+        + "attempting to use the thread context classloader");
+    log.info("User " + name + " logged in from {}", host);
+    log.info(a + b + " total");
+    log.info(a + b);
+    log.debug("sum=" + (a + b) + "!");
+  }
+"""#;
+
+    #[test]
+    fn test_extract_java_concatenation() {
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.java"), TEST_JAVA_CONCAT_SRC);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
+        assert_eq!(
+            patterns,
+            vec![
+                "(?s)^Can''t find our classloader for the Driver; attempting to use the thread context classloader$",
+                "(?s)^User (.+) logged in from (.+)$",
+                "(?s)^(.+) total$",
+                "(?s)^sum=(.+)!$",
+            ]
+        );
+        assert_eq!((src_refs[0].line_no, src_refs[0].end_line_no), (3, 4));
+
+        let line = "User alice logged in from example.com";
+        let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+        assert_eq!(
+            extract_variables(&log_ref, &src_refs[1]),
+            vec![
+                VariablePair {
+                    expr: "name".to_string(),
+                    value: "alice".to_string()
+                },
+                VariablePair {
+                    expr: "host".to_string(),
+                    value: "example.com".to_string()
+                },
+            ]
+        );
+
+        let line = "42 total";
+        let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+        assert_eq!(
+            extract_variables(&log_ref, &src_refs[2]),
+            vec![VariablePair {
+                expr: "a + b".to_string(),
+                value: "42".to_string()
+            }]
+        );
+        assert_eq!(
+            src_refs[3].args,
+            vec![FormatArgument::Named("(a + b)".to_string())]
+        );
+    }
+
+    const MESSAGES_SRC: &str = r#"package com.example.cc;
+
+class Messages {
+    static final String LOG_INIT_GROUND_PROXY = "Starting ground proxy" +
+            " with CloudProxy {}, JCC {}:{}";
+    static final String LOG_KEY_FILE = "Key material file: {}";
+}
+"#;
+
+    const OTHER_MESSAGES_SRC: &str = r#"package com.example.config;
+
+public class Messages {
+    public static final String LOG_KEY_FILE = "Config key file: {}";
+    public static final String LOG_LOADED = "Loaded {} keys";
+}
+"#;
+
+    const CALLER_SRC: &str = r#"package com.example.cc;
+
+import static com.example.config.Messages.*;
+
+class Caller {
+    void start(String uri, String host, int port, String name) {
+        log.info(Messages.LOG_INIT_GROUND_PROXY, uri, host,
+                port);
+        log.debug(Messages.LOG_KEY_FILE, name);
+        log.debug(LOG_LOADED, port - 1);
+        log.info(Messages.NOT_DEFINED, name);
+    }
+}
+"#;
+
+    fn write_message_tree(root: &Path) {
+        for (path, src) in [
+            ("com/example/cc/Messages.java", MESSAGES_SRC),
+            ("com/example/config/Messages.java", OTHER_MESSAGES_SRC),
+            ("com/example/cc/Caller.java", CALLER_SRC),
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, src).unwrap();
+        }
+    }
+
+    fn matcher_for(root: &Path) -> LogMatcher {
+        let tracker = ProgressTracker::new();
+        let mut matcher = LogMatcher::new();
+        matcher.add_root(root).unwrap();
+        assert!(matcher.discover_sources(&tracker).is_empty());
+        matcher.extract_log_statements(&tracker);
+        matcher
+    }
+
+    /// Match the message and return the line number and variables of the statement.
+    fn match_message(matcher: &LogMatcher, msg: &str) -> Option<(usize, Vec<(String, String)>)> {
+        let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+        matcher.match_log_statement(&log_ref).map(|mapping| {
+            let src_ref = mapping.src_ref.unwrap();
+            assert!(src_ref.source_path.ends_with("Caller.java"));
+            (
+                src_ref.line_no,
+                mapping
+                    .variables
+                    .into_iter()
+                    .map(|var| (var.expr, var.value))
+                    .collect(),
+            )
+        })
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(expr, value)| (expr.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_message_constants() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_message_tree(temp_dir.path());
+        let matcher = matcher_for(temp_dir.path());
+
+        assert_eq!(
+            match_message(
+                &matcher,
+                "Starting ground proxy with CloudProxy http://proxy, JCC localhost:8090"
+            ),
+            Some((
+                7,
+                vars(&[
+                    ("uri", "http://proxy"),
+                    ("host", "localhost"),
+                    ("port", "8090")
+                ])
+            ))
+        );
+        // The same name in two packages resolves to the one for the caller's package.
+        assert_eq!(
+            match_message(&matcher, "Key material file: /etc/key.pem"),
+            Some((9, vars(&[("name", "/etc/key.pem")])))
+        );
+        assert_eq!(
+            match_message(&matcher, "Config key file: /etc/key.pem"),
+            None
+        );
+        // A bare name from a static import.
+        assert_eq!(
+            match_message(&matcher, "Loaded 3 keys"),
+            Some((10, vars(&[("port - 1", "3")])))
+        );
+        let caller: Vec<&SourceRef> = matcher
+            .statements()
+            .filter(|stmt| stmt.source_path.ends_with("Caller.java"))
+            .collect();
+        assert_eq!(caller.len(), 3);
+        assert!(caller
+            .iter()
+            .all(|stmt| stmt.qualified_name == "com.example.cc.Caller.start"));
+    }
+
+    #[test]
+    fn test_message_constants_change() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path();
+        write_message_tree(root);
+        let tracker = ProgressTracker::new();
+        let mut matcher = matcher_for(root);
+
+        // Only the file with the constants changes, the caller is not re-extracted.
+        let messages_path = root.join("com/example/cc/Messages.java");
+        fs::write(
+            &messages_path,
+            MESSAGES_SRC.replace("Key material file", "Key file is"),
+        )
+        .unwrap();
+        let later = SystemTime::now() + std::time::Duration::from_secs(5);
+        File::options()
+            .write(true)
+            .open(&messages_path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let _ = matcher.discover_sources(&tracker);
+        let summary = matcher.extract_log_statements(&tracker);
+        assert_eq!((summary.new, summary.deleted), (1, 1));
+
+        assert_eq!(
+            match_message(&matcher, "Key material file: /etc/key.pem"),
+            None
+        );
+        assert_eq!(
+            match_message(&matcher, "Key file is: /etc/key.pem"),
+            Some((9, vars(&[("name", "/etc/key.pem")])))
+        );
+        assert_eq!(matcher.statements().count(), 3);
+    }
+
+    /// Get the totals of the deterministic work reported to the listener so far.
+    fn work_totals(listener: &progress::ProgressListener) -> Vec<(u64, String)> {
+        let mut retval = Vec::new();
+        while let Some(update) = listener.try_next_for(std::time::Duration::from_millis(10)) {
+            if let ProgressUpdate::Work(info) = update {
+                retval.push((info.total, info.units.clone()));
+            }
+        }
+        retval
+    }
+
+    #[test]
+    fn test_progress_totals() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("src");
+        write_message_tree(&root);
+        let cache = Cache {
+            location: temp_dir.path().join("cache"),
+        };
+        let mut tracker = ProgressTracker::new();
+        let listener = tracker.subscribe();
+        let mut matcher = LogMatcher::new();
+        matcher.add_root(&root).unwrap();
+        let _ = matcher.discover_sources(&tracker);
+        matcher.extract_log_statements(&tracker);
+        matcher.cache_to(&cache, &tracker).unwrap();
+        assert_eq!(
+            work_totals(&listener),
+            vec![
+                (1, "paths".to_string()),
+                (3, "files".to_string()),
+                (1, "root".to_string())
+            ]
+        );
+
+        // Loading reports the size of the cache file.
+        let cache_size: u64 = fs::read_dir(&cache.location)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        let mut matcher = LogMatcher::new();
+        matcher.add_root(&root).unwrap();
+        assert!(matcher.load_from_cache(&cache, &tracker).is_empty());
+        assert_eq!(
+            work_totals(&listener),
+            vec![(cache_size, "bytes".to_string())]
+        );
+
+        // Only the changed file is counted when extracting.
+        let caller_path = root.join("com/example/cc/Caller.java");
+        let later = SystemTime::now() + std::time::Duration::from_secs(5);
+        File::options()
+            .write(true)
+            .open(&caller_path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let _ = matcher.discover_sources(&tracker);
+        matcher.extract_log_statements(&tracker);
+        assert_eq!(
+            work_totals(&listener),
+            vec![(1, "paths".to_string()), (1, "files".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_message_constants_from_cache() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("src");
+        write_message_tree(&root);
+        let cache = Cache {
+            location: temp_dir.path().join("cache"),
+        };
+        let tracker = ProgressTracker::new();
+        matcher_for(&root).cache_to(&cache, &tracker).unwrap();
+
+        let mut matcher = LogMatcher::new();
+        matcher.add_root(&root).unwrap();
+        assert!(matcher.load_from_cache(&cache, &tracker).is_empty());
+        let _ = matcher.discover_sources(&tracker);
+        let summary = matcher.extract_log_statements(&tracker);
+        assert_eq!(summary.changes(), 0);
+        assert_eq!(matcher.statements().count(), 3);
+        assert_eq!(
+            match_message(&matcher, "Loaded 12 keys"),
+            Some((10, vars(&[("port - 1", "12")])))
+        );
+    }
+
     const CPP_SOURCE: &str = r#"
     #include <stdio.h>
 
@@ -1584,6 +2029,56 @@ fn main() {
         );
     }
 
+    const PYTHON_CONCAT_SOURCE: &str = r#"
+def main(name, count, x):
+    logger.info("first part "
+                "second part %s", name)
+    logger.info(f"user {name} " "has %d items", count)
+    logger.info(r"C:\dir " "x\tz")
+    logger.info(f"{{literal}} {name}")
+    logger.info(R"raw\d {x}")
+"#;
+
+    #[test]
+    fn test_python_concatenation() {
+        let code = CodeSource::from_string(&Path::new("in-mem.py"), PYTHON_CONCAT_SOURCE);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
+        assert_eq!(
+            patterns,
+            vec![
+                r"(?s)^first part second part (.+)$",
+                r"(?s)^user (.+) has (.+) items$",
+                r"(?s)^C:\\dir x\tz$",
+                r"(?s)^\{literal\} (.+)$",
+                r"(?s)^raw\\d \{x\}$",
+            ]
+        );
+        assert_eq!((src_refs[0].line_no, src_refs[0].end_line_no), (3, 4));
+        assert_eq!(src_refs[0].vars, vec!["name"]);
+
+        let line = "user bob has 3 items";
+        let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+        assert_eq!(
+            extract_variables(&log_ref, &src_refs[1]),
+            vec![
+                VariablePair {
+                    expr: "name".to_string(),
+                    value: "bob".to_string()
+                },
+                VariablePair {
+                    expr: "count".to_string(),
+                    value: "3".to_string()
+                },
+            ]
+        );
+        let line = "C:\\dir x\tz";
+        assert!(src_refs[2].pattern().is_match(line));
+    }
+
     const PYTHON_SOURCE: &str = r#"
 def main(args):
     logger.info("foo %s \N{greek small letter pi}", test_var)
@@ -1609,6 +2104,151 @@ processing \started -- {args[0]}""")
                 expr: "test_var".to_string(),
                 value: "bar".to_string()
             },]
+        );
+    }
+
+    fn qualified_names(filename: &str, source: &str) -> Vec<(String, String)> {
+        let code = CodeSource::from_string(&PathBuf::from(filename), source);
+        extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements
+            .into_iter()
+            .map(|s| (s.name, s.qualified_name))
+            .collect()
+    }
+
+    fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|(name, qname)| (name.to_string(), qname.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_qualified_name_rust() {
+        let source = r#"
+mod net {
+    struct Server;
+    impl Server {
+        fn handle(&self) {
+            info!("handling");
+        }
+    }
+    impl Drop for Server {
+        fn drop(&mut self) {
+            info!("dropping");
+        }
+    }
+    trait Greet {
+        fn greet(&self) {
+            fn inner() {
+                info!("inner");
+            }
+            let f = || info!("closure");
+        }
+    }
+}
+"#;
+        assert_eq!(
+            qualified_names("in-mem.rs", source),
+            pairs(&[
+                ("handle", "net::Server::handle"),
+                ("drop", "net::<Server as Drop>::drop"),
+                ("inner", "net::Greet::greet::inner"),
+                ("greet", "net::Greet::greet"),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_qualified_name_java() {
+        let source = r#"package com.example
+    .net;
+
+class Server {
+    Server() {
+        logger.info("constructing");
+    }
+
+    void handle() {
+        logger.info("handling");
+        Runnable r = () -> logger.info("lambda");
+    }
+
+    static class Inner {
+        void run() {
+            logger.info("inner");
+        }
+    }
+}
+"#;
+        assert_eq!(
+            qualified_names("Server.java", source),
+            pairs(&[
+                ("Server", "com.example.net.Server.Server"),
+                ("handle", "com.example.net.Server.handle"),
+                ("handle", "com.example.net.Server.handle"),
+                ("run", "com.example.net.Server.Inner.run"),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_qualified_name_cpp() {
+        let source = r#"
+namespace net {
+namespace {
+void helper() {
+    printf("helper");
+}
+}
+
+class Server {
+    void handle() {
+        printf("handle");
+    }
+};
+
+const char *Server::name(int x) const {
+    printf("name %d", x);
+}
+
+Server &Server::self() {
+    printf("self");
+}
+}
+"#;
+        assert_eq!(
+            qualified_names("in-mem.cc", source),
+            pairs(&[
+                ("helper()", "net::(anonymous namespace)::helper"),
+                ("handle()", "net::Server::handle"),
+                ("*Server::name(int x) const", "net::Server::name"),
+                ("&Server::self()", "net::Server::self"),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_qualified_name_python() {
+        let source = r#"
+logger.info("top")
+
+class Server:
+    def handle(self):
+        logger.info("handle")
+
+        def inner():
+            logger.info("inner")
+"#;
+        let names: Vec<String> = qualified_names("in-mem.py", source)
+            .into_iter()
+            .map(|(_, qname)| qname)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["<module>", "Server.handle", "Server.handle.<locals>.inner"]
         );
     }
 

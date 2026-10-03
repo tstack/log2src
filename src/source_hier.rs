@@ -1,10 +1,12 @@
 use crate::{LogError, SourceLanguage};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::Match;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 use std::{fs, io};
 
@@ -12,14 +14,59 @@ fn is_ignored_dir(name: &OsStr) -> bool {
     name == ".git" || name == ".hg" || name == ".svn" || name == ".vscode"
 }
 
-fn build_gitignore(root: &Path) -> Gitignore {
-    let mut builder = GitignoreBuilder::new(root);
-    builder.add(root.join(".gitignore"));
-    builder.build().unwrap_or_else(|_| Gitignore::empty())
+const GITIGNORE: &str = ".gitignore";
+
+/// The .gitignore files that apply to a directory, ordered from the furthest away to the
+/// closest.
+#[derive(Clone, Default)]
+struct IgnoreChain {
+    matchers: Vec<Arc<Gitignore>>,
 }
 
-fn is_gitignored(gi: &Gitignore, path: &Path, is_dir: bool) -> bool {
-    gi.matched_path_or_any_parents(path, is_dir).is_ignore()
+impl IgnoreChain {
+    /// Build the chain for the .gitignore files in the directories above the given path, up to
+    /// the root of the git repository that contains it.
+    fn for_ancestors_of(path: &Path) -> Self {
+        let ancestors: Vec<&Path> = path.ancestors().skip(1).collect();
+        let Some(repo_index) = ancestors.iter().position(|dir| dir.join(".git").exists()) else {
+            return Self::default();
+        };
+        ancestors[..=repo_index]
+            .iter()
+            .rev()
+            .fold(Self::default(), |chain, dir| {
+                chain.descend(dir, dir.join(GITIGNORE).is_file())
+            })
+    }
+
+    /// Get the chain for the given directory, which includes its .gitignore, if it has one.
+    fn descend(&self, dir: &Path, has_gitignore: bool) -> Self {
+        if has_gitignore {
+            let mut builder = GitignoreBuilder::new(dir);
+            builder.add(dir.join(GITIGNORE));
+            if let Ok(gi) = builder.build() {
+                if !gi.is_empty() {
+                    let mut retval = self.clone();
+                    retval.matchers.push(Arc::new(gi));
+                    return retval;
+                }
+            }
+        }
+        self.clone()
+    }
+
+    /// Check if the path is ignored.  Like git, the closest .gitignore that matches the path
+    /// wins, so a subdirectory can whitelist something its parent ignored.
+    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        for gi in self.matchers.iter().rev() {
+            match gi.matched(path, is_dir) {
+                Match::Ignore(_) => return true,
+                Match::Whitelist(_) => return false,
+                Match::None => {}
+            }
+        }
+        false
+    }
 }
 
 /// Result of a shallow check of a file system path.  Mainly interested in getting a directory
@@ -91,26 +138,29 @@ impl SourceHierContent {
             .collect())
     }
 
-    fn from_dir(path: &Path, gi: &Gitignore) -> Self {
+    fn from_dir(path: &Path, gi: &IgnoreChain) -> Self {
         match Self::entries_of(path) {
-            Ok(entries) => Self::Directory {
-                entries: entries
-                    .into_iter()
-                    .filter(|entry| {
-                        !is_ignored_dir(&entry.0) && {
-                            let child_path = path.join(&entry.0);
-                            let is_dir = entry.1.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                            !is_gitignored(gi, &child_path, is_dir)
-                        }
-                    })
-                    .map(|(entry_name, meta)| {
-                        (
-                            entry_name.to_os_string(),
-                            SourceHierNode::from_int(&path.join(entry_name), meta, gi),
-                        )
-                    })
-                    .collect(),
-            },
+            Ok(entries) => {
+                let gi = &gi.descend(path, entries.contains_key(OsStr::new(GITIGNORE)));
+                Self::Directory {
+                    entries: entries
+                        .into_iter()
+                        .filter(|entry| {
+                            !is_ignored_dir(&entry.0) && {
+                                let child_path = path.join(&entry.0);
+                                let is_dir = entry.1.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                                !gi.is_ignored(&child_path, is_dir)
+                            }
+                        })
+                        .map(|(entry_name, meta)| {
+                            (
+                                entry_name.to_os_string(),
+                                SourceHierNode::from_int(&path.join(entry_name), meta, gi),
+                            )
+                        })
+                        .collect(),
+                }
+            }
             Err(err) => Self::Error {
                 source: LogError::CannotAccessPath {
                     path: path.to_path_buf(),
@@ -120,7 +170,7 @@ impl SourceHierContent {
         }
     }
 
-    fn from(path: &Path, metadata: Result<fs::Metadata, io::Error>, gi: &Gitignore) -> Self {
+    fn from(path: &Path, metadata: Result<fs::Metadata, io::Error>, gi: &IgnoreChain) -> Self {
         match metadata {
             Ok(meta) => {
                 if meta.is_dir() {
@@ -200,7 +250,7 @@ impl SourceHierContent {
         path: &Path,
         latest_meta: Result<fs::Metadata, io::Error>,
         deleted_events: &mut Vec<ScanEvent>,
-        gi: &Gitignore,
+        gi: &IgnoreChain,
     ) -> bool {
         let latest_content = Self::shallow_check(path, &latest_meta);
         *self = match self {
@@ -222,6 +272,7 @@ impl SourceHierContent {
             },
             SourceHierContent::Directory { ref mut entries } => match latest_content {
                 ShallowCheckResult::Directory { latest_entries } => {
+                    let gi = &gi.descend(path, latest_entries.contains_key(OsStr::new(GITIGNORE)));
                     let mut changed = false;
                     entries.retain(|name, node| {
                         let exists = latest_entries.contains_key(name);
@@ -236,9 +287,12 @@ impl SourceHierContent {
                     for (name, meta) in latest_entries {
                         let child_path = path.join(&name);
                         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                        if is_ignored_dir(&name.as_os_str())
-                            || is_gitignored(gi, &child_path, is_dir)
-                        {
+                        if is_ignored_dir(&name.as_os_str()) || gi.is_ignored(&child_path, is_dir) {
+                            // The entry might have been ignored since the last sync.
+                            if let Some(node) = entries.remove(&name) {
+                                node.deleted(path, &name, deleted_events);
+                                changed = true;
+                            }
                         } else if let Some(existing_entry) = entries.get_mut(&name) {
                             existing_entry.sync(&child_path, meta, deleted_events, gi)
                         } else {
@@ -297,7 +351,7 @@ pub struct SourceHierNode {
 }
 
 impl SourceHierNode {
-    fn from_int(path: &Path, metadata: Result<fs::Metadata, io::Error>, gi: &Gitignore) -> Self {
+    fn from_int(path: &Path, metadata: Result<fs::Metadata, io::Error>, gi: &IgnoreChain) -> Self {
         match metadata {
             Ok(meta) => {
                 if meta.is_dir() {
@@ -379,7 +433,7 @@ impl SourceHierNode {
         path: &Path,
         meta: Result<fs::Metadata, io::Error>,
         deleted_events: &mut Vec<ScanEvent>,
-        gi: &Gitignore,
+        gi: &IgnoreChain,
     ) {
         if self.content.sync_int(path, meta, deleted_events, gi) {
             self.last_scan_time = None;
@@ -469,7 +523,7 @@ impl SourceHierTree {
 
     /// Synchronize the state of this tree with the file system.
     pub fn sync(&mut self) {
-        let gi = build_gitignore(&self.root_path);
+        let gi = IgnoreChain::for_ancestors_of(&self.root_path);
         SourceFileInfo::NEXT_ID.with(|id_opt| {
             *id_opt.borrow_mut() = self.next_id;
         });
@@ -745,5 +799,87 @@ mod test {
         // Verify stats don't count ignored files
         let stats = tree.stats();
         assert_eq!(stats.files, 1);
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    fn new_file_names(tree: &mut SourceHierTree) -> Vec<String> {
+        let mut names: Vec<String> = tree
+            .scan()
+            .filter_map(|event| match event {
+                ScanEvent::NewFile(path, _) => {
+                    Some(path.file_name().unwrap().to_string_lossy().to_string())
+                }
+                ScanEvent::DeletedFile(..) => None,
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_nested_gitignore() {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let root = temp_dir.path();
+
+        write_file(&root.join(".gitignore"), "*.py\n");
+        write_file(&root.join("src/main.rs"), "fn main() {}");
+        write_file(&root.join("other.py"), "");
+        // A virtualenv ignores everything inside of it.
+        write_file(&root.join(".venv/.gitignore"), "*\n");
+        write_file(&root.join(".venv/lib/site-packages/pkg.py"), "");
+        // A closer .gitignore can whitelist what a parent ignored and vice-versa.
+        write_file(&root.join("gen/.gitignore"), "*.rs\n!keep.rs\n!tool.py\n");
+        write_file(&root.join("gen/out.rs"), "");
+        write_file(&root.join("gen/keep.rs"), "");
+        write_file(&root.join("gen/tool.py"), "");
+
+        let mut tree = SourceHierTree::from(root);
+        tree.sync();
+        assert_eq!(
+            new_file_names(&mut tree),
+            vec!["keep.rs", "main.rs", "tool.py"]
+        );
+        assert_eq!(tree.stats().files, 3);
+    }
+
+    #[test]
+    fn test_gitignore_in_parent_of_root() {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let repo = temp_dir.path();
+
+        fs::create_dir(repo.join(".git")).unwrap();
+        write_file(&repo.join(".gitignore"), "skip/\n");
+        write_file(&repo.join("project/.gitignore"), "*.py\n");
+        write_file(&repo.join("project/main.rs"), "");
+        write_file(&repo.join("project/app.py"), "");
+        write_file(&repo.join("project/skip/gen.rs"), "");
+
+        let mut tree = SourceHierTree::from(&repo.join("project"));
+        tree.sync();
+        assert_eq!(new_file_names(&mut tree), vec!["main.rs"]);
+    }
+
+    #[test]
+    fn test_newly_ignored_files_are_deleted() {
+        let temp_dir = tempdir().expect("Failed to create temporary directory");
+        let root = temp_dir.path();
+
+        write_file(&root.join("src/main.rs"), "");
+        write_file(&root.join(".venv/lib/pkg.py"), "");
+
+        let mut tree = SourceHierTree::from(root);
+        tree.sync();
+        assert_eq!(new_file_names(&mut tree), vec!["main.rs", "pkg.py"]);
+
+        write_file(&root.join(".venv/.gitignore"), "*\n");
+        tree.sync();
+        let events: Vec<ScanEvent> = tree.scan().map(redact_event).collect();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ScanEvent::DeletedFile(p, _) if p == Path::new("pkg.py")));
+        assert_eq!(tree.stats().files, 1);
     }
 }

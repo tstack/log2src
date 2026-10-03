@@ -200,6 +200,61 @@ struct ErrorWrapper {
     error: SerializableDiagnostic,
 }
 
+/// Find the log statements in the source trees, using the cache when possible.
+fn build_log_matcher(
+    sources: &[String],
+    verbose: bool,
+    tracker: &ProgressTracker,
+) -> miette::Result<LogMatcher> {
+    let mut log_matcher = LogMatcher::new();
+    for source in sources {
+        log_matcher
+            .add_root(&PathBuf::from(source))
+            .into_diagnostic()?;
+    }
+
+    let cache_open_res = Cache::open();
+    if verbose && cache_open_res.is_err() {
+        eprintln!("Could not find cache directory, will not cache source trees");
+    }
+
+    if let Ok(cache) = &cache_open_res {
+        let res = log_matcher.load_from_cache(&cache, tracker);
+        for err in res {
+            let report = Report::new(err);
+            if verbose
+                || report.severity().unwrap_or(miette::Severity::Error) != miette::Severity::Advice
+            {
+                eprintln!("{:?}", report);
+            }
+        }
+    }
+
+    log_matcher
+        .discover_sources(tracker)
+        .into_iter()
+        .for_each(|err| eprintln!("{:?}", Report::new(err)));
+    let mut extract_summary = log_matcher.extract_log_statements(tracker);
+    extract_summary
+        .errors
+        .drain(..)
+        .for_each(|err| eprintln!("{:?}", Report::new(err)));
+    if log_matcher.is_empty() {
+        return Err(LogError::NoLogStatements.into());
+    }
+
+    if extract_summary.changes() > 0 {
+        if let Ok(cache) = &cache_open_res {
+            let res = log_matcher.cache_to(&cache, tracker);
+            if let Err(err) = res {
+                eprintln!("{:?}", Report::new(err));
+            }
+        }
+    }
+
+    Ok(log_matcher)
+}
+
 fn main() -> miette::Result<()> {
     let _ = miette::set_hook(Box::new(move |_| {
         Box::new(
@@ -213,7 +268,7 @@ fn main() -> miette::Result<()> {
 
     let args = Cli::parse();
 
-    if args.verbose {
+    let listener_thread = args.verbose.then(|| {
         let listener = tracker.subscribe();
         std::thread::spawn(move || {
             let mut prefix = String::new();
@@ -231,12 +286,14 @@ fn main() -> miette::Result<()> {
                         // XXX Take the stdout lock so that the actual output does not interfere
                         // with the progress bar updates on stderr.
                         let _stdout_lock = stdout().lock();
+                        let template = if info.units == "bytes" {
+                            "{prefix}... {bar} {bytes:>10}/{total_bytes:10}"
+                        } else {
+                            "{prefix}... {bar} {pos:>7}/{len:7}"
+                        };
                         let bar = ProgressBar::new(info.total)
                             .with_prefix(prefix.clone())
-                            .with_style(
-                                ProgressStyle::with_template("{prefix}... {bar} {pos:>7}/{len:7}")
-                                    .unwrap(),
-                            );
+                            .with_style(ProgressStyle::with_template(template).unwrap());
                         while info.is_in_progress() {
                             bar.set_position(info.completed.load(Ordering::Relaxed));
                             sleep(Duration::from_millis(33));
@@ -245,8 +302,8 @@ fn main() -> miette::Result<()> {
                     }
                 }
             }
-        });
-    }
+        })
+    });
 
     let log_format: Option<LogFormat> = if let Some(format) = args.format {
         Some(format.as_str().try_into()?)
@@ -271,51 +328,14 @@ fn main() -> miette::Result<()> {
         }
     };
 
-    let mut log_matcher = LogMatcher::new();
-    for source in &args.sources {
-        log_matcher
-            .add_root(&PathBuf::from(source))
-            .into_diagnostic()?;
+    let matcher_res = build_log_matcher(&args.sources, args.verbose, &tracker);
+    // Nothing else reports progress, so close the channel and wait for the listener to print
+    // the remaining updates.  Otherwise, they are lost if the program exits early.
+    drop(tracker);
+    if let Some(handle) = listener_thread {
+        let _ = handle.join();
     }
-
-    let cache_open_res = Cache::open();
-    if args.verbose && cache_open_res.is_err() {
-        eprintln!("Could not find cache directory, will not cache source trees");
-    }
-
-    if let Ok(cache) = &cache_open_res {
-        let res = log_matcher.load_from_cache(&cache, &tracker);
-        for err in res {
-            let report = Report::new(err);
-            if args.verbose
-                || report.severity().unwrap_or(miette::Severity::Error) != miette::Severity::Advice
-            {
-                eprintln!("{:?}", report);
-            }
-        }
-    }
-
-    log_matcher
-        .discover_sources(&tracker)
-        .into_iter()
-        .for_each(|err| eprintln!("{:?}", Report::new(err)));
-    let mut extract_summary = log_matcher.extract_log_statements(&tracker);
-    extract_summary
-        .errors
-        .drain(..)
-        .for_each(|err| eprintln!("{:?}", Report::new(err)));
-    if log_matcher.is_empty() {
-        return Err(LogError::NoLogStatements.into());
-    }
-
-    if extract_summary.changes() > 0 {
-        if let Ok(cache) = &cache_open_res {
-            let res = log_matcher.cache_to(&cache, &tracker);
-            if let Err(err) = res {
-                eprintln!("{:?}", Report::new(err));
-            }
-        }
-    }
+    let log_matcher = matcher_res?;
 
     let start = args.start.unwrap_or(0);
     let count = args.count.unwrap_or(usize::MAX);

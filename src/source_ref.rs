@@ -1,3 +1,4 @@
+use crate::java_symbols::MessageRef;
 use crate::{CodeSource, QueryResult, SourceLanguage};
 use core::fmt;
 use regex::{Captures, Regex};
@@ -33,6 +34,10 @@ pub struct SourceRef {
     pub end_line_no: usize,
     pub column: usize,
     pub name: String,
+    /// The name of the enclosing function qualified by its containers, like namespaces,
+    /// classes, and modules.
+    #[serde(rename(serialize = "qualifiedName"))]
+    pub qualified_name: String,
     pub text: String,
     pub quality: usize,
     #[serde(with = "serde_regex")]
@@ -85,6 +90,7 @@ impl SourceRef {
                 end_line_no,
                 column: col,
                 name,
+                qualified_name: result.qualified_name,
                 text,
                 quality,
                 pattern_str: matcher.as_str().to_string(),
@@ -95,6 +101,35 @@ impl SourceRef {
         } else {
             None
         }
+    }
+
+    /// Create a statement for a Java log call whose message is the given constant value.  The
+    /// location is the call site, not where the constant is defined.
+    pub(crate) fn from_message_ref(
+        source_path: &str,
+        message_ref: &MessageRef,
+        value: &str,
+    ) -> Option<SourceRef> {
+        let MessageMatcher {
+            matcher,
+            args,
+            quality,
+        } = build_matcher(false, value, SourceLanguage::Java)?;
+        Some(SourceRef {
+            source_path: source_path.to_string(),
+            language: SourceLanguage::Java,
+            line_no: message_ref.line_no,
+            end_line_no: message_ref.end_line_no,
+            column: message_ref.column,
+            name: message_ref.name.clone(),
+            qualified_name: message_ref.qualified_name.clone(),
+            text: message_ref.text.clone(),
+            quality,
+            pattern_str: matcher.as_str().to_string(),
+            pattern: matcher,
+            args,
+            vars: message_ref.vars.clone(),
+        })
     }
 
     pub fn captures<'a>(&self, line: &'a str) -> Option<Captures<'a>> {

@@ -1,3 +1,4 @@
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -45,6 +46,31 @@ impl WorkGuard {
     /// Increase the amount of deterministic work that has been done.
     pub fn inc(&self, amount: u64) {
         self.info.completed.fetch_add(amount, Ordering::Relaxed);
+    }
+
+    /// The amount of work that has been done so far.
+    pub fn completed(&self) -> u64 {
+        self.info.completed.load(Ordering::Relaxed)
+    }
+}
+
+/// A reader that counts the bytes read through it as completed work.
+pub(crate) struct ProgressReader<'a, R> {
+    inner: R,
+    guard: &'a WorkGuard,
+}
+
+impl<'a, R> ProgressReader<'a, R> {
+    pub(crate) fn new(inner: R, guard: &'a WorkGuard) -> Self {
+        Self { inner, guard }
+    }
+}
+
+impl<R: Read> Read for ProgressReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let amount = self.inner.read(buf)?;
+        self.guard.inc(amount as u64);
+        Ok(amount)
     }
 }
 
@@ -121,5 +147,23 @@ impl Iterator for ProgressListener {
 impl ProgressListener {
     pub fn try_next_for(&self, timeout: Duration) -> Option<ProgressUpdate> {
         self.receiver.recv_timeout(timeout).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_progress_reader() {
+        let tracker = ProgressTracker::new();
+        let guard = tracker.doing_work(11, "bytes".to_string());
+        let mut reader = ProgressReader::new("hello world".as_bytes(), &guard);
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(guard.completed(), 4);
+        let mut rest = String::new();
+        reader.read_to_string(&mut rest).unwrap();
+        assert_eq!(guard.completed(), 11);
     }
 }

@@ -8,6 +8,7 @@ lineNumber: 27
 endLineNumber: 27
 column: 11
 name: namedarg
+qualifiedName: namedarg
 text: "\"Hello, {name}!\""
 quality: 7
 pattern: "(?s)^Hello, (.+)!$"

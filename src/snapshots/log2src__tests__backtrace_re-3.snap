@@ -8,6 +8,7 @@ expression: src_refs
   endLineNumber: 3
   column: 13
   name: run
+  qualifiedName: in-mem.run
   text: "\"{}: Started\""
   quality: 8
   pattern: "(?s)^(.+): Started$"
@@ -21,6 +22,7 @@ expression: src_refs
   endLineNumber: 9
   column: 15
   name: run
+  qualifiedName: in-mem.run
   text: "\"{}: Stopped\""
   quality: 8
   pattern: "(?s)^(.+): Stopped$"
