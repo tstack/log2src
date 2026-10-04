@@ -10,16 +10,18 @@ info:
     - "-f"
     - "^(?<timestamp>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}) (?<thread>\\d+) (?<body>.*)$"
   env:
+    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpdvhmvP
     COLS: "1000"
-    HOME: /var/folders/gq/s3t7n95d19g3w41nsw0m0n240000gn/T/.tmpzzq9Js
-    USERPROFILE: /var/folders/gq/s3t7n95d19g3w41nsw0m0n240000gn/T/.tmpzzq9Js
-    XDG_CONFIG_HOME: /var/folders/gq/s3t7n95d19g3w41nsw0m0n240000gn/T/.tmpzzq9Js
+    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpdvhmvP
+    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpdvhmvP
+    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpdvhmvP
+    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpdvhmvP
 ---
 success: true
 exit_code: 0
 ----- stdout -----
-{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{java_dir}/BasicSlf4j.java","language":"Java","lineNumber":10,"endLineNumber":10,"column":20,"name":"main","qualifiedName":"org.example.Main.main","text":"\"Application starting\"","quality":19,"pattern":"(?s)^Application starting$","args":[],"vars":[]},"variables":[]}
-{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{java_dir}/BasicSlf4j.java","language":"Java","lineNumber":12,"endLineNumber":13,"column":21,"name":"main","qualifiedName":"org.example.Main.main","text":"\"Debug message: args length = {}\"","quality":24,"pattern":"(?s)^Debug message: args length = (.+)$","args":["Placeholder"],"vars":["args.length"]},"variables":[{"expr":"args.length","value":"0"}]}
+{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{java_dir}/BasicSlf4j.java","language":"Java","lineNumber":10,"endLineNumber":10,"column":20,"name":"main","qualifiedName":"org.example.Main.main","blockId":250,"text":"\"Application starting\"","quality":19,"pattern":"(?s)^Application starting$","args":[],"vars":[]},"variables":[]}
+{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{java_dir}/BasicSlf4j.java","language":"Java","lineNumber":12,"endLineNumber":13,"column":21,"name":"main","qualifiedName":"org.example.Main.main","blockId":250,"text":"\"Debug message: args length = {}\"","quality":24,"pattern":"(?s)^Debug message: args length = (.+)$","args":["Placeholder"],"vars":["args.length"]},"variables":[{"expr":"args.length","value":"0"}]}
 
 ----- stderr -----
   ⚠ failed to read cache file "cache.XXX"

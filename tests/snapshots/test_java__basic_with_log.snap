@@ -9,13 +9,20 @@ info:
     - tests/resources/java/basic.log
     - "-f"
     - "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2} \\w+ \\w+ \\w+: (?<body>.*)"
+  env:
+    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpSaPHIO
+    COLS: "1000"
+    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpSaPHIO
+    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpSaPHIO
+    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpSaPHIO
+    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpSaPHIO
 ---
 success: true
 exit_code: 0
 ----- stdout -----
-{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/BasicWithLog.java","language":"Java","lineNumber":18,"endLineNumber":18,"column":13,"name":"main","qualifiedName":"BasicWithLog.main","text":"\"Hello from main\"","quality":13,"pattern":"(?s)^Hello from main$","args":[],"vars":[]},"variables":[]}
-{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/BasicWithLog.java","language":"Java","lineNumber":25,"endLineNumber":25,"column":17,"name":"foo","qualifiedName":"BasicWithLog.foo","text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"0"}]}
-{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/BasicWithLog.java","language":"Java","lineNumber":25,"endLineNumber":25,"column":17,"name":"foo","qualifiedName":"BasicWithLog.foo","text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"1"}]}
-{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/BasicWithLog.java","language":"Java","lineNumber":25,"endLineNumber":25,"column":17,"name":"foo","qualifiedName":"BasicWithLog.foo","text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"2"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/BasicWithLog.java","language":"Java","lineNumber":18,"endLineNumber":18,"column":13,"name":"main","qualifiedName":"BasicWithLog.main","blockId":231,"text":"\"Hello from main\"","quality":13,"pattern":"(?s)^Hello from main$","args":[],"vars":[]},"variables":[]}
+{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/BasicWithLog.java","language":"Java","lineNumber":25,"endLineNumber":25,"column":17,"name":"foo","qualifiedName":"BasicWithLog.foo","blockId":606,"text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"0"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/BasicWithLog.java","language":"Java","lineNumber":25,"endLineNumber":25,"column":17,"name":"foo","qualifiedName":"BasicWithLog.foo","blockId":606,"text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"1"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/BasicWithLog.java","language":"Java","lineNumber":25,"endLineNumber":25,"column":17,"name":"foo","qualifiedName":"BasicWithLog.foo","blockId":606,"text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"2"}]}
 
 ----- stderr -----

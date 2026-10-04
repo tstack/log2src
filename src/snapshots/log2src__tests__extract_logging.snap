@@ -9,6 +9,7 @@ expression: src_refs
   column: 11
   name: main
   qualifiedName: main
+  blockId: 43
   text: "\"you're only as funky as your last cut\""
   quality: 30
   pattern: "(?s)^you're only as funky as your last cut$"
@@ -21,6 +22,7 @@ expression: src_refs
   column: 16
   name: nope
   qualifiedName: nope
+  blockId: 224
   text: "\"this won't match i={}; j={}\""
   quality: 19
   pattern: "(?s)^this won't match i=(.+); j=(.+)$"
@@ -37,6 +39,7 @@ expression: src_refs
   column: 11
   name: namedarg0
   qualifiedName: namedarg0
+  blockId: 326
   text: "\"{salutation}, {name}!\""
   quality: 2
   pattern: "(?s)^(.+), (.+)!$"
@@ -51,6 +54,7 @@ expression: src_refs
   column: 11
   name: namedarg
   qualifiedName: namedarg
+  blockId: 427
   text: "\"Hello, {name}!\""
   quality: 7
   pattern: "(?s)^Hello, (.+)!$"
@@ -64,6 +68,7 @@ expression: src_refs
   column: 11
   name: namedarg2
   qualifiedName: namedarg2
+  blockId: 548
   text: "\"{salutation}, {name}!\""
   quality: 2
   pattern: "(?s)^(.+), (.+)!$"

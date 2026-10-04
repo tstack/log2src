@@ -9,6 +9,7 @@ expression: src_refs
   column: 13
   name: run
   qualifiedName: in-mem.run
+  blockId: 24
   text: "\"{}: Started\""
   quality: 8
   pattern: "(?s)^(.+): Started$"
@@ -23,6 +24,7 @@ expression: src_refs
   column: 15
   name: run
   qualifiedName: in-mem.run
+  blockId: 69
   text: "\"{}: Stopped\""
   quality: 8
   pattern: "(?s)^(.+): Stopped$"

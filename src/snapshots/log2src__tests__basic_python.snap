@@ -9,6 +9,7 @@ expression: src_refs
   column: 16
   name: main
   qualifiedName: main
+  blockId: 21
   text: "\"foo %s \\N{greek small letter pi}\""
   quality: 4
   pattern: (?s)^foo (.+) .$
@@ -23,6 +24,7 @@ expression: src_refs
   column: 17
   name: main
   qualifiedName: main
+  blockId: 21
   text: "f'Hello, {args[1]}!'"
   quality: 7
   pattern: "(?s)^Hello, (.+)!$"
@@ -36,6 +38,7 @@ expression: src_refs
   column: 19
   name: main
   qualifiedName: main
+  blockId: 21
   text: "f\"warning message:\\nlow disk space\""
   quality: 29
   pattern: "(?s)^warning message:\\nlow disk space$"
@@ -48,6 +51,7 @@ expression: src_refs
   column: 16
   name: main
   qualifiedName: main
+  blockId: 21
   text: "rf\"\"\"info message:\nprocessing \\started -- {args[0]}\"\"\""
   quality: 35
   pattern: "(?s)^info message:\\nprocessing \\\\started -- (.+)$"

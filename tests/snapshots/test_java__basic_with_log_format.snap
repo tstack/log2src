@@ -9,13 +9,20 @@ info:
     - tests/resources/java/basic-class-line.log
     - "-f"
     - "^(?<timestamp>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}) (?<level>\\w+) (?<file>[\\w$.]+):(?<line>\\d+) (?<method>[\\w$]+): (?<body>.*)$"
+  env:
+    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmptqoxs6
+    COLS: "1000"
+    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmptqoxs6
+    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmptqoxs6
+    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmptqoxs6
+    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmptqoxs6
 ---
 success: true
 exit_code: 0
 ----- stdout -----
-{"logRef":{"details":{"file":"BasicWithCustom","lineno":15}},"srcRef":{"sourcePath":"{java_dir}/BasicWithCustom.java","language":"Java","lineNumber":15,"endLineNumber":15,"column":16,"name":"main","qualifiedName":"BasicWithCustom.main","text":"\"Hello from main\"","quality":13,"pattern":"(?s)^Hello from main$","args":[],"vars":[]},"variables":[]}
-{"logRef":{"details":{"file":"BasicWithCustom","lineno":22}},"srcRef":{"sourcePath":"{java_dir}/BasicWithCustom.java","language":"Java","lineNumber":22,"endLineNumber":22,"column":20,"name":"foo","qualifiedName":"BasicWithCustom.foo","text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"0"}]}
-{"logRef":{"details":{"file":"BasicWithCustom","lineno":22}},"srcRef":{"sourcePath":"{java_dir}/BasicWithCustom.java","language":"Java","lineNumber":22,"endLineNumber":22,"column":20,"name":"foo","qualifiedName":"BasicWithCustom.foo","text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"1"}]}
-{"logRef":{"details":{"file":"BasicWithCustom","lineno":22}},"srcRef":{"sourcePath":"{java_dir}/BasicWithCustom.java","language":"Java","lineNumber":22,"endLineNumber":22,"column":20,"name":"foo","qualifiedName":"BasicWithCustom.foo","text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"2"}]}
+{"logRef":{"details":{"file":"BasicWithCustom","lineno":15}},"srcRef":{"sourcePath":"{java_dir}/BasicWithCustom.java","language":"Java","lineNumber":15,"endLineNumber":15,"column":16,"name":"main","qualifiedName":"BasicWithCustom.main","blockId":233,"text":"\"Hello from main\"","quality":13,"pattern":"(?s)^Hello from main$","args":[],"vars":[]},"variables":[]}
+{"logRef":{"details":{"file":"BasicWithCustom","lineno":22}},"srcRef":{"sourcePath":"{java_dir}/BasicWithCustom.java","language":"Java","lineNumber":22,"endLineNumber":22,"column":20,"name":"foo","qualifiedName":"BasicWithCustom.foo","blockId":508,"text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"0"}]}
+{"logRef":{"details":{"file":"BasicWithCustom","lineno":22}},"srcRef":{"sourcePath":"{java_dir}/BasicWithCustom.java","language":"Java","lineNumber":22,"endLineNumber":22,"column":20,"name":"foo","qualifiedName":"BasicWithCustom.foo","blockId":508,"text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"1"}]}
+{"logRef":{"details":{"file":"BasicWithCustom","lineno":22}},"srcRef":{"sourcePath":"{java_dir}/BasicWithCustom.java","language":"Java","lineNumber":22,"endLineNumber":22,"column":20,"name":"foo","qualifiedName":"BasicWithCustom.foo","blockId":508,"text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"2"}]}
 
 ----- stderr -----

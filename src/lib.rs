@@ -144,7 +144,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "11")]
+    #[serde(rename = "12")]
     Current,
 }
 
@@ -1256,6 +1256,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                             column: range.start_point.column,
                             name: code.buffer[result.name_range].to_string(),
                             qualified_name: result.qualified_name,
+                            block_id: result.block_id,
                             text: text.to_string(),
                             vars: vec![],
                             candidates: symbols.candidates(text, range.start_byte),
@@ -2249,6 +2250,196 @@ class Server:
         assert_eq!(
             names,
             vec!["<module>", "Server.handle", "Server.handle.<locals>.inner"]
+        );
+    }
+
+    /// Map the message of each log statement, without quotes, to its block ID.
+    fn block_ids(filename: &str, source: &str) -> HashMap<String, u32> {
+        let code = CodeSource::from_string(&PathBuf::from(filename), source);
+        extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements
+            .into_iter()
+            .map(|s| (s.text.trim_matches('"').to_string(), s.block_id))
+            .collect()
+    }
+
+    /// Check that the statements in each group share a block and that the groups differ.
+    fn assert_blocks(ids: &HashMap<String, u32>, groups: &[&[&str]]) {
+        let mut seen = std::collections::HashSet::new();
+        for group in groups {
+            let id = ids[group[0]];
+            for msg in &group[1..] {
+                assert_eq!(
+                    ids[*msg], id,
+                    "{} should be in the block of {}",
+                    msg, group[0]
+                );
+            }
+            assert!(seen.insert(id), "{} should be in its own block", group[0]);
+        }
+        assert_eq!(
+            ids.len(),
+            groups.iter().map(|group| group.len()).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn test_block_id_rust() {
+        let source = r#"
+fn run(x: Result<(), ()>, c: bool) {
+    info!("a");
+    if c {
+        info!("b");
+    }
+    info!("c");
+    match x {
+        Ok(_) => info!("d"),
+        Err(_) => info!("e"),
+    }
+}
+"#;
+        assert_blocks(
+            &block_ids("in-mem.rs", source),
+            &[&["a", "c"], &["b"], &["d"], &["e"]],
+        );
+    }
+
+    #[test]
+    fn test_block_id_java() {
+        let source = r#"
+class Server {
+    void handle(boolean x, int y) {
+        logger.info("a");
+        if (x) logger.info("b");
+        else logger.info("c");
+        for (int i = 0; i < y; i++) {
+            logger.info("d");
+        }
+        logger.info("e");
+        switch (y) {
+            case 1:
+                logger.info("f");
+                break;
+        }
+    }
+}
+"#;
+        assert_blocks(
+            &block_ids("Server.java", source),
+            &[&["a", "e"], &["b"], &["c"], &["d"], &["f"]],
+        );
+    }
+
+    #[test]
+    fn test_block_id_java_finally() {
+        let source = r#"
+class Server {
+    void handle() {
+        logger.info("a");
+        try {
+            logger.info("b");
+        } catch (IOException e) {
+            logger.info("c");
+        } finally {
+            logger.info("d");
+        }
+        try (Reader r = open()) {
+            logger.info("e");
+        } finally {
+            logger.info("f");
+        }
+    }
+}
+"#;
+        assert_blocks(
+            &block_ids("Server.java", source),
+            &[&["a"], &["b", "d"], &["c"], &["e", "f"]],
+        );
+    }
+
+    #[test]
+    fn test_block_id_cpp() {
+        let source = r#"
+void handle(bool x, int y) {
+    printf("a");
+    if (x) printf("b");
+    while (y--) {
+        printf("c");
+    }
+    printf("d");
+    switch (y) {
+        case 1:
+            printf("e");
+            break;
+    }
+}
+"#;
+        assert_blocks(
+            &block_ids("in-mem.cc", source),
+            &[&["a", "d"], &["b"], &["c"], &["e"]],
+        );
+    }
+
+    #[test]
+    fn test_block_id_cpp_preproc() {
+        let source = r#"
+void handle(bool x) {
+    printf("a");
+#ifdef X
+    printf("b");
+#elif defined(Y)
+    printf("c");
+#else
+    printf("d");
+#endif
+    if (x) {
+#if X
+        printf("e");
+#else
+        printf("f");
+#endif
+    }
+}
+"#;
+        assert_blocks(
+            &block_ids("in-mem.cc", source),
+            &[&["a", "b", "c", "d"], &["e", "f"]],
+        );
+    }
+
+    #[test]
+    fn test_block_id_python() {
+        let source = r#"
+logger.info("a")
+
+def handle(x):
+    logger.info("b")
+    if x:
+        logger.info("c")
+    logger.info("d")
+"#;
+        let ids = block_ids("in-mem.py", source);
+        assert_eq!(ids["a"], 0);
+        assert_blocks(&ids, &[&["a"], &["b", "d"], &["c"]]);
+    }
+
+    #[test]
+    fn test_block_id_python_finally() {
+        let source = r#"
+def handle():
+    logger.info("a")
+    try:
+        logger.info("b")
+    except IOError:
+        logger.info("c")
+    finally:
+        logger.info("d")
+"#;
+        assert_blocks(
+            &block_ids("in-mem.py", source),
+            &[&["a"], &["b", "d"], &["c"]],
         );
     }
 

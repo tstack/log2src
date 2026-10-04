@@ -38,6 +38,10 @@ pub struct SourceRef {
     /// classes, and modules.
     #[serde(rename(serialize = "qualifiedName"))]
     pub qualified_name: String,
+    /// The start byte of the innermost lexical block containing the call.  Statements with the
+    /// same `source_path` and `block_id` are in the same block.
+    #[serde(rename(serialize = "blockId"))]
+    pub block_id: u32,
     pub text: String,
     pub quality: usize,
     #[serde(with = "serde_regex")]
@@ -91,6 +95,7 @@ impl SourceRef {
                 column: col,
                 name,
                 qualified_name: result.qualified_name,
+                block_id: result.block_id,
                 text,
                 quality,
                 pattern_str: matcher.as_str().to_string(),
@@ -123,6 +128,7 @@ impl SourceRef {
             column: message_ref.column,
             name: message_ref.name.clone(),
             qualified_name: message_ref.qualified_name.clone(),
+            block_id: message_ref.block_id,
             text: message_ref.text.clone(),
             quality,
             pattern_str: matcher.as_str().to_string(),

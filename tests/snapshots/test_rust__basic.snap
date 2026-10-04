@@ -10,21 +10,21 @@ info:
     - "-f"
     - "\\[\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z \\w+ \\w+\\]\\s+(?<body>.*)"
   env:
-    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpyR4Ga0
+    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpTu9z2y
     COLS: "1000"
-    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpyR4Ga0
-    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpyR4Ga0
-    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpyR4Ga0
-    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpyR4Ga0
+    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpTu9z2y
+    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpTu9z2y
+    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpTu9z2y
+    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpTu9z2y
 ---
 success: true
 exit_code: 0
 ----- stdout -----
-{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":6,"endLineNumber":6,"column":11,"name":"main","qualifiedName":"main","text":"\"Hello from main\"","quality":13,"pattern":"(?s)^Hello from main$","args":[],"vars":[]},"variables":[]}
-{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"foo","qualifiedName":"foo","text":"\"Hello from foo i={}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":["Placeholder"],"vars":["i"]},"variables":[{"expr":"i","value":"0"}]}
-{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"foo","qualifiedName":"foo","text":"\"Hello from foo i={}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":["Placeholder"],"vars":["i"]},"variables":[{"expr":"i","value":"1"}]}
-{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"foo","qualifiedName":"foo","text":"\"Hello from foo i={}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":["Placeholder"],"vars":["i"]},"variables":[{"expr":"i","value":"2"}]}
-{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":19,"endLineNumber":19,"column":11,"name":"bar","qualifiedName":"bar","text":"\"Hello from bar j={j}\"","quality":14,"pattern":"(?s)^Hello from bar j=(.+)$","args":[{"Named":"j"}],"vars":[]},"variables":[{"expr":"j","value":"4"}]}
-{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":23,"endLineNumber":23,"column":11,"name":"baz","qualifiedName":"baz","text":"\"Hello from baz i={1} j={0}\"","quality":16,"pattern":"(?s)^Hello from baz i=(.+) j=(.+)$","args":[{"Positional":1},{"Positional":0}],"vars":["j","i"]},"variables":[{"expr":"i","value":"5"},{"expr":"j","value":"6"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":6,"endLineNumber":6,"column":11,"name":"main","qualifiedName":"main","blockId":42,"text":"\"Hello from main\"","quality":13,"pattern":"(?s)^Hello from main$","args":[],"vars":[]},"variables":[]}
+{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"foo","qualifiedName":"foo","blockId":186,"text":"\"Hello from foo i={}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":["Placeholder"],"vars":["i"]},"variables":[{"expr":"i","value":"0"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"foo","qualifiedName":"foo","blockId":186,"text":"\"Hello from foo i={}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":["Placeholder"],"vars":["i"]},"variables":[{"expr":"i","value":"1"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"foo","qualifiedName":"foo","blockId":186,"text":"\"Hello from foo i={}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":["Placeholder"],"vars":["i"]},"variables":[{"expr":"i","value":"2"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":19,"endLineNumber":19,"column":11,"name":"bar","qualifiedName":"bar","blockId":244,"text":"\"Hello from bar j={j}\"","quality":14,"pattern":"(?s)^Hello from bar j=(.+)$","args":[{"Named":"j"}],"vars":[]},"variables":[{"expr":"j","value":"4"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":23,"endLineNumber":23,"column":11,"name":"baz","qualifiedName":"baz","blockId":308,"text":"\"Hello from baz i={1} j={0}\"","quality":16,"pattern":"(?s)^Hello from baz i=(.+) j=(.+)$","args":[{"Positional":1},{"Positional":0}],"vars":["j","i"]},"variables":[{"expr":"i","value":"5"},{"expr":"j","value":"6"}]}
 
 ----- stderr -----

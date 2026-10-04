@@ -13,11 +13,18 @@ info:
     - "1"
     - "-c"
     - "2"
+  env:
+    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpZfT05c
+    COLS: "1000"
+    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpZfT05c
+    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpZfT05c
+    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpZfT05c
+    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpZfT05c
 ---
 success: true
 exit_code: 0
 ----- stdout -----
-{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"Java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"0"}]}
-{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"Java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"1"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"Java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","blockId":618,"text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"0"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"Java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","blockId":618,"text":"\"Hello from foo i=\\{i}\"","quality":14,"pattern":"(?s)^Hello from foo i=(.+)$","args":[{"Named":"i"}],"vars":[]},"variables":[{"expr":"i","value":"1"}]}
 
 ----- stderr -----

@@ -9,6 +9,7 @@ endLineNumber: 27
 column: 11
 name: namedarg
 qualifiedName: namedarg
+blockId: 427
 text: "\"Hello, {name}!\""
 quality: 7
 pattern: "(?s)^Hello, (.+)!$"

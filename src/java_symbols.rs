@@ -38,6 +38,8 @@ pub(crate) struct MessageRef {
     pub name: String,
     /// The name of the enclosing function qualified by its package and classes.
     pub qualified_name: String,
+    /// The start byte of the innermost lexical block containing the call.
+    pub block_id: u32,
     /// The reference as written in the source, like `Messages.LOG_STARTING`.
     pub text: String,
     pub vars: Vec<String>,

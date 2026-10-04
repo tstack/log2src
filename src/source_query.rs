@@ -20,6 +20,7 @@ pub(crate) struct QueryResult {
     pub range: TSRange,
     pub name_range: Range<usize>,
     pub qualified_name: String,
+    pub block_id: u32,
     pub pattern: Option<String>,
     pub args: Vec<FormatArgument>,
     pub raw: bool,
@@ -113,6 +114,7 @@ impl<'a> SourceQuery<'a> {
                         range: capture.node.range(),
                         name_range: Self::find_fn_range(child),
                         qualified_name: self.qualified_name(child),
+                        block_id: self.block_id(child),
                         pattern: concat_pattern.take(),
                         args: std::mem::take(&mut concat_args),
                         raw: false,
@@ -138,6 +140,7 @@ impl<'a> SourceQuery<'a> {
                                         },
                                         name_range: Self::find_fn_range(child),
                                         qualified_name: self.qualified_name(child),
+                                        block_id: self.block_id(child),
                                         pattern: None,
                                         args: vec![],
                                         raw: false,
@@ -442,6 +445,53 @@ impl<'a> SourceQuery<'a> {
                 }
             }
         }
+    }
+
+    /// Get an ID for the innermost lexical block enclosing the given node, which is the block's
+    /// start byte.  A statement that is the body of an `if`, loop, etc. without braces is
+    /// treated as its own block.  A `finally` block gets the ID of its `try` body.  A node that
+    /// is not in a block gets the root's ID of zero.
+    fn block_id(&self, node: Node) -> u32 {
+        let block_kinds: &[&str] = match self.source_language {
+            SourceLanguage::Rust => &["block", "match_arm"],
+            SourceLanguage::Java => &[
+                "block",
+                "constructor_body",
+                "switch_block_statement_group",
+                "switch_rule",
+                "lambda_expression",
+            ],
+            SourceLanguage::Cpp => &["compound_statement", "case_statement"],
+            SourceLanguage::Python => &["block"],
+        };
+        let mut curr = node.parent();
+        while let Some(candidate) = curr {
+            if block_kinds.contains(&candidate.kind()) {
+                // A `finally` runs whenever the `try` body does, so it shares the body's ID.
+                let try_body = candidate
+                    .parent()
+                    .filter(|parent| {
+                        matches!(parent.kind(), "finally_clause" | "seh_finally_clause")
+                    })
+                    .and_then(|finally| finally.parent())
+                    .and_then(|try_stmt| try_stmt.child_by_field_name("body"));
+                return try_body.unwrap_or(candidate).start_byte() as u32;
+            }
+            let parent = candidate.parent();
+            // The branches of `#if`/`#else` are not blocks, so a statement in either one
+            // belongs to the enclosing block.
+            let is_unbraced_body = parent.is_some_and(|parent| {
+                !parent.kind().starts_with("preproc_")
+                    && ["consequence", "alternative", "body"]
+                        .iter()
+                        .any(|field| parent.child_by_field_name(field) == Some(candidate))
+            });
+            if is_unbraced_body {
+                return candidate.start_byte() as u32;
+            }
+            curr = parent;
+        }
+        0
     }
 
     /// Get the name of the function enclosing the given node, qualified by the namespaces,
