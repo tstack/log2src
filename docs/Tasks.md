@@ -19,6 +19,7 @@
 ## Languages
 
 - [X] Python
+- [X] Kotlin
 - [ ] Go
 - [ ] JavaScript
 - [ ] Typescript

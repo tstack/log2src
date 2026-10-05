@@ -5,10 +5,18 @@ expression: events
 - NewFile:
     - test_rust.rs
     - language: Rust
-      id: 7
+      id: 9
+- NewFile:
+    - test_kotlin.rs
+    - language: Rust
+      id: 8
 - NewFile:
     - test_java.rs
     - language: Rust
+      id: 7
+- NewFile:
+    - Basic.kt
+    - language: Kotlin
       id: 6
 - NewFile:
     - BasicWithUpper.java

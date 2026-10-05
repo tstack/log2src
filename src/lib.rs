@@ -144,7 +144,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "12")]
+    #[serde(rename = "13")]
     Current,
 }
 
@@ -683,6 +683,7 @@ pub enum SourceLanguage {
     #[serde(rename = "C++")]
     Cpp,
     Python,
+    Kotlin,
 }
 
 impl From<SourceLanguage> for Language {
@@ -692,6 +693,7 @@ impl From<SourceLanguage> for Language {
             SourceLanguage::Java => tree_sitter_java::LANGUAGE.into(),
             SourceLanguage::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             SourceLanguage::Python => tree_sitter_python::LANGUAGE.into(),
+            SourceLanguage::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
         }
     }
 }
@@ -701,6 +703,8 @@ const IDENTS_JAVA: &[&str] = &["logger", "log", "fine", "debug", "info", "warn",
 const IDENTS_CPP: &[&str] = &["debug", "info", "warn", "trace"];
 
 const IDENTS_PYTHON: &[&str] = &["debug", "info", "warn", "trace"];
+
+const IDENTS_KOTLIN: &[&str] = IDENTS_JAVA;
 
 static RUST_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\{(?:([a-zA-Z_][a-zA-Z0-9_.]*)|(\d+))?\s*(?::[^}]*)?}"#).unwrap()
@@ -712,6 +716,10 @@ static JAVA_PLACEHOLDER_REGEX: LazyLock<Regex> =
 static CPP_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*[diuoxXfFeEgGaAcspn%]|\{(?:([a-zA-Z_][a-zA-Z0-9_.]*)|(\d+))?\s*(?::[^}]*)?}"#).unwrap()
 });
+
+/// SLF4J-style placeholders.  String templates are converted to these placeholders, too.
+static KOTLIN_PLACEHOLDER_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\{[^}]*}"#).unwrap());
 
 static PYTHON_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*[diuoxXfFeEgGaAcrspn%]"#).unwrap()
@@ -786,6 +794,7 @@ impl SourceLanguage {
             SourceLanguage::Java => "Java",
             SourceLanguage::Cpp => "C++",
             SourceLanguage::Python => "Python",
+            SourceLanguage::Kotlin => "Kotlin",
         }
     }
 
@@ -795,6 +804,7 @@ impl SourceLanguage {
             Some("java") => Some(Self::Java),
             Some("h" | "hh" | "hpp" | "hxx" | "tpp" | "cc" | "cpp" | "cxx") => Some(Self::Cpp),
             Some("py") => Some(Self::Python),
+            Some("kt" | "kts") => Some(Self::Kotlin),
             None | Some(_) => None,
         }
     }
@@ -882,6 +892,40 @@ impl SourceLanguage {
                 )
                 "#
             }
+            SourceLanguage::Kotlin => {
+                r#"
+                    (call_expression
+                        (navigation_expression
+                            (identifier) @object-name
+                            (identifier) @method-name)
+                        (value_arguments .
+                            (value_argument . [(string_literal) (binary_expression)] @arguments))
+                        (#match? @object-name "log(ger)?|LOG(GER)?")
+                        (#match? @method-name "debug|info|warn|trace|error")
+                    )
+                    ; kotlin-logging's lazy messages, like logger.info { "..." }
+                    (call_expression
+                        (navigation_expression
+                            (identifier) @object-name
+                            (identifier) @method-name)
+                        (annotated_lambda
+                            (lambda_literal [(string_literal) (binary_expression)] @arguments .))
+                        (#match? @object-name "log(ger)?|LOG(GER)?")
+                        (#match? @method-name "debug|info|warn|trace|error")
+                    )
+                    ; ... with a throwable, like logger.error(e) { "..." }
+                    (call_expression
+                        (call_expression
+                            (navigation_expression
+                                (identifier) @object-name
+                                (identifier) @method-name))
+                        (annotated_lambda
+                            (lambda_literal [(string_literal) (binary_expression)] @arguments .))
+                        (#match? @object-name "log(ger)?|LOG(GER)?")
+                        (#match? @method-name "debug|info|warn|trace|error")
+                    )
+                "#
+            }
         }
     }
 
@@ -891,6 +935,7 @@ impl SourceLanguage {
             SourceLanguage::Java => IDENTS_JAVA,
             SourceLanguage::Cpp => IDENTS_CPP,
             SourceLanguage::Python => IDENTS_PYTHON,
+            SourceLanguage::Kotlin => IDENTS_KOTLIN,
         }
     }
 
@@ -900,6 +945,7 @@ impl SourceLanguage {
             SourceLanguage::Java => JAVA_PLACEHOLDER_REGEX.deref(),
             SourceLanguage::Cpp => CPP_PLACEHOLDER_REGEX.deref(),
             SourceLanguage::Python => PYTHON_PLACEHOLDER_REGEX.deref(),
+            SourceLanguage::Kotlin => KOTLIN_PLACEHOLDER_REGEX.deref(),
         }
     }
 
@@ -1018,13 +1064,16 @@ impl<'a> StackTrace<'a> {
                         retval.push(CallSite {
                             name: cap.name("name").unwrap().as_str().to_string(),
                             source_path: full_path.to_string_lossy().to_string(),
-                            language: SourceLanguage::Java,
+                            // The trace could also be from Kotlin or another JVM language.
+                            language: SourceLanguage::from_path(&full_path)
+                                .unwrap_or(SourceLanguage::Java),
                             line_no: cap.name("line").unwrap().as_str().parse::<usize>().unwrap(),
                         });
                     }
                 }
             }
-            SourceLanguage::Cpp => {}
+            // JVM traces are always recognized as Java.
+            SourceLanguage::Cpp | SourceLanguage::Kotlin => {}
             SourceLanguage::Python => {
                 for cap in PYTHON_CALLER_REGEX.captures_iter(self.content) {
                     retval.push(CallSite {
@@ -2443,6 +2492,178 @@ def handle():
         );
     }
 
+    const KOTLIN_SOURCE: &str = r#"package com.example
+
+class Server {
+    fun handle(user: User, count: Int, e: Exception) {
+        logger.info("Started {} with {} threads", user.name, count)
+        logger.info("Hello $user, you have ${user.messages.size} messages")
+        logger.debug("Mixed {} and $count \$5\ttab", user)
+        logger.info { "Lazy ${user.id}" }
+        logger.error(e) { "Failed for $user" }
+        logger.warn("Concat " + count + " items")
+        logger.warn(e) {
+            "Failed [count=${user.messages.size}] " +
+                "after ${count / 1000.0} sec, " + count + " left"
+        }
+        logger.info("""raw $user""")
+        println("not a log $user")
+    }
+}
+"#;
+
+    fn kotlin_statements() -> Vec<SourceRef> {
+        let code = CodeSource::from_string(Path::new("Server.kt"), KOTLIN_SOURCE);
+        extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements
+    }
+
+    fn kotlin_vars(src_ref: &SourceRef, line: &str) -> Vec<(String, String)> {
+        let log_ref = LogRefBuilder::new().build(line);
+        extract_variables(&log_ref, src_ref)
+            .into_iter()
+            .map(|pair| (pair.expr, pair.value))
+            .collect()
+    }
+
+    #[test]
+    fn test_basic_kotlin() {
+        let src_refs = kotlin_statements();
+        assert_yaml_snapshot!(src_refs);
+        // The raw string and println() are skipped.
+        assert_eq!(src_refs.len(), 7);
+        assert_eq!(
+            kotlin_vars(&src_refs[0], "Started api with 4 threads"),
+            pairs(&[("user.name", "api"), ("count", "4")])
+        );
+        assert_eq!(
+            kotlin_vars(&src_refs[1], "Hello bob, you have 3 messages"),
+            pairs(&[("user", "bob"), ("user.messages.size", "3")])
+        );
+        assert_eq!(
+            kotlin_vars(&src_refs[2], "Mixed bob and 7 $5\ttab"),
+            pairs(&[("user", "bob"), ("count", "7")])
+        );
+        assert_eq!(
+            kotlin_vars(&src_refs[3], "Lazy 42"),
+            pairs(&[("user.id", "42")])
+        );
+        assert_eq!(
+            kotlin_vars(&src_refs[4], "Failed for bob"),
+            pairs(&[("user", "bob")])
+        );
+        assert_eq!(
+            kotlin_vars(&src_refs[5], "Concat 9 items"),
+            pairs(&[("count", "9")])
+        );
+        assert_eq!(
+            kotlin_vars(&src_refs[6], "Failed [count=3] after 1.5 sec, 1500 left"),
+            pairs(&[
+                ("user.messages.size", "3"),
+                ("count / 1000.0", "1.5"),
+                ("count", "1500")
+            ])
+        );
+    }
+
+    #[test]
+    fn test_qualified_name_kotlin() {
+        let source = r#"package com.example.net
+
+class Server {
+    constructor(x: Int) {
+        logger.info("constructing")
+    }
+
+    init {
+        logger.info("initializing")
+    }
+
+    fun handle() {
+        logger.info("handling")
+        val r = Runnable { logger.info("lambda") }
+    }
+
+    companion object {
+        fun create() {
+            logger.info { "creating" }
+        }
+    }
+}
+
+object Registry {
+    fun register() {
+        logger.info("registering")
+    }
+}
+
+fun main() {
+    logger.info("main")
+}
+"#;
+        assert_eq!(
+            qualified_names("my-server.kt", source),
+            pairs(&[
+                ("Server", "com.example.net.Server.Server"),
+                ("Server", "com.example.net.Server.Server"),
+                ("handle", "com.example.net.Server.handle"),
+                ("handle", "com.example.net.Server.handle"),
+                ("create", "com.example.net.Server.Companion.create"),
+                ("register", "com.example.net.Registry.register"),
+                ("main", "com.example.net.My_serverKt.main"),
+            ])
+        );
+        let renamed = format!("@file:JvmName(\"Util\")\n{}", source);
+        assert_eq!(
+            qualified_names("main.kt", &renamed).last().unwrap().1,
+            "com.example.net.Util.main"
+        );
+    }
+
+    #[test]
+    fn test_block_id_kotlin() {
+        let source = r#"
+fun handle(x: Boolean, y: Int) {
+    logger.info("a")
+    if (x) logger.info("b") else logger.info("c")
+    for (i in 0 until y) {
+        logger.info("d")
+    }
+    logger.info { "e" }
+    when (y) {
+        1 -> logger.info("f")
+        else -> {
+            logger.info("g")
+        }
+    }
+    try {
+        logger.info("h")
+    } catch (e: Exception) {
+        logger.error(e) { "i" }
+    } finally {
+        logger.info("j")
+    }
+    items.forEach { logger.info("k") }
+}
+"#;
+        assert_blocks(
+            &block_ids("in-mem.kt", source),
+            &[
+                &["a", "e"],
+                &["b"],
+                &["c"],
+                &["d"],
+                &["f"],
+                &["g"],
+                &["h", "j"],
+                &["i"],
+                &["k"],
+            ],
+        );
+    }
+
     const TRACE: &str = r#"JvmPauseMonitor-n0: Started
 java.lang.IllegalStateException: simulated failure for demo
     at org.example.Main.simulateError(Main.java:50)
@@ -2464,6 +2685,37 @@ java.lang.IllegalStateException: simulated failure for demo
         assert_yaml_snapshot!(src_refs);
         let vars = extract_variables(&log_ref, &src_refs[0]);
         assert_yaml_snapshot!(vars);
+    }
+
+    #[test]
+    fn test_kotlin_trace() {
+        let content = r#"java.lang.IllegalStateException: boom
+    at org.example.Worker.run(Basic.kt:13)
+    at org.example.BasicKt.main(Basic.kt:21)
+"#;
+        let mut log_matcher = LogMatcher::new();
+        log_matcher
+            .add_root(&Path::new("tests").join("kotlin"))
+            .unwrap();
+        assert!(log_matcher
+            .discover_sources(&ProgressTracker::new())
+            .is_empty());
+        let stacktrace = StackTrace {
+            language: SourceLanguage::Java,
+            content,
+        };
+        let trace: Vec<_> = stacktrace
+            .to_exception_trace(&log_matcher)
+            .into_iter()
+            .map(|site| (site.name, site.language, site.line_no))
+            .collect();
+        assert_eq!(
+            trace,
+            vec![
+                ("run".to_string(), SourceLanguage::Kotlin, 13),
+                ("main".to_string(), SourceLanguage::Kotlin, 21),
+            ]
+        );
     }
 
     const PYTHON_TRACE: &str = r#"\

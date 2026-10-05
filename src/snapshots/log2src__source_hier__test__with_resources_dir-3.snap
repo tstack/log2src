@@ -7,12 +7,12 @@ expression: new_and_updated_events
     - 1
 - DeletedFile:
     - test_java.rs
-    - 6
+    - 7
 - NewFile:
     - Basic.java
     - language: Java
-      id: 8
+      id: 10
 - NewFile:
     - new.rs
     - language: Rust
-      id: 9
+      id: 11

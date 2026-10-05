@@ -8,6 +8,10 @@ pub fn enable_filters(home_path: &Path) -> insta::internals::SettingsBindDropGua
     let mut settings = insta::Settings::clone_current();
     settings.add_filter(r#""[^"]*examples(?:/|\\\\?)"#, "\"{example_dir}/");
     settings.add_filter(r#""[^"]*tests(?:/|\\\\?)java(?:/|\\\\?)"#, "\"{java_dir}/");
+    settings.add_filter(
+        r#""[^"]*tests(?:/|\\\\?)kotlin(?:/|\\\\?)"#,
+        "\"{kotlin_dir}/",
+    );
     settings.add_filter(r#"(?:[ \w\.]+) (\(os error \d+\))"#, " {errmsg} $1");
     settings.add_filter(r#""[^"]*cache\.[0-9a-f]+"#, "\"cache.XXX");
     settings.add_filter(

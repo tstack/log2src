@@ -16,4 +16,4 @@ expression: deleted_dir_events
     - 2
 - DeletedFile:
     - Basic.java
-    - 8
+    - 10

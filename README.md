@@ -23,7 +23,7 @@ The current version is still an early prototype that only works with simple prog
 - Maps log lines back onto the source code to aid debugging by easing cognitive burden.
 - Tries to reconstruct a portion of the program state by providing values of expressions & variables.
 - Infer the call stack when possible based on an analysis of the source code.
-- At the moment a subset of the Java & Rust programming languages are supported, but intending to try and work with most popular languages.
+- At the moment a subset of the Rust, Java, Kotlin, C++ and Python programming languages are supported, but intending to try and work with most popular languages.
 - A VS Code extension using the debug adapter protocol.
 
 ### Build

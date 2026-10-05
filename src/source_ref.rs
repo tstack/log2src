@@ -498,6 +498,12 @@ mod tests {
             (Rust, r"\x41\0", r"A\x00"),
             (Rust, "one \\\n      two", "one two"),
             (Java, r"tab\there\s", r"tab\there "),
+            (Kotlin, r"\$price\té\b", r"\$price\té\x08"),
+            (
+                Kotlin,
+                r#"\"quoted\" \'c\' \\path"#,
+                r#""quoted" 'c' \\path"#,
+            ),
             (Java, r"\u00e9 \uuu0041 \uD83D\uDE00", "é A 😀"),
             (Python, r"\N{BULLET} item", ". item"),
             (Python, r"C:\dir\x41", r"C:\\dirA"),

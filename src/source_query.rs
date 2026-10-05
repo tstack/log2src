@@ -6,6 +6,8 @@ use tree_sitter::{
 
 use crate::source_ref::FormatArgument;
 use crate::{CodeSource, SourceLanguage};
+use regex::Regex;
+use std::sync::LazyLock;
 
 pub struct SourceQuery<'a> {
     pub source: &'a str,
@@ -86,8 +88,23 @@ impl<'a> SourceQuery<'a> {
                                 None => break,
                             }
                         }
+                        if child.kind() == "string_literal"
+                            && self.source_language == SourceLanguage::Kotlin
+                        {
+                            match self.kotlin_pattern(child) {
+                                Some((pattern, args)) => {
+                                    concat_pattern = Some(pattern);
+                                    concat_args = args;
+                                }
+                                None => break,
+                            }
+                        }
                         if child.kind() == "binary_expression" {
-                            match self.java_concat_pattern(child) {
+                            let concat = match self.source_language {
+                                SourceLanguage::Kotlin => self.kotlin_concat_pattern(child),
+                                _ => self.java_concat_pattern(child),
+                            };
+                            match concat {
                                 Some((pattern, args)) => {
                                     concat_pattern = Some(pattern);
                                     concat_args = args;
@@ -108,13 +125,14 @@ impl<'a> SourceQuery<'a> {
                 let mut arg_start: Option<(usize, Point)> = None;
 
                 if filter_idx.is_none() || filter_idx.is_some_and(|f| f == capture.index) {
+                    let anchor = Self::statement_anchor(child);
                     let qr_index = results.len();
                     results.push(QueryResult {
                         kind: kind.to_string(),
                         range: capture.node.range(),
-                        name_range: Self::find_fn_range(child),
-                        qualified_name: self.qualified_name(child),
-                        block_id: self.block_id(child),
+                        name_range: Self::find_fn_range(anchor),
+                        qualified_name: self.qualified_name(anchor),
+                        block_id: self.block_id(anchor),
                         pattern: concat_pattern.take(),
                         args: std::mem::take(&mut concat_args),
                         raw: false,
@@ -125,6 +143,11 @@ impl<'a> SourceQuery<'a> {
                         let (pattern, args) = self.python_pattern(child);
                         results[qr_index].pattern = Some(pattern);
                         results[qr_index].args = args;
+                    }
+                    if let Some(parent) = child.parent().filter(|p| p.kind() == "value_argument") {
+                        // Kotlin wraps each argument, so the separators are the wrapper's
+                        // siblings.
+                        child = parent;
                     }
                     while let Some(next_child) = child.next_sibling() {
                         if matches!(next_child.kind(), "," | ")") {
@@ -138,9 +161,9 @@ impl<'a> SourceQuery<'a> {
                                             end_byte: next_child.start_byte(),
                                             end_point: next_child.start_position(),
                                         },
-                                        name_range: Self::find_fn_range(child),
-                                        qualified_name: self.qualified_name(child),
-                                        block_id: self.block_id(child),
+                                        name_range: Self::find_fn_range(anchor),
+                                        qualified_name: self.qualified_name(anchor),
+                                        block_id: self.block_id(anchor),
                                         pattern: None,
                                         args: vec![],
                                         raw: false,
@@ -299,6 +322,132 @@ impl<'a> SourceQuery<'a> {
         (pattern, args)
     }
 
+    /// Convert a Kotlin string-literal, like `"Hello $name, {}"`, into the contents of a single
+    /// string-literal with SLF4J placeholders.  Templates are replaced with placeholders and, if
+    /// there are any, the returned arguments list every placeholder in order.  Returns None for
+    /// raw strings since they are usually trimmed with `trimIndent()`.
+    fn kotlin_pattern(&self, node: Node) -> Option<(String, Vec<FormatArgument>)> {
+        let (pattern, mut args, interpolated) = self.kotlin_template(node)?;
+        if !interpolated {
+            // The placeholders will be found when building the matcher.
+            args.clear();
+        }
+        Some((pattern, args))
+    }
+
+    /// Convert a Kotlin string-literal into a pattern and the arguments for all of its
+    /// placeholders.  Also returns whether the string has any templates.
+    fn kotlin_template(&self, node: Node) -> Option<(String, Vec<FormatArgument>, bool)> {
+        static TEMPLATE_REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r#"\$([a-zA-Z_][a-zA-Z0-9_]*)|\{[^}]*}"#).unwrap());
+
+        if self.source[node.byte_range()].starts_with("\"\"\"") {
+            return None;
+        }
+        let mut pattern = String::new();
+        let mut args = Vec::new();
+        let mut interpolated = false;
+        // The grammar splits the text of a `$name` template from the name, so the adjacent
+        // pieces of content are joined before looking for templates.
+        let mut content = String::new();
+        let flush = |content: &mut String,
+                     pattern: &mut String,
+                     args: &mut Vec<FormatArgument>,
+                     interpolated: &mut bool| {
+            let mut last_end = 0;
+            for cap in TEMPLATE_REGEX.captures_iter(content) {
+                let whole = cap.get(0).unwrap();
+                pattern.push_str(&content[last_end..whole.start()]);
+                match cap.get(1) {
+                    Some(name) => {
+                        pattern.push_str("{}");
+                        args.push(FormatArgument::Named(name.as_str().to_string()));
+                        *interpolated = true;
+                    }
+                    None => {
+                        pattern.push_str(whole.as_str());
+                        args.push(FormatArgument::Placeholder);
+                    }
+                }
+                last_end = whole.end();
+            }
+            pattern.push_str(&content[last_end..]);
+            content.clear();
+        };
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            let text = &self.source[child.byte_range()];
+            match child.kind() {
+                "string_content" => content.push_str(text),
+                "escape_sequence" => {
+                    flush(&mut content, &mut pattern, &mut args, &mut interpolated);
+                    // The escapes are decoded when building the matcher.
+                    pattern.push_str(text);
+                }
+                "interpolation" => {
+                    flush(&mut content, &mut pattern, &mut args, &mut interpolated);
+                    pattern.push_str("{}");
+                    interpolated = true;
+                    let expr = child.named_child(0).unwrap_or(child);
+                    args.push(FormatArgument::Named(self.normalized_text(expr)));
+                }
+                _ => {}
+            }
+        }
+        flush(&mut content, &mut pattern, &mut args, &mut interpolated);
+        Some((pattern, args, interpolated))
+    }
+
+    /// Convert a Kotlin string concatenation, like `"count=$count " + "size=" + size`, into
+    /// the contents of a single string-literal.  Kotlin has no `+` that takes a number on the
+    /// left and a string on the right, so a concatenation always starts with a string.
+    /// Returns None if the expression is not a concatenation starting with a string-literal.
+    fn kotlin_concat_pattern(&self, node: Node) -> Option<(String, Vec<FormatArgument>)> {
+        let mut operands = vec![];
+        let mut curr = node;
+        while curr.kind() == "binary_expression"
+            && curr
+                .child_by_field_name("operator")
+                .is_some_and(|op| op.kind() == "+")
+        {
+            operands.push(curr.child_by_field_name("right")?);
+            curr = curr.child_by_field_name("left")?;
+        }
+        if curr.kind() != "string_literal" {
+            return None;
+        }
+        operands.push(curr);
+        let mut pattern = String::new();
+        let mut args = vec![];
+        let mut interpolated = false;
+        for operand in operands.into_iter().rev() {
+            if operand.kind() == "string_literal" {
+                let (piece, piece_args, piece_interpolated) = self.kotlin_template(operand)?;
+                pattern.push_str(&piece);
+                args.extend(piece_args);
+                interpolated |= piece_interpolated;
+            } else {
+                pattern.push_str("{}");
+                args.push(FormatArgument::Named(self.normalized_text(operand)));
+                interpolated = true;
+            }
+        }
+        if !interpolated {
+            args.clear();
+        }
+        Some((pattern, args))
+    }
+
+    /// Get the node that stands in for the log statement when finding its function and block.
+    /// The message in a Kotlin lambda, like `logger.info { "..." }`, is inside a block of its
+    /// own, so the lambda is used instead.
+    fn statement_anchor(node: Node) -> Node {
+        match node.parent() {
+            Some(parent) if parent.kind() == "lambda_literal" => parent.parent().unwrap_or(parent),
+            _ => node,
+        }
+    }
+
     /// Convert a Java string concatenation, like `"user " + name + " logged in"`, into the
     /// contents of a single string-literal.  The non-literal operands are replaced with
     /// placeholders whose argument is the operand's expression.  Returns None if the expression
@@ -415,7 +564,7 @@ impl<'a> SourceQuery<'a> {
                 };
                 range.start_byte..range.end_byte
             }
-            "method_declaration" => {
+            "method_declaration" | "function_declaration" | "object_declaration" => {
                 let range = node.child_by_field_name("name").unwrap().range();
                 range.start_byte..range.end_byte
             }
@@ -426,6 +575,13 @@ impl<'a> SourceQuery<'a> {
             "class_declaration" => {
                 let range = node.child_by_field_name("name").unwrap().range();
                 range.start_byte..range.end_byte
+            }
+            "secondary_constructor" | "anonymous_initializer" => {
+                // Named after the class, like a Java constructor.
+                match node.parent().and_then(|body| body.parent()) {
+                    Some(class) => Self::find_fn_range(class),
+                    None => node.byte_range(),
+                }
             }
             "declaration_list" | "static_item" | "attribute_item" => {
                 let range = node.range();
@@ -463,6 +619,7 @@ impl<'a> SourceQuery<'a> {
             ],
             SourceLanguage::Cpp => &["compound_statement", "case_statement"],
             SourceLanguage::Python => &["block"],
+            SourceLanguage::Kotlin => &["block", "lambda_literal", "when_entry"],
         };
         let mut curr = node.parent();
         while let Some(candidate) = curr {
@@ -471,16 +628,38 @@ impl<'a> SourceQuery<'a> {
                 let try_body = candidate
                     .parent()
                     .filter(|parent| {
-                        matches!(parent.kind(), "finally_clause" | "seh_finally_clause")
+                        matches!(
+                            parent.kind(),
+                            "finally_clause" | "seh_finally_clause" | "finally_block"
+                        )
                     })
                     .and_then(|finally| finally.parent())
-                    .and_then(|try_stmt| try_stmt.child_by_field_name("body"));
+                    .and_then(|try_stmt| {
+                        // Kotlin's grammar has no field for the body.
+                        try_stmt.child_by_field_name("body").or_else(|| {
+                            let mut cursor = try_stmt.walk();
+                            let body = try_stmt
+                                .named_children(&mut cursor)
+                                .find(|child| child.kind() == "block");
+                            body
+                        })
+                    });
                 return try_body.unwrap_or(candidate).start_byte() as u32;
             }
             let parent = candidate.parent();
             // The branches of `#if`/`#else` are not blocks, so a statement in either one
             // belongs to the enclosing block.
             let is_unbraced_body = parent.is_some_and(|parent| {
+                if self.source_language == SourceLanguage::Kotlin {
+                    // Kotlin's grammar has no fields for the bodies, just the condition.
+                    return matches!(
+                        parent.kind(),
+                        "if_expression"
+                            | "for_statement"
+                            | "while_statement"
+                            | "do_while_statement"
+                    ) && parent.child_by_field_name("condition") != Some(candidate);
+                }
                 !parent.kind().starts_with("preproc_")
                     && ["consequence", "alternative", "body"]
                         .iter()
@@ -552,6 +731,21 @@ impl<'a> SourceQuery<'a> {
                     field(parent, "name")
                 }
                 (SourceLanguage::Python, "class_definition") => field(parent, "name"),
+                (SourceLanguage::Kotlin, "function_declaration") => field(parent, "name"),
+                (SourceLanguage::Kotlin, "class_declaration" | "object_declaration") => {
+                    in_class = true;
+                    field(parent, "name")
+                }
+                (SourceLanguage::Kotlin, "companion_object") => {
+                    Some(field(parent, "name").unwrap_or_else(|| "Companion".to_string()))
+                }
+                (SourceLanguage::Kotlin, "secondary_constructor" | "anonymous_initializer") => {
+                    // Named after the class, like a Java constructor.
+                    parent
+                        .parent()
+                        .and_then(|body| body.parent())
+                        .and_then(|class| field(class, "name"))
+                }
                 _ => None,
             };
             components.extend(component);
@@ -569,6 +763,13 @@ impl<'a> SourceQuery<'a> {
                 }
                 components.extend(self.java_package());
             }
+            SourceLanguage::Kotlin => {
+                if !in_class && !components.is_empty() {
+                    // A top-level function is in the class generated for the file.
+                    components.push(self.kotlin_file_class());
+                }
+                components.extend(self.java_package());
+            }
             SourceLanguage::Python if components.is_empty() => {
                 components.push("<module>".to_string())
             }
@@ -577,7 +778,7 @@ impl<'a> SourceQuery<'a> {
         components.reverse();
         let separator = match self.source_language {
             SourceLanguage::Rust | SourceLanguage::Cpp => "::",
-            SourceLanguage::Java | SourceLanguage::Python => ".",
+            SourceLanguage::Java | SourceLanguage::Python | SourceLanguage::Kotlin => ".",
         };
         components.join(separator)
     }
@@ -607,18 +808,60 @@ impl<'a> SourceQuery<'a> {
         Some(text.split('(').next().unwrap_or(&text).trim().to_string())
     }
 
-    /// Get the package declared in a Java file, like `com.example`.
+    /// Get the package declared in a Java or Kotlin file, like `com.example`.
     fn java_package(&self) -> Option<String> {
         let root = self.tree.root_node();
         let mut cursor = root.walk();
         let package = root
             .named_children(&mut cursor)
-            .find(|child| child.kind() == "package_declaration")?;
+            .find(|child| matches!(child.kind(), "package_declaration" | "package_header"))?;
         let mut cursor = package.walk();
-        let name = package
-            .named_children(&mut cursor)
-            .find(|child| matches!(child.kind(), "scoped_identifier" | "identifier"))?;
+        let name = package.named_children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "scoped_identifier" | "identifier" | "qualified_identifier"
+            )
+        })?;
         Some(self.source[name.byte_range()].split_whitespace().collect())
+    }
+
+    /// Get the name of the class that holds the top-level functions in a Kotlin file, which is
+    /// set by `@file:JvmName("...")` or is derived from the file name, like `MainKt` for
+    /// `main.kt`.
+    fn kotlin_file_class(&self) -> String {
+        let root = self.tree.root_node();
+        let mut cursor = root.walk();
+        let jvm_name = root
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "file_annotation")
+            .find_map(|annotation| {
+                let text = &self.source[annotation.byte_range()];
+                let args = text
+                    .split_once("JvmName")?
+                    .1
+                    .trim_start()
+                    .strip_prefix('(')?;
+                let name = args.trim_start().strip_prefix('"')?;
+                Some(name.split('"').next()?.to_string())
+            });
+        if let Some(name) = jvm_name {
+            return name;
+        }
+        let stem = Path::new(self.filename)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut retval: String = stem
+            .chars()
+            .enumerate()
+            .map(|(index, c)| match c {
+                _ if index == 0 => c.to_ascii_uppercase(),
+                _ if c.is_alphanumeric() || c == '_' => c,
+                _ => '_',
+            })
+            .collect();
+        retval.push_str("Kt");
+        retval
     }
 
     /// Get the text of a node with runs of whitespace collapsed into a single space, since a
