@@ -1,0 +1,110 @@
+---
+source: src/lib.rs
+expression: src_refs
+---
+- sourcePath: Server.kt
+  language: Kotlin
+  lineNumber: 5
+  endLineNumber: 5
+  column: 20
+  name: handle
+  qualifiedName: com.example.Server.handle
+  blockId: 89
+  text: "\"Started {} with {} threads\""
+  quality: 18
+  pattern: (?s)^Started (.+) with (.+) threads$
+  args:
+    - Placeholder
+    - Placeholder
+  vars:
+    - user.name
+    - count
+- sourcePath: Server.kt
+  language: Kotlin
+  lineNumber: 6
+  endLineNumber: 6
+  column: 20
+  name: handle
+  qualifiedName: com.example.Server.handle
+  blockId: 89
+  text: "\"Hello $user, you have ${user.messages.size} messages\""
+  quality: 21
+  pattern: "(?s)^Hello (.+), you have (.+) messages$"
+  args:
+    - Named: user
+    - Named: user.messages.size
+  vars: []
+- sourcePath: Server.kt
+  language: Kotlin
+  lineNumber: 7
+  endLineNumber: 7
+  column: 21
+  name: handle
+  qualifiedName: com.example.Server.handle
+  blockId: 89
+  text: "\"Mixed {} and $count \\$5\\ttab\""
+  quality: 16
+  pattern: "(?s)^Mixed (.+) and (.+) \\$5\\ttab$"
+  args:
+    - Placeholder
+    - Named: count
+  vars:
+    - user
+- sourcePath: Server.kt
+  language: Kotlin
+  lineNumber: 8
+  endLineNumber: 8
+  column: 22
+  name: handle
+  qualifiedName: com.example.Server.handle
+  blockId: 89
+  text: "\"Lazy ${user.id}\""
+  quality: 4
+  pattern: (?s)^Lazy (.+)$
+  args:
+    - Named: user.id
+  vars: []
+- sourcePath: Server.kt
+  language: Kotlin
+  lineNumber: 9
+  endLineNumber: 9
+  column: 26
+  name: handle
+  qualifiedName: com.example.Server.handle
+  blockId: 89
+  text: "\"Failed for $user\""
+  quality: 9
+  pattern: (?s)^Failed for (.+)$
+  args:
+    - Named: user
+  vars: []
+- sourcePath: Server.kt
+  language: Kotlin
+  lineNumber: 10
+  endLineNumber: 10
+  column: 20
+  name: handle
+  qualifiedName: com.example.Server.handle
+  blockId: 89
+  text: "\"Concat \" + count + \" items\""
+  quality: 11
+  pattern: (?s)^Concat (.+) items$
+  args:
+    - Named: count
+  vars: []
+- sourcePath: Server.kt
+  language: Kotlin
+  lineNumber: 12
+  endLineNumber: 13
+  column: 12
+  name: handle
+  qualifiedName: com.example.Server.handle
+  blockId: 89
+  text: "\"Failed [count=${user.messages.size}] \" +\n                \"after ${count / 1000.0} sec, \" + count + \" left\""
+  quality: 29
+  pattern: "(?s)^Failed \\[count=(.+)\\] after (.+) sec, (.+) left$"
+  args:
+    - Named: user.messages.size
+    - Named: count / 1000.0
+    - Named: count
+  vars: []

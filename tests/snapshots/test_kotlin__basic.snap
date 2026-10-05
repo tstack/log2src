@@ -1,0 +1,29 @@
+---
+source: tests/test_kotlin.rs
+info:
+  program: log2src
+  args:
+    - "-d"
+    - tests/kotlin
+    - "-l"
+    - tests/resources/kotlin/basic.log
+    - "-f"
+    - "^(?<timestamp>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}) (?<thread>\\d+) (?<body>.*)$"
+  env:
+    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmp5oNlPr
+    COLS: "1000"
+    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmp5oNlPr
+    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmp5oNlPr
+    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmp5oNlPr
+    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmp5oNlPr
+---
+success: true
+exit_code: 0
+----- stdout -----
+{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{kotlin_dir}/org/example/Basic.kt","language":"Kotlin","lineNumber":20,"endLineNumber":20,"column":16,"name":"main","qualifiedName":"org.example.BasicKt.main","blockId":518,"text":"\"Application starting with {} args\"","quality":27,"pattern":"(?s)^Application starting with (.+) args$","args":["Placeholder"],"vars":["args.size"]},"variables":[{"expr":"args.size","value":"0"}]}
+{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{kotlin_dir}/org/example/Basic.kt","language":"Kotlin","lineNumber":11,"endLineNumber":11,"column":20,"name":"run","qualifiedName":"org.example.Worker.run","blockId":270,"text":"\"Worker {} starting\"","quality":14,"pattern":"(?s)^Worker (.+) starting$","args":["Placeholder"],"vars":["name"]},"variables":[{"expr":"name","value":"alpha"}]}
+{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{kotlin_dir}/org/example/Basic.kt","language":"Kotlin","lineNumber":13,"endLineNumber":13,"column":25,"name":"run","qualifiedName":"org.example.Worker.run","blockId":353,"text":"\"$name processing item $i of ${count - 1}\"","quality":16,"pattern":"(?s)^(.+) processing item (.+) of (.+)$","args":[{"Named":"name"},{"Named":"i"},{"Named":"count - 1"}],"vars":[]},"variables":[{"expr":"name","value":"alpha"},{"expr":"i","value":"0"},{"expr":"count - 1","value":"1"}]}
+{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{kotlin_dir}/org/example/Basic.kt","language":"Kotlin","lineNumber":13,"endLineNumber":13,"column":25,"name":"run","qualifiedName":"org.example.Worker.run","blockId":353,"text":"\"$name processing item $i of ${count - 1}\"","quality":16,"pattern":"(?s)^(.+) processing item (.+) of (.+)$","args":[{"Named":"name"},{"Named":"i"},{"Named":"count - 1"}],"vars":[]},"variables":[{"expr":"name","value":"alpha"},{"expr":"i","value":"1"},{"expr":"count - 1","value":"1"}]}
+{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{kotlin_dir}/org/example/Basic.kt","language":"Kotlin","lineNumber":15,"endLineNumber":15,"column":23,"name":"run","qualifiedName":"org.example.Worker.run","blockId":270,"text":"\"Worker $name done\"","quality":10,"pattern":"(?s)^Worker (.+) done$","args":[{"Named":"name"}],"vars":[]},"variables":[{"expr":"name","value":"alpha"}]}
+
+----- stderr -----
