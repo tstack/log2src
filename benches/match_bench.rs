@@ -10,6 +10,204 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// The longest run of literal bytes any match must contain, the same as the prefilter's key.
+fn longest_literal(pattern: &str) -> Option<Vec<u8>> {
+    fn walk(hir: &Hir, cur: &mut Vec<u8>, best: &mut Vec<u8>) {
+        match hir.kind() {
+            HirKind::Literal(lit) => cur.extend_from_slice(&lit.0),
+            HirKind::Empty | HirKind::Look(_) => {}
+            HirKind::Concat(subs) => subs.iter().for_each(|sub| walk(sub, cur, best)),
+            _ => flush(cur, best),
+        }
+    }
+    fn flush(cur: &mut Vec<u8>, best: &mut Vec<u8>) {
+        if cur.len() > best.len() {
+            std::mem::swap(cur, best);
+        }
+        cur.clear();
+    }
+    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+    let (mut cur, mut best) = (Vec::new(), Vec::new());
+    walk(&hir, &mut cur, &mut best);
+    flush(&mut cur, &mut best);
+    (!best.is_empty()).then_some(best)
+}
+
+/// The runs of literal bytes in a pattern, in order, and whether the first run is at the very
+/// start of the message.
+fn literal_runs(pattern: &str) -> Option<(Vec<Vec<u8>>, bool, bool)> {
+    fn walk(
+        hir: &Hir,
+        cur: &mut Vec<u8>,
+        runs: &mut Vec<Vec<u8>>,
+        seen_other: &mut bool,
+        at_start: &mut Option<bool>,
+    ) {
+        match hir.kind() {
+            HirKind::Literal(lit) => {
+                if cur.is_empty() && runs.is_empty() && at_start.is_none() {
+                    *at_start = Some(!*seen_other);
+                }
+                cur.extend_from_slice(&lit.0)
+            }
+            HirKind::Empty | HirKind::Look(_) => {}
+            HirKind::Concat(subs) => subs
+                .iter()
+                .for_each(|sub| walk(sub, cur, runs, seen_other, at_start)),
+            _ => {
+                *seen_other = true;
+                if !cur.is_empty() {
+                    runs.push(std::mem::take(cur));
+                }
+            }
+        }
+    }
+    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+    let (mut cur, mut runs, mut seen_other, mut at_start) = (Vec::new(), Vec::new(), false, None);
+    walk(&hir, &mut cur, &mut runs, &mut seen_other, &mut at_start);
+    if !cur.is_empty() {
+        runs.push(cur);
+    }
+    Some((runs, at_start.unwrap_or(false), seen_other))
+}
+
+/// Report where the longest literal, which the prefilter keys on, sits in each pattern.
+fn literal_position_stats(stmts: &[&SourceRef]) {
+    const LABELS: [&str; 6] = [
+        "no placeholders",
+        "1 run, at start",
+        "1 run, after placeholder",
+        "longest first, at start",
+        "longest first, after placeholder",
+        "longest later",
+    ];
+    let mut by_lang: HashMap<&str, [usize; 6]> = HashMap::new();
+    for stmt in stmts {
+        let Some((runs, at_start, has_placeholder)) = literal_runs(stmt.pattern().as_str()) else {
+            continue;
+        };
+        let longest = runs.iter().map(|r| r.len()).max().unwrap_or(0);
+        let bucket = match runs.len() {
+            _ if !has_placeholder => 0,
+            1 if at_start => 1,
+            1 => 2,
+            // The prefilter takes the first of equal-length runs.
+            _ if runs[0].len() == longest && at_start => 3,
+            _ if runs[0].len() == longest => 4,
+            _ => 5,
+        };
+        by_lang.entry(stmt.language.as_str()).or_default()[bucket] += 1;
+    }
+    let mut langs: Vec<_> = by_lang.into_iter().collect();
+    langs.sort_by_key(|(_, c)| std::cmp::Reverse(c.iter().sum::<usize>()));
+    for (lang, c) in langs {
+        let total: usize = c.iter().sum();
+        println!("{} ({} statements)", lang, total);
+        for (label, count) in LABELS.iter().zip(c) {
+            println!(
+                "  {:<34} {:>6} ({:>4.1}%)",
+                label,
+                count,
+                100.0 * count as f64 / total as f64
+            );
+        }
+    }
+}
+
+fn percentile(sorted: &[usize], pct: usize) -> usize {
+    sorted
+        .get((sorted.len() * pct / 100).min(sorted.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Mirror the prefilter's candidate selection, without the filename filter, and report how
+/// much work is left for the regexes.
+fn prefilter_stats(stmts: &[&SourceRef], label: &str, bodies: &[&str]) {
+    let mut literals: Vec<Vec<u8>> = Vec::new();
+    let mut lit_ids: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut by_literal: Vec<Vec<usize>> = Vec::new();
+    let mut always: Vec<usize> = Vec::new();
+    for (index, stmt) in stmts.iter().enumerate() {
+        match longest_literal(stmt.pattern().as_str()) {
+            Some(lit) => {
+                let id = *lit_ids.entry(lit.clone()).or_insert_with(|| {
+                    literals.push(lit);
+                    by_literal.push(Vec::new());
+                    literals.len() - 1
+                });
+                by_literal[id].push(index);
+            }
+            None => always.push(index),
+        }
+    }
+    let ac = aho_corasick::AhoCorasick::new(&literals).unwrap();
+    let (mut candidates, mut checks) = (Vec::new(), Vec::new());
+    let (mut misses, mut wasted) = (0, 0);
+    let mut hot_literals: HashMap<usize, usize> = HashMap::new();
+    for body in bodies {
+        let mut hits: Vec<usize> = ac
+            .find_overlapping_iter(body)
+            .map(|m| m.pattern().as_usize())
+            .collect();
+        hits.sort_unstable();
+        hits.dedup();
+        for &hit in &hits {
+            *hot_literals.entry(hit).or_default() += by_literal[hit].len();
+        }
+        let mut cands: Vec<&SourceRef> = hits
+            .iter()
+            .flat_map(|&hit| by_literal[hit].iter())
+            .chain(always.iter())
+            .map(|&i| stmts[i])
+            .collect();
+        cands.sort_by(|lhs, rhs| rhs.quality.cmp(&lhs.quality));
+        candidates.push(cands.len());
+        let tried = match cands.iter().position(|c| c.pattern().is_match(body)) {
+            Some(pos) => pos + 1,
+            None => {
+                misses += 1;
+                cands.len()
+            }
+        };
+        wasted += tried.saturating_sub(1);
+        checks.push(tried);
+    }
+    candidates.sort_unstable();
+    checks.sort_unstable();
+    let avg = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len().max(1) as f64;
+    println!(
+        "{label}: {} lines, {} literals, {} always-checked statements",
+        bodies.len(),
+        literals.len(),
+        always.len()
+    );
+    println!(
+        "  candidates/line: avg {:.1}, p50 {}, p99 {}, max {}",
+        avg(&candidates),
+        percentile(&candidates, 50),
+        percentile(&candidates, 99),
+        candidates.last().unwrap_or(&0)
+    );
+    println!(
+        "  is_match calls/line: avg {:.1}, p99 {}, max {}; {} non-matching calls, {} lines with no match",
+        avg(&checks),
+        percentile(&checks, 99),
+        checks.last().unwrap_or(&0),
+        wasted,
+        misses
+    );
+    let mut hot: Vec<_> = hot_literals.into_iter().collect();
+    hot.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1));
+    for (id, count) in hot.iter().take(5) {
+        println!(
+            "  hot literal {:?}: {} candidates contributed",
+            String::from_utf8_lossy(&literals[*id]),
+            count
+        );
+    }
+}
+
 /// Generate a message that should be matched by the given pattern.
 fn synthesize(pattern: &str) -> Option<String> {
     fn walk(hir: &Hir, out: &mut Vec<u8>, counter: &mut usize) {
@@ -205,6 +403,22 @@ fn main() {
         matchable,
         rounds
     );
+
+    if std::env::var("LITERAL_POSITIONS").is_ok() {
+        literal_position_stats(&stmts);
+        return;
+    }
+    if std::env::var("PREFILTER_STATS").is_ok() {
+        let bodies: Vec<&str> = lines.iter().map(|l| l.body.as_str()).collect();
+        prefilter_stats(&stmts, "synthesized", &bodies[..matchable]);
+        prefilter_stats(&stmts, "unknown", &bodies[matchable..]);
+        if let Ok(path) = std::env::var("LOG_BODIES") {
+            let text = std::fs::read_to_string(path).unwrap();
+            let bodies: Vec<&str> = text.lines().collect();
+            prefilter_stats(&stmts, "log bodies", &bodies);
+        }
+        return;
+    }
 
     let start = Instant::now();
     let old_matcher = OldMatcher::new(&stmts);
