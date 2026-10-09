@@ -2,8 +2,8 @@ use clap::Parser as ClapParser;
 use colored_json::{ColoredFormatter, CompactFormatter, Styler};
 use indicatif::{ProgressBar, ProgressStyle};
 use log2src::{
-    Cache, LogError, LogFormat, LogMapping, LogMatcher, LogRef, LogRefBuilder, ProgressTracker,
-    ProgressUpdate,
+    Cache, LogError, LogFormat, LogMapping, LogMatchOptions, LogMatcher, LogRef, LogRefBuilder,
+    ProgressTracker, ProgressUpdate,
 };
 use miette::{IntoDiagnostic, MietteHandlerOpts, Report};
 use serde::Serialize;
@@ -85,9 +85,9 @@ impl MessageAccumulator {
         }
     }
 
-    fn get_log_mapping<'a>(&self, log_ref: LogRef<'a>) -> LogMapping<'a> {
+    fn get_log_mapping<'a>(&self, log_ref: LogRef<'a>) -> LogMapping<'a, '_> {
         self.log_matcher
-            .match_log_statement(&log_ref)
+            .match_log_statement(&log_ref, &LogMatchOptions::default())
             .unwrap_or_else(move || LogMapping {
                 log_ref,
                 src_ref: None,

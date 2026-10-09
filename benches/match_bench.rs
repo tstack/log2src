@@ -2,7 +2,10 @@
 //!
 //! Usage: cargo bench --bench match_bench -- <source-dir> [rounds]
 
-use log2src::{extract_variables, LogMatcher, LogRef, LogRefBuilder, ProgressTracker, SourceRef};
+use log2src::{
+    extract_variables, LogMatchOptions, LogMatcher, LogRef, LogRefBuilder, ProgressTracker,
+    SourceRef,
+};
 use rayon::prelude::*;
 use regex::RegexSet;
 use regex_syntax::hir::{Hir, HirKind};
@@ -332,8 +335,7 @@ impl<'a> OldMatcher<'a> {
         }
         // Do the same work as building the LogMapping in the real code.
         best.map(|src_ref| {
-            let src_ref = src_ref.clone();
-            let _ = extract_variables(log_ref, &src_ref);
+            let _ = extract_variables(log_ref, src_ref);
         });
         best
     }
@@ -440,8 +442,8 @@ fn main() {
         let (elapsed, results) = time(&lines, rounds, |line| {
             let log_ref = build(line, with_file).build(&line.body);
             matcher
-                .match_log_statement(&log_ref)
-                .and_then(|m| m.src_ref.as_ref().map(key))
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|m| m.src_ref.map(key))
         });
         let (old_elapsed, old_results) = time(&lines, rounds, |line| {
             let log_ref = build(line, with_file).build(&line.body);

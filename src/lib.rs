@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 use tempfile::NamedTempFile;
@@ -31,7 +31,7 @@ mod source_ref;
 
 // TODO: doesn't need to be exposed if we can clean up the arguments to do_mapping
 use crate::java_symbols::{JavaSymbols, MessageRef, StringConstant};
-use crate::prefilter::Prefilter;
+use crate::prefilter::{Prefilter, StatementID};
 use crate::progress::{ProgressReader, WorkGuard};
 use crate::source_hier::{ScanEvent, SourceFileID, SourceHierContent, SourceHierTree};
 use crate::source_ref::{CallSite, FormatArgument};
@@ -229,7 +229,15 @@ pub struct SourceTree {
     /// Finds the candidate statements for a log message, rebuilt after loading/extracting.
     #[serde(skip)]
     prefilter: Option<Prefilter>,
+    /// The statements that matched log messages with a given file name and line number.  They
+    /// are tried before the prefilter when another message has the same file and line.  Cleared
+    /// whenever the statements change.
+    #[serde(skip)]
+    line_cache: RwLock<LineCache>,
 }
+
+/// Maps a file name and line number from a log message to the statements that matched it.
+type LineCache = HashMap<String, HashMap<usize, Vec<StatementID>>>;
 
 /// The outcome of resolving the log calls that use message constants.
 #[derive(Default)]
@@ -272,9 +280,46 @@ impl SourceTree {
 
     fn rebuild_prefilter(&mut self) {
         self.prefilter = Some(Prefilter::new(self.files_with_statements.values()));
+        // The statement IDs in the cache may now refer to different statements.
+        self.line_cache
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
-    /// Find the highest quality statement that matches the given log message.
+    /// The line cache key for a log message, if it has a file name and line number and the
+    /// file name refers to a single source file.  Messages for file names shared by several
+    /// source files are not cached, since a statement in one could hide a better match in another.
+    fn line_cache_key<'a>(&self, log_ref: &LogRef<'a>) -> Option<(&'a str, usize)> {
+        let (filename, lineno) = log_ref.file_and_line()?;
+        match self.file_name_to_sources.get(filename) {
+            Some(ids) if ids.len() == 1 => Some((filename, lineno)),
+            _ => None,
+        }
+    }
+
+    /// Find the highest quality statement that previously matched a log message with the same
+    /// file name and line number as this one, and matches this one too.
+    fn find_cached_match(&self, log_ref: &LogRef) -> Option<&SourceRef> {
+        let (filename, lineno) = self.line_cache_key(log_ref)?;
+        let body = log_ref.body();
+        let cache = self
+            .line_cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        cache
+            .get(filename)?
+            .get(&lineno)?
+            .iter()
+            .filter_map(|(file_id, index)| {
+                self.files_with_statements.get(file_id)?.statement(*index)
+            })
+            .filter(|src_ref| src_ref.pattern.is_match(body))
+            .max_by_key(|src_ref| src_ref.quality)
+    }
+
+    /// Find the highest quality statement that matches the given log message.  If the message
+    /// has a file name and line number, the statement is added to the cache for them.
     fn find_best_match(&self, log_ref: &LogRef) -> Option<&SourceRef> {
         let prefilter = self.prefilter.as_ref()?;
         let body = log_ref.body();
@@ -286,7 +331,7 @@ impl SourceTree {
             _ => None,
         };
         let file_ids = filename.and_then(|name| self.file_name_to_sources.get(name));
-        let mut candidates: Vec<&SourceRef> = Vec::new();
+        let mut candidates: Vec<(StatementID, &SourceRef)> = Vec::new();
         prefilter.candidates(body, |(file_id, index)| {
             let Some(sif) = self.files_with_statements.get(&file_id) else {
                 return;
@@ -297,13 +342,28 @@ impl SourceTree {
                 (Some(name), None) => sif.path.contains(name),
             };
             if in_file {
-                candidates.extend(sif.statement(index));
+                candidates.extend(sif.statement(index).map(|stmt| ((file_id, index), stmt)));
             }
         });
-        candidates.sort_by(|lhs, rhs| rhs.quality.cmp(&lhs.quality));
-        candidates
+        candidates.sort_by(|lhs, rhs| rhs.1.quality.cmp(&lhs.1.quality));
+        let (stmt_id, src_ref) = candidates
             .into_iter()
-            .find(|src_ref| src_ref.pattern.is_match(body))
+            .find(|(_, src_ref)| src_ref.pattern.is_match(body))?;
+        if let Some((filename, lineno)) = self.line_cache_key(log_ref) {
+            let mut cache = self
+                .line_cache
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let ids = cache
+                .entry(filename.to_string())
+                .or_default()
+                .entry(lineno)
+                .or_default();
+            if !ids.contains(&stmt_id) {
+                ids.push(stmt_id);
+            }
+        }
+        Some(src_ref)
     }
 }
 
@@ -311,6 +371,21 @@ impl SourceTree {
 /// that contain log statements.
 pub struct LogMatcher {
     roots: HashMap<PathBuf, SourceTree>,
+}
+
+/// Options for matching log statements.
+#[derive(Debug, Copy, Clone)]
+pub struct LogMatchOptions {
+    /// Whether to extract variables from log statements.
+    pub extract_variables: bool,
+}
+
+impl Default for LogMatchOptions {
+    fn default() -> Self {
+        Self {
+            extract_variables: true,
+        }
+    }
 }
 
 fn to_cached_name(path: &Path) -> String {
@@ -505,6 +580,7 @@ impl LogMatcher {
                     files_with_statements: HashMap::new(),
                     file_name_to_sources: HashMap::new(),
                     prefilter: None,
+                    line_cache: RwLock::default(),
                 });
         }
         Ok(())
@@ -632,12 +708,21 @@ impl LogMatcher {
         retval
     }
 
-    /// Attempt to match the given log message.
-    pub fn match_log_statement<'a>(&self, log_ref: &LogRef<'a>) -> Option<LogMapping<'a>> {
+    /// Attempt to match the given log message.  If the message has a file name and line number,
+    /// the statements in a root that matched earlier messages with the same ones are tried
+    /// before the rest of that root.
+    pub fn match_log_statement<'a, 's>(
+        &'s self,
+        log_ref: &LogRef<'a>,
+        options: &LogMatchOptions,
+    ) -> Option<LogMapping<'a, 's>> {
         self.roots
             .values()
-            .find_map(|coll| coll.find_best_match(log_ref))
-            .map(|src_ref| self.to_log_mapping(log_ref, src_ref))
+            .find_map(|coll| {
+                coll.find_cached_match(log_ref)
+                    .or_else(|| coll.find_best_match(log_ref))
+            })
+            .map(|src_ref| self.to_log_mapping(log_ref, src_ref, options))
     }
 
     #[doc(hidden)]
@@ -655,7 +740,12 @@ impl LogMatcher {
             .flat_map(|sif| sif.statements())
     }
 
-    fn to_log_mapping<'a>(&self, log_ref: &LogRef<'a>, src_ref: &SourceRef) -> LogMapping<'a> {
+    fn to_log_mapping<'a, 's>(
+        &self,
+        log_ref: &LogRef<'a>,
+        src_ref: &'s SourceRef,
+        options: &LogMatchOptions,
+    ) -> LogMapping<'a, 's> {
         let exception_trace = match log_ref {
             LogRef {
                 details:
@@ -666,10 +756,14 @@ impl LogMatcher {
             } => trace.to_exception_trace(self),
             _ => Vec::new(),
         };
-        let variables = extract_variables(log_ref, src_ref);
+        let variables = if options.extract_variables {
+            extract_variables(log_ref, src_ref)
+        } else {
+            Vec::new()
+        };
         LogMapping {
             log_ref: log_ref.clone(),
-            src_ref: Some(src_ref.clone()),
+            src_ref: Some(src_ref),
             variables,
             exception_trace,
         }
@@ -974,11 +1068,11 @@ pub struct VariablePair {
 }
 
 #[derive(Serialize)]
-pub struct LogMapping<'a> {
+pub struct LogMapping<'a, 's> {
     #[serde(rename(serialize = "logRef"))]
     pub log_ref: LogRef<'a>,
     #[serde(rename(serialize = "srcRef"))]
-    pub src_ref: Option<SourceRef>,
+    pub src_ref: Option<&'s SourceRef>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename(serialize = "exceptionTrace"))]
     pub exception_trace: Vec<CallSite>,
@@ -1189,6 +1283,18 @@ impl<'a> LogRefBuilder<'a> {
 }
 
 impl<'a> LogRef<'a> {
+    /// The file name and line number of the log statement, if the message has both.
+    fn file_and_line(self) -> Option<(&'a str, usize)> {
+        match self.details {
+            Some(LogDetails {
+                file: Some(file),
+                lineno: Some(lineno),
+                ..
+            }) => Some((file, lineno)),
+            _ => None,
+        }
+    }
+
     pub fn body(self) -> &'a str {
         if let Some(LogDetails { body: Some(s), .. }) = self.details {
             s
@@ -1760,18 +1866,125 @@ class Caller {
     /// Match the message and return the line number and variables of the statement.
     fn match_message(matcher: &LogMatcher, msg: &str) -> Option<(usize, Vec<(String, String)>)> {
         let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
-        matcher.match_log_statement(&log_ref).map(|mapping| {
-            let src_ref = mapping.src_ref.unwrap();
-            assert!(src_ref.source_path.ends_with("Caller.java"));
-            (
-                src_ref.line_no,
-                mapping
-                    .variables
-                    .into_iter()
-                    .map(|var| (var.expr, var.value))
-                    .collect(),
-            )
-        })
+        matcher
+            .match_log_statement(&log_ref, &LogMatchOptions::default())
+            .map(|mapping| {
+                let src_ref = mapping.src_ref.unwrap();
+                assert!(src_ref.source_path.ends_with("Caller.java"));
+                (
+                    src_ref.line_no,
+                    mapping
+                        .variables
+                        .into_iter()
+                        .map(|var| (var.expr, var.value))
+                        .collect(),
+                )
+            })
+    }
+
+    const DUP_SRC: &str = r#"package com.example;
+
+class Dup {
+    void run(int count) {
+        log.info("count is {}", count);
+        log.info("total is {}", count);
+    }
+}
+"#;
+
+    #[test]
+    fn test_line_cache() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("com/example/Dup.java");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, DUP_SRC).unwrap();
+        let mut matcher = matcher_for(temp_dir.path());
+
+        let match_line = |matcher: &LogMatcher, msg: &str| {
+            let log_ref = LogRefBuilder::new()
+                .with_file(Some("Dup.java"))
+                .with_lineno(Some(6))
+                .with_body(Some(msg))
+                .build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref)
+                .map(|src_ref| src_ref.line_no)
+        };
+        let cached_lines = |matcher: &LogMatcher| {
+            let coll = matcher.roots.values().next().unwrap();
+            let cache = coll.line_cache.read().unwrap();
+            let mut lines: Vec<usize> = cache
+                .get("Dup.java")
+                .and_then(|by_line| by_line.get(&6))
+                .into_iter()
+                .flatten()
+                .map(|(file_id, index)| {
+                    coll.files_with_statements[file_id]
+                        .statement(*index)
+                        .unwrap()
+                        .line_no
+                })
+                .collect();
+            lines.sort();
+            lines
+        };
+
+        assert_eq!(match_line(&matcher, "total is 3"), Some(6));
+        assert_eq!(cached_lines(&matcher), vec![6]);
+        // Found in the cache, so nothing is added.
+        assert_eq!(match_line(&matcher, "total is 4"), Some(6));
+        assert_eq!(cached_lines(&matcher), vec![6]);
+        // The cached statement doesn't match, so fall back to the prefilter and remember it.
+        assert_eq!(match_line(&matcher, "count is 3"), Some(5));
+        assert_eq!(cached_lines(&matcher), vec![5, 6]);
+        assert_eq!(match_line(&matcher, "nothing like it"), None);
+        assert_eq!(cached_lines(&matcher), vec![5, 6]);
+
+        // A change to the source clears the cache.
+        fs::write(&path, DUP_SRC.replace("class Dup {", "class Dup {\n")).unwrap();
+        let tracker = ProgressTracker::new();
+        assert!(matcher.discover_sources(&tracker).is_empty());
+        matcher.extract_log_statements(&tracker);
+        assert_eq!(cached_lines(&matcher), Vec::<usize>::new());
+        assert_eq!(match_line(&matcher, "count is 3"), Some(6));
+        assert_eq!(cached_lines(&matcher), vec![6]);
+    }
+
+    #[test]
+    fn test_line_cache_ambiguous_name() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let generic = temp_dir.path().join("com/a/Dup.java");
+        let specific = temp_dir.path().join("com/b/Dup.java");
+        fs::create_dir_all(generic.parent().unwrap()).unwrap();
+        fs::create_dir_all(specific.parent().unwrap()).unwrap();
+        fs::write(
+            &generic,
+            "package com.a;\n\nclass Dup {\n    void run(String msg) {\n        log.info(\"count {}\", msg);\n    }\n}\n",
+        )
+        .unwrap();
+        fs::write(&specific, DUP_SRC).unwrap();
+        let matcher = matcher_for(temp_dir.path());
+
+        let match_path = |msg: &str| {
+            let log_ref = LogRefBuilder::new()
+                .with_file(Some("Dup.java"))
+                .with_lineno(Some(6))
+                .with_body(Some(msg))
+                .build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref)
+                .map(|src_ref| src_ref.source_path.clone())
+        };
+
+        assert!(match_path("count xyz").unwrap().ends_with("com/a/Dup.java"));
+        // The generic statement also matches, but must not hide the better one in the other file.
+        assert!(match_path("count is 3")
+            .unwrap()
+            .ends_with("com/b/Dup.java"));
+        let coll = matcher.roots.values().next().unwrap();
+        assert!(coll.line_cache.read().unwrap().is_empty());
     }
 
     fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
