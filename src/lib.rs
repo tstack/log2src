@@ -569,10 +569,16 @@ impl LogMatcher {
     }
 
     /// Add a source root path
+    /// Add a directory to search for source files.  A path under an existing root
+    /// is already covered and ignored.  Existing roots under the new path are
+    /// replaced by it, so a file is only ever in one root; otherwise its statements
+    /// would be found (and reported) once per root.
     pub fn add_root(&mut self, path: &Path) -> Result<(), LogError> {
         let path = path.canonicalize().unwrap_or(path.to_owned());
         if let Some(_existing_path) = self.match_path(&path) {
         } else {
+            self.roots
+                .retain(|existing_path, _| !existing_path.starts_with(&path));
             self.roots
                 .entry(path.to_owned())
                 .or_insert_with(|| SourceTree {
@@ -2138,6 +2144,41 @@ class Dup {
             work_totals(&listener),
             vec![(1, "paths".to_string()), (1, "files".to_string())]
         );
+    }
+
+    #[test]
+    fn test_nested_roots_find_statements_once() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project = temp_dir.path().join("project");
+        let src = project.join("src");
+        write_message_tree(&src);
+        let caller = src.join("com/example/cc/Caller.java").canonicalize().unwrap();
+        let count = |matcher: &LogMatcher| -> usize {
+            matcher
+                .find_source_file_statements(&caller)
+                .iter()
+                .map(|stmts| stmts.statements().count())
+                .sum()
+        };
+        let tracker = ProgressTracker::new();
+
+        // The parent added after the child replaces it.
+        let mut matcher = LogMatcher::new();
+        matcher.add_root(&src).unwrap();
+        matcher.add_root(&project).unwrap();
+        assert!(matcher.discover_sources(&tracker).is_empty());
+        matcher.extract_log_statements(&tracker);
+        let once = count(&matcher);
+        assert!(once > 0);
+        assert_eq!(matcher.find_source_file_statements(&caller).len(), 1);
+
+        // The child added after the parent is already covered.
+        let mut matcher = LogMatcher::new();
+        matcher.add_root(&project).unwrap();
+        matcher.add_root(&src).unwrap();
+        assert!(matcher.discover_sources(&tracker).is_empty());
+        matcher.extract_log_statements(&tracker);
+        assert_eq!(count(&matcher), once);
     }
 
     #[test]
