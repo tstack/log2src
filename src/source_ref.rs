@@ -192,6 +192,17 @@ fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<Mess
         None
     } else {
         pattern.push_str(subtext.as_str());
+        // Trailing whitespace, like the newline at the end of a multi-line message, is often
+        // trimmed by the logging framework or the log viewer, so it is optional.
+        let trimmed_len = trim_trailing_whitespace_regex(&pattern).len();
+        if trimmed_len < pattern.len() && trimmed_len > "(?s)^".len() {
+            pattern.truncate(trimmed_len);
+            if pattern.ends_with("(.+)") {
+                // Leave the whitespace out of the value of a placeholder at the end.
+                pattern.insert(pattern.len() - 1, '?');
+            }
+            pattern.push_str("\\s*");
+        }
         pattern.push('$');
         // A pattern that does not compile is not usable, so skip the log statement.
         Regex::new(pattern.as_str())
@@ -201,6 +212,26 @@ fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<Mess
                 quality,
                 args,
             })
+    }
+}
+
+/// Remove the whitespace at the end of a regex built by `push_regex_literal()`.
+fn trim_trailing_whitespace_regex(regex: &str) -> &str {
+    let mut rest = regex;
+    loop {
+        if let Some(prefix) = rest.strip_suffix(' ') {
+            rest = prefix;
+            continue;
+        }
+        let escaped = ["\\n", "\\r", "\\t"]
+            .iter()
+            .find_map(|esc| rest.strip_suffix(esc))
+            // The backslash must not itself be escaped, like in `\\n`.
+            .filter(|prefix| (prefix.len() - prefix.trim_end_matches('\\').len()) % 2 == 0);
+        match escaped {
+            Some(prefix) => rest = prefix,
+            None => return rest,
+        }
     }
 }
 
@@ -469,6 +500,24 @@ mod tests {
                 .as_str(),
             matcher.as_str()
         );
+    }
+
+    #[test]
+    fn test_build_matcher_trailing_whitespace() {
+        let MessageMatcher { matcher, .. } = build_matcher(
+            false,
+            "Headers:\\n{}\\n \\t",
+            SourceLanguage::Kotlin,
+        )
+        .unwrap();
+        assert_eq!(r#"(?s)^Headers:\n(.+?)\s*$"#, matcher.as_str());
+        assert!(matcher.is_match("Headers:\nA: b\n"));
+        assert!(matcher.is_match("Headers:\nA: b"));
+
+        // An escaped backslash followed by an 'n' is not a newline.
+        let MessageMatcher { matcher, .. } =
+            build_matcher(false, "path is C:\\\\n", SourceLanguage::Java).unwrap();
+        assert_eq!(r#"(?s)^path is C:\\n$"#, matcher.as_str());
     }
 
     #[test]
