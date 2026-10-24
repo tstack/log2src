@@ -6,13 +6,14 @@ use rayon::prelude::*;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io};
@@ -144,7 +145,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "14")]
+    #[serde(rename = "15")]
     Current,
 }
 
@@ -315,11 +316,12 @@ impl SourceTree {
                 self.files_with_statements.get(file_id)?.statement(*index)
             })
             .filter(|src_ref| src_ref.pattern.is_match(body))
-            .max_by_key(|src_ref| src_ref.quality)
+            .min_by(|lhs, rhs| compare_candidates(lhs, rhs, Some(lineno)))
     }
 
-    /// Find the highest quality statement that matches the given log message.  If the message
-    /// has a file name and line number, the statement is added to the cache for them.
+    /// Find the highest quality statement that matches the given log message, preferring the one
+    /// closest to the message's line number for a tie.  If the message has a file name and line
+    /// number, the statement is added to the cache for them.
     fn find_best_match(&self, log_ref: &LogRef) -> Option<&SourceRef> {
         let prefilter = self.prefilter.as_ref()?;
         let body = log_ref.body();
@@ -345,7 +347,8 @@ impl SourceTree {
                 candidates.extend(sif.statement(index).map(|stmt| ((file_id, index), stmt)));
             }
         });
-        candidates.sort_by(|lhs, rhs| rhs.1.quality.cmp(&lhs.1.quality));
+        let lineno = log_ref.details.as_ref().and_then(|details| details.lineno);
+        candidates.sort_by(|lhs, rhs| compare_candidates(lhs.1, rhs.1, lineno));
         let (stmt_id, src_ref) = candidates
             .into_iter()
             .find(|(_, src_ref)| src_ref.pattern.is_match(body))?;
@@ -365,6 +368,33 @@ impl SourceTree {
         }
         Some(src_ref)
     }
+}
+
+/// Order the candidate statements for a log message from best to worst.  Higher quality is
+/// better and, for the same quality, a statement closer to the line number in the log message.
+/// The line number is only a tie-breaker since it is not always the line of the log call, like
+/// for a message built in a lambda.  Any remaining tie goes to the earliest location in the
+/// source so that the choice does not depend on the order the candidates were found in.
+fn compare_candidates(lhs: &SourceRef, rhs: &SourceRef, lineno: Option<usize>) -> Ordering {
+    let distance = |src_ref: &SourceRef| {
+        lineno.map_or(0, |lineno| {
+            if lineno < src_ref.line_no {
+                src_ref.line_no - lineno
+            } else {
+                lineno.saturating_sub(src_ref.end_line_no)
+            }
+        })
+    };
+    rhs.quality
+        .cmp(&lhs.quality)
+        .then_with(|| distance(lhs).cmp(&distance(rhs)))
+        .then_with(|| {
+            (&lhs.source_path, lhs.line_no, lhs.column).cmp(&(
+                &rhs.source_path,
+                rhs.line_no,
+                rhs.column,
+            ))
+        })
 }
 
 /// Collection of root paths to their tree of source files
@@ -417,6 +447,73 @@ impl LogMatcher {
         Self {
             roots: HashMap::new(),
         }
+    }
+
+    /// Find a file, in any language, under one of the roots.  The file with the same name that
+    /// shares the longest trailing run of components with the path is chosen, so a path that is
+    /// not under a root, like an absolute path from the machine that produced a stack trace,
+    /// still matches.  If the path only partially matches more than one file, it is ambiguous
+    /// and nothing is returned rather than guessing.
+    ///
+    /// A relative path with directories, like a Java package's, has to match at least the file
+    /// and the directory it is in: `com/foo/Bar.java` is not `com/other/Bar.java`.  A Windows
+    /// path, like `C:\src\App\Program.cs` in a .NET trace, is read with `\` as the separator.
+    pub fn find_file(&self, path: &Path) -> Option<PathBuf> {
+        let windows_path = Self::from_windows_path(path);
+        let path = windows_path.as_deref().unwrap_or(path);
+        let names: Vec<_> = path
+            .components()
+            .filter_map(|comp| match comp {
+                Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        let file_name = names.last()?;
+        let mut candidates: Vec<_> = self
+            .roots
+            .values()
+            .flat_map(|root| root.tree.find_by_name(file_name))
+            .map(|found| {
+                let matched = found
+                    .components()
+                    .rev()
+                    .zip(names.iter().rev())
+                    .take_while(|(comp, name)| comp.as_os_str() == **name)
+                    .count();
+                (matched, found)
+            })
+            .collect();
+        // Sort by longest match and then by path so that the result does not depend on the
+        // order of the roots.
+        candidates.sort_by(|lhs, rhs| rhs.0.cmp(&lhs.0).then_with(|| lhs.1.cmp(&rhs.1)));
+        let mut iter = candidates.into_iter();
+        let (best_len, best) = iter.next()?;
+        if !path.has_root() && best_len < names.len().min(2) {
+            // Only the file name is the same, and the path's directories say where it is.
+            return None;
+        }
+        match iter.next() {
+            Some((next_len, _)) if next_len == best_len && best_len < names.len() => None,
+            _ => Some(best),
+        }
+    }
+
+    /// `path` with `/` for `\` and without its drive letter, if it's a Windows path: it has
+    /// backslashes and no slashes.
+    fn from_windows_path(path: &Path) -> Option<PathBuf> {
+        let path_str = path.to_str()?;
+        if !path_str.contains('\\') || path_str.contains('/') {
+            return None;
+        }
+        let path_str = path_str.replace('\\', "/");
+        let bytes = path_str.as_bytes();
+        let without_drive =
+            if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                &path_str[2..]
+            } else {
+                &path_str[..]
+            };
+        Some(PathBuf::from(without_drive))
     }
 
     fn load_cache_entry(path: &Path, input: impl Read) -> Result<SourceTree, LogError> {
@@ -1119,7 +1216,7 @@ static JAVA_CALLER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?smx)
     (?:
-        ^\s+at\s+(?<pkg>(?:[^.\n(]+\.)*)(?<class>[^.$\n(]+)\.(?<name>\S+)\((?<file>[^:]+):(?<line>\d+)\)\s*$\n?
+        ^\s+at\s+(?:[^\s/(]*/)*(?<pkg>(?:[\w$]+\.)*)(?<class>[\w$]+)\.(?<name>[\w$<>-]+)\((?<file>[^:()\n]+):(?<line>\d+)\)\s*$\n?
     )
 "#,
     )
@@ -1147,19 +1244,7 @@ impl<'a> StackTrace<'a> {
                         .map(|m| PathBuf::from(m.as_str().replace(".", "/")))
                         .unwrap_or_default();
                     let path_for_class = path_for_pkg.join(cap.name("file").unwrap().as_str());
-                    let full_path = log_matcher
-                        .roots
-                        .values()
-                        .filter_map(|root| {
-                            if let Some((actual_path, _source_info)) =
-                                root.tree.find_file(&path_for_class).iter().next()
-                            {
-                                Some(actual_path.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .next();
+                    let full_path = log_matcher.find_file(&path_for_class);
                     if let Some(full_path) = full_path {
                         retval.push(CallSite {
                             name: cap.name("name").unwrap().as_str().to_string(),
@@ -1993,6 +2078,96 @@ class Dup {
         assert!(coll.line_cache.read().unwrap().is_empty());
     }
 
+    const SAME_TEXT_SRC: &str = r#"package com.example;
+
+class Same {
+    void start(int count) {
+        log.info("count is {}", count);
+    }
+
+    void stop(int count) {
+        log.info("count is {}", count);
+    }
+}
+"#;
+
+    #[test]
+    fn test_closest_line() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let first = temp_dir.path().join("com/a/Same.java");
+        let second = temp_dir.path().join("com/b/Same.java");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, SAME_TEXT_SRC).unwrap();
+        // Shift the statements so they are on different lines from the first file.
+        fs::write(
+            &second,
+            SAME_TEXT_SRC.replace("class Same {", "class Same {\n\n\n\n\n"),
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+
+        let match_line = |lineno: Option<usize>| {
+            let msg = "count is 3";
+            let log_ref = LogRefBuilder::new()
+                .with_file(Some("Same.java"))
+                .with_lineno(lineno)
+                .with_body(Some(msg))
+                .build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref)
+                .map(|src_ref| {
+                    let dir = if src_ref.source_path.ends_with("com/a/Same.java") {
+                        "a"
+                    } else {
+                        "b"
+                    };
+                    (dir, src_ref.line_no)
+                })
+        };
+
+        assert_eq!(match_line(Some(5)), Some(("a", 5)));
+        assert_eq!(match_line(Some(9)), Some(("a", 9)));
+        assert_eq!(match_line(Some(10)), Some(("b", 10)));
+        assert_eq!(match_line(Some(14)), Some(("b", 14)));
+        // Not exactly on a statement, so the nearest one.
+        assert_eq!(match_line(Some(8)), Some(("a", 9)));
+        // Equally close to a:5 and a:9, so the earlier one.
+        assert_eq!(match_line(Some(7)), Some(("a", 5)));
+        assert_eq!(match_line(Some(100)), Some(("b", 14)));
+        // Without a line number, any of them will do.
+        assert!(match_line(None).is_some());
+    }
+
+    #[test]
+    fn test_closest_line_cached() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("com/example/Same.java");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, SAME_TEXT_SRC).unwrap();
+        let matcher = matcher_for(temp_dir.path());
+
+        let match_line = |lineno: usize| {
+            let msg = "count is 3";
+            let log_ref = LogRefBuilder::new()
+                .with_file(Some("Same.java"))
+                .with_lineno(Some(lineno))
+                .with_body(Some(msg))
+                .build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref)
+                .map(|src_ref| src_ref.line_no)
+        };
+
+        // The second lookup for each line is answered by the cache.
+        for _ in 0..2 {
+            assert_eq!(match_line(9), Some(9));
+            assert_eq!(match_line(5), Some(5));
+        }
+    }
+
     fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
             .iter()
@@ -2152,7 +2327,10 @@ class Dup {
         let project = temp_dir.path().join("project");
         let src = project.join("src");
         write_message_tree(&src);
-        let caller = src.join("com/example/cc/Caller.java").canonicalize().unwrap();
+        let caller = src
+            .join("com/example/cc/Caller.java")
+            .canonicalize()
+            .unwrap();
         let count = |matcher: &LogMatcher| -> usize {
             matcher
                 .find_source_file_statements(&caller)
@@ -2291,6 +2469,111 @@ class Dup {
         assert_eq!(src_refs[0].vars, vec!["path", "line", "0"]);
         assert_eq!(src_refs[1].pattern().as_str(), "(?s)^read (.+) bytes$");
         assert_eq!(src_refs[1].vars, vec!["size"]);
+    }
+
+    const CPP_SPLIT_ELSE_SOURCE: &str = r#"
+    bool load(int fd) {
+        int rc = 0;
+        if (fd == 0) {
+            rc = 1;
+        }
+    #ifdef HAVE_BZLIB_H // ü
+        else if (fd == 1) {
+            rc = 2;
+        }
+    #endif
+        else {
+            rc = 3;
+        }
+        log_debug("END load fd(%d): %d", fd, rc);
+        return true;
+    }
+    "#;
+
+    #[test]
+    fn test_cpp_else_split_by_preproc() {
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_SPLIT_ELSE_SOURCE);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        assert_eq!(src_refs.len(), 1);
+        assert_eq!(src_refs[0].line_no, 15);
+        assert_eq!(src_refs[0].text, r#""END load fd(%d): %d""#);
+        assert_eq!(src_refs[0].vars, vec!["fd", "rc"]);
+    }
+
+    const CPP_SPLIT_ELSE_COMPLEX_SOURCE: &str = r#"
+bool load(int fd) {
+    int rc = 0;
+    if (fd == 0) {
+        rc = 1;
+    }
+#if defined(HAVE_BZLIB_H) && (BZ_VERSION >= 0x0106 || \
+        !defined(_WIN32)) /* ü */
+    else if (fd == 1) {
+        rc = 2;
+    }
+#elif (defined(HAVE_ZLIB_H) && ZLIB_VERNUM > 0x1200) || defined(__APPLE__)
+    else if (fd == 2) {
+        rc = 4;
+    }
+#endif
+    else {
+        rc = 3;
+    }
+    log_debug("END load fd(%d): %d", fd, rc);
+    return true;
+}
+
+int other(int x) {
+    log_debug("second %d", x);
+    return 1;
+}
+"#;
+
+    #[test]
+    fn test_cpp_else_split_by_complex_preproc() {
+        let code =
+            CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_SPLIT_ELSE_COMPLEX_SOURCE);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        assert_eq!(src_refs.len(), 2);
+        assert_eq!(src_refs[0].line_no, 20);
+        assert_eq!(src_refs[0].qualified_name, "load");
+        assert_eq!(src_refs[0].vars, vec!["fd", "rc"]);
+        assert_eq!(src_refs[1].line_no, 25);
+        assert_eq!(src_refs[1].qualified_name, "other");
+    }
+
+    const CPP_SPLIT_SIGNATURE_SOURCE: &str = r#"
+#ifdef WIN32
+int load(int fd, HANDLE h) {
+#else
+int load(int fd) {
+#endif
+    log_debug("first %d", fd);
+    return 0;
+}
+
+int other(int x) {
+    log_debug("second %d", x);
+    return 1;
+}
+"#;
+
+    #[test]
+    fn test_cpp_signature_split_by_preproc() {
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_SPLIT_SIGNATURE_SOURCE);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        assert_eq!(src_refs.len(), 2);
+        assert_eq!(src_refs[0].qualified_name, "load");
+        assert_eq!(src_refs[1].qualified_name, "other");
     }
 
     #[test]
@@ -2968,6 +3251,166 @@ java.lang.IllegalStateException: simulated failure for demo
             vec![
                 ("run".to_string(), SourceLanguage::Kotlin, 13),
                 ("main".to_string(), SourceLanguage::Kotlin, 21),
+            ]
+        );
+    }
+
+    fn find_file_matcher() -> (tempfile::TempDir, LogMatcher) {
+        let dir = tempfile::tempdir().unwrap();
+        for rel in [
+            "cmd/server/main.go",
+            "src/main/java/com/foo/Bar.java",
+            "src/main/java/com/other/Bar.java",
+            "src/main/kotlin/com/MyCo/app/UserId.kt",
+        ] {
+            let path = dir.path().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "class Bar {}\n").unwrap();
+        }
+        let mut log_matcher = LogMatcher::new();
+        log_matcher.add_root(dir.path()).unwrap();
+        assert!(log_matcher
+            .discover_sources(&ProgressTracker::new())
+            .is_empty());
+        (dir, log_matcher)
+    }
+
+    #[test]
+    fn test_find_file() {
+        let (dir, log_matcher) = find_file_matcher();
+        let root = dir.path().canonicalize().unwrap();
+        let canon = |path: Option<PathBuf>| path.map(|path| path.canonicalize().unwrap());
+        let main_go = Some(root.join("cmd/server/main.go"));
+
+        // Files in languages that are not scanned for log statements are found too.
+        assert_eq!(
+            canon(log_matcher.find_file(Path::new("cmd/server/main.go"))),
+            main_go
+        );
+        assert_eq!(
+            canon(log_matcher.find_file(Path::new("./cmd/server/main.go"))),
+            main_go
+        );
+        // An absolute path from another machine is matched by its suffix.
+        assert_eq!(
+            canon(log_matcher.find_file(Path::new("/build/agent/work/cmd/server/main.go"))),
+            main_go
+        );
+        assert_eq!(
+            log_matcher.find_file(Path::new("cmd/server/missing.go")),
+            None
+        );
+
+        let foo_bar = Some(root.join("src/main/java/com/foo/Bar.java"));
+        // The longest matching suffix wins.
+        assert_eq!(
+            canon(log_matcher.find_file(Path::new("x/foo/Bar.java"))),
+            foo_bar
+        );
+        // Both Bar.java files match only by name, so it is ambiguous.
+        assert_eq!(log_matcher.find_file(Path::new("com/zzz/Bar.java")), None);
+        // A bare name is matched completely by both, so the first one is picked.
+        assert_eq!(canon(log_matcher.find_file(Path::new("Bar.java"))), foo_bar);
+
+        // A relative path's directories say where the file is: the only main.go is in another
+        // directory, so it isn't this one.
+        assert_eq!(log_matcher.find_file(Path::new("net/other/main.go")), None);
+        // An absolute path from another machine can fall back to the file name alone.
+        assert_eq!(
+            canon(log_matcher.find_file(Path::new("/build/agent/main.go"))),
+            main_go
+        );
+        // A Windows path, as in a .NET trace.
+        assert_eq!(
+            canon(log_matcher.find_file(Path::new(r"C:\build\agent\cmd\server\main.go"))),
+            main_go
+        );
+        assert_eq!(
+            canon(log_matcher.find_file(Path::new(r"cmd\server\main.go"))),
+            main_go
+        );
+    }
+
+    #[test]
+    fn test_from_windows_path() {
+        let cases = [
+            (r"C:\build\agent\main.go", Some("/build/agent/main.go")),
+            (r"c:\src\App\Program.cs", Some("/src/App/Program.cs")),
+            (r"C:\", Some("/")),
+            (r"cmd\server\main.go", Some("cmd/server/main.go")),
+            (r"\\server\share\App.cs", Some("//server/share/App.cs")),
+            // Not Windows paths, so they are left alone.
+            ("cmd/server/main.go", None),
+            (r"C:\build/agent\main.go", None),
+            ("main.go", None),
+            ("C:", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                LogMatcher::from_windows_path(Path::new(input)),
+                expected.map(PathBuf::from),
+                "input: {input}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_from_windows_path_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"C:\\build\\\xff.go"));
+        assert_eq!(LogMatcher::from_windows_path(path), None);
+    }
+
+    #[test]
+    fn test_java_trace_inner_classes() {
+        let content = r#"java.lang.IllegalStateException: boom
+	at com.foo.Bar$1.run(Bar.java:42)
+	at com.foo.Bar$Inner$2.call(Bar.java:55)
+	at com.foo.Bar.lambda$main$0(Bar.java:12)
+	at app//com.foo.Bar$1.<init>(Bar.java:40)
+	at com.foo.Bar$$Lambda$14/0x0000000800c03000.run(Unknown Source)
+	at com.zzz.Bar.run(Bar.java:7)
+	at com.MyCo.app.UserId.box-impl(UserId.kt:5)
+	at java.base/java.lang.Thread.run(Thread.java:833)
+"#;
+        let (dir, log_matcher) = find_file_matcher();
+        let bar = dir
+            .path()
+            .join("src/main/java/com/foo/Bar.java")
+            .canonicalize()
+            .unwrap();
+        let user_id = dir
+            .path()
+            .join("src/main/kotlin/com/MyCo/app/UserId.kt")
+            .canonicalize()
+            .unwrap();
+        let stacktrace = StackTrace {
+            language: SourceLanguage::Java,
+            content,
+        };
+        let trace: Vec<_> = stacktrace
+            .to_exception_trace(&log_matcher)
+            .into_iter()
+            .map(|site| {
+                (
+                    site.name,
+                    PathBuf::from(site.source_path).canonicalize().unwrap(),
+                    site.line_no,
+                )
+            })
+            .collect();
+        // com/other/Bar.java has the same name, so the package has to be split off correctly.
+        // com.zzz.Bar is in neither package, so it is dropped instead of guessing.
+        assert_eq!(
+            trace,
+            vec![
+                ("run".to_string(), bar.clone(), 42),
+                ("call".to_string(), bar.clone(), 55),
+                ("lambda$main$0".to_string(), bar.clone(), 12),
+                ("<init>".to_string(), bar.clone(), 40),
+                ("box-impl".to_string(), user_id, 5),
             ]
         );
     }

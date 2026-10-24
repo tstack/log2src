@@ -590,6 +590,36 @@ impl SourceHierTree {
         retval
     }
 
+    /// Find every file with the given name, in any language, including the ones that are not
+    /// scanned for log statements.
+    pub fn find_by_name(&self, name: &OsStr) -> Vec<PathBuf> {
+        fn walk(node: &SourceHierNode, path: &mut PathBuf, name: &OsStr, accum: &mut Vec<PathBuf>) {
+            match &node.content {
+                SourceHierContent::File { .. } | SourceHierContent::UnsupportedFile {}
+                    if path.file_name() == Some(name) =>
+                {
+                    accum.push(path.clone());
+                }
+                SourceHierContent::Directory { entries } => {
+                    for (entry_name, child) in entries {
+                        path.push(entry_name);
+                        walk(child, path, name, accum);
+                        path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut retval = vec![];
+        walk(
+            &self.root_node,
+            &mut self.root_path.clone(),
+            name,
+            &mut retval,
+        );
+        retval
+    }
+
     /// Visit every node in the hierarchy, depth-first, calling `f` on each.
     pub fn visit<F>(&self, mut f: F)
     where

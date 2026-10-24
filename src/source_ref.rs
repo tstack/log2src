@@ -504,12 +504,8 @@ mod tests {
 
     #[test]
     fn test_build_matcher_trailing_whitespace() {
-        let MessageMatcher { matcher, .. } = build_matcher(
-            false,
-            "Headers:\\n{}\\n \\t",
-            SourceLanguage::Kotlin,
-        )
-        .unwrap();
+        let MessageMatcher { matcher, .. } =
+            build_matcher(false, "Headers:\\n{}\\n \\t", SourceLanguage::Kotlin).unwrap();
         assert_eq!(r#"(?s)^Headers:\n(.+?)\s*$"#, matcher.as_str());
         assert!(matcher.is_match("Headers:\nA: b\n"));
         assert!(matcher.is_match("Headers:\nA: b"));

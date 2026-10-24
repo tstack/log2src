@@ -37,13 +37,97 @@ impl<'a> SourceQuery<'a> {
             .set_language(&language)
             .unwrap_or_else(|_| panic!("Error loading {:?} grammar", language));
         let source = code.buffer.as_str();
-        let tree = parser.parse(source, None).expect("source is parsable");
+        let mut tree = parser.parse(source, None).expect("source is parsable");
+        if code.info.language == SourceLanguage::Cpp && tree.root_node().has_error() {
+            // Masking the conditionals can also break code that parses fine as-is, like
+            // alternate function signatures in each branch, so it is only a fallback.
+            if let Some(masked_source) = Self::mask_preproc_conditionals(source, &tree) {
+                let masked = parser
+                    .parse(masked_source, None)
+                    .expect("source is parsable");
+                if Self::error_count(&masked) < Self::error_count(&tree) {
+                    tree = masked;
+                }
+            }
+        }
         SourceQuery {
             source,
             filename: code.filename.as_str(),
             tree,
             language,
             source_language: code.info.language,
+        }
+    }
+
+    /// Blank out the `#if`/`#else`/`#endif` family of directives so the parser sees the code in
+    /// every branch.  The grammar cannot handle a conditional that splits a statement, like an
+    /// `else if` chain with one link under `#ifdef`, and its error recovery ends the function
+    /// early, which leaves the rest of its log statements at file scope.  The directives are
+    /// replaced with spaces so that byte offsets and line numbers still match the original
+    /// source.  Directive-like text in comments and string literals, according to the original
+    /// `tree`, is left alone.  Returns None if there was nothing to mask.
+    fn mask_preproc_conditionals(source: &str, tree: &Tree) -> Option<String> {
+        static CONDITIONAL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r"(?m)^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b(?:[^\n]*\\\r?\n)*[^\n]*",
+            )
+            .unwrap()
+        });
+        let mut masked_any = false;
+        let retval = CONDITIONAL_REGEX.replace_all(source, |caps: &regex::Captures| {
+            let whole = caps.get(0).unwrap();
+            let hash_pos = whole.start() + whole.as_str().find('#').unwrap();
+            let in_literal = tree
+                .root_node()
+                .descendant_for_byte_range(hash_pos, hash_pos + 1)
+                .is_some_and(|node| {
+                    matches!(
+                        node.kind(),
+                        "comment"
+                            | "string_literal"
+                            | "string_content"
+                            | "raw_string_literal"
+                            | "raw_string_content"
+                    )
+                });
+            if in_literal {
+                return whole.as_str().to_string();
+            }
+            masked_any = true;
+            // Map by byte so that multibyte characters in a trailing comment keep the
+            // same length.
+            caps[0]
+                .bytes()
+                .map(|b| {
+                    if b == b'\n' || b == b'\r' {
+                        b as char
+                    } else {
+                        ' '
+                    }
+                })
+                .collect::<String>()
+        });
+        masked_any.then(|| retval.into_owned())
+    }
+
+    /// Count the error and missing nodes in a tree.
+    fn error_count(tree: &Tree) -> usize {
+        let mut count = 0;
+        let mut cursor = tree.walk();
+        loop {
+            let node = cursor.node();
+            if node.is_error() || node.is_missing() {
+                count += 1;
+            }
+            // Only subtrees with errors need to be visited.
+            if node.has_error() && cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    return count;
+                }
+            }
         }
     }
 
@@ -883,4 +967,41 @@ enum ConcatPiece<'a> {
 fn is_inttypes_macro(text: &str) -> bool {
     (text.starts_with("PRI") || text.starts_with("SCN"))
         && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[cfg(test)]
+mod test {
+    use super::SourceQuery;
+    use tree_sitter::Parser;
+
+    fn mask(source: &str) -> Option<String> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        SourceQuery::mask_preproc_conditionals(source, &tree)
+    }
+
+    #[test]
+    fn test_mask_preproc_conditionals() {
+        let source = "int f() {\n#ifdef A\n  return 1;\n#endif\n}\n";
+        assert_eq!(
+            mask(source).as_deref(),
+            Some("int f() {\n        \n  return 1;\n      \n}\n")
+        );
+        assert_eq!(mask("int f() { return 1; }\n"), None);
+    }
+
+    #[test]
+    fn test_mask_preproc_conditionals_skips_literals() {
+        let source = r#"/* note
+#if FOO
+*/
+const char *s = R"(
+#else
+)";
+"#;
+        assert_eq!(mask(source), None);
+    }
 }
