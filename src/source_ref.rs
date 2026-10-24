@@ -1,9 +1,11 @@
 use crate::java_symbols::MessageRef;
+use crate::value_kind::{PatternParts, ValueKind, ANY_CAPTURE};
 use crate::{CodeSource, QueryResult, SourceLanguage};
 use core::fmt;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use std::str::Chars;
+use std::sync::OnceLock;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum FormatArgument {
@@ -51,6 +53,13 @@ pub struct SourceRef {
     pub pattern_str: String,
     pub(crate) args: Vec<FormatArgument>,
     pub(crate) vars: Vec<String>,
+    /// The kinds of values expected for the placeholders, based on the format spec and the
+    /// argument expressions.  This, and `segment_matchers`, are only computed when needed since
+    /// most statements are never matched.
+    #[serde(skip)]
+    value_kinds: OnceLock<Option<Vec<ValueKind>>>,
+    #[serde(skip)]
+    segment_matchers: OnceLock<Option<Vec<Regex>>>,
 }
 
 struct MessageMatcher {
@@ -102,6 +111,8 @@ impl SourceRef {
                 pattern: matcher,
                 args,
                 vars: vec![],
+                value_kinds: OnceLock::new(),
+                segment_matchers: OnceLock::new(),
             })
         } else {
             None
@@ -135,6 +146,8 @@ impl SourceRef {
             pattern: matcher,
             args,
             vars: message_ref.vars.clone(),
+            value_kinds: OnceLock::new(),
+            segment_matchers: OnceLock::new(),
         })
     }
 
@@ -145,6 +158,32 @@ impl SourceRef {
     /// The regex used to match log messages to this statement.
     pub fn pattern(&self) -> &Regex {
         &self.pattern
+    }
+
+    /// The kinds of values expected for the placeholders.  `exprs` are the argument
+    /// expressions for the placeholders, which are used when the format spec does not have a
+    /// kind.
+    pub(crate) fn value_kinds(&self, exprs: &[String]) -> Option<&[ValueKind]> {
+        self.value_kinds
+            .get_or_init(|| {
+                let parts = PatternParts::parse(self.pattern.as_str())?;
+                (parts.kinds.len() == exprs.len()).then(|| {
+                    std::iter::zip(parts.kinds, exprs)
+                        .map(|(kind, expr)| match kind {
+                            ValueKind::Any => ValueKind::from_expression(self.language, expr),
+                            _ => kind,
+                        })
+                        .collect()
+                })
+            })
+            .as_deref()
+    }
+
+    /// Anchored regexes for the literal text before, between, and after the placeholders.
+    pub(crate) fn segment_matchers(&self) -> Option<&[Regex]> {
+        self.segment_matchers
+            .get_or_init(|| PatternParts::parse(self.pattern.as_str())?.compile_segments())
+            .as_deref()
     }
 }
 
@@ -183,7 +222,8 @@ fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<Mess
         quality += subtext.chars().filter(|c| !c.is_whitespace()).count();
         pattern.push_str(subtext.as_str());
         last_end = placeholder.end();
-        pattern.push_str("(.+)");
+        let kind = ValueKind::from_placeholder(language, placeholder.as_str());
+        pattern.push_str(kind.capture_regex());
         args.push(language.captures_to_format_arg(&cap));
     }
     let subtext = literal_to_regex(raw, language, &text[last_end..]);
@@ -197,7 +237,7 @@ fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<Mess
         let trimmed_len = trim_trailing_whitespace_regex(&pattern).len();
         if trimmed_len < pattern.len() && trimmed_len > "(?s)^".len() {
             pattern.truncate(trimmed_len);
-            if pattern.ends_with("(.+)") {
+            if pattern.ends_with(ANY_CAPTURE) {
                 // Leave the whitespace out of the value of a placeholder at the end.
                 pattern.insert(pattern.len() - 1, '?');
             }
@@ -459,7 +499,7 @@ mod tests {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "they are %d years old", SourceLanguage::Cpp).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^they are (.+) years old$"#)
+            Regex::new(r#"(?s)^they are \s*([-+]?\d+)\s* years old$"#)
                 .unwrap()
                 .as_str(),
             matcher.as_str()
@@ -472,7 +512,7 @@ mod tests {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "they are {0:d} years old", SourceLanguage::Cpp).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^they are (.+) years old$"#)
+            Regex::new(r#"(?s)^they are \s*([-+]?\d+)\s* years old$"#)
                 .unwrap()
                 .as_str(),
             matcher.as_str()

@@ -29,6 +29,7 @@ mod progress;
 mod source_hier;
 mod source_query;
 mod source_ref;
+mod value_kind;
 
 // TODO: doesn't need to be exposed if we can clean up the arguments to do_mapping
 use crate::java_symbols::{JavaSymbols, MessageRef, StringConstant};
@@ -145,7 +146,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "15")]
+    #[serde(rename = "16")]
     Current,
 }
 
@@ -1431,8 +1432,10 @@ pub fn extract_variables<'a>(log_ref: &LogRef<'a>, src_ref: &'a SourceRef) -> Ve
     };
     if let Some(captures) = src_ref.captures(line) {
         let mut placeholder_index = 0;
-        for (cap, placeholder) in std::iter::zip(captures.iter().skip(1), src_ref.args.iter()) {
-            let expr = match placeholder {
+        let exprs: Vec<String> = src_ref
+            .args
+            .iter()
+            .map(|placeholder| match placeholder {
                 FormatArgument::Named(name) => name.clone(),
                 FormatArgument::Positional(pos) => src_ref
                     .vars
@@ -1451,10 +1454,29 @@ pub fn extract_variables<'a>(log_ref: &LogRef<'a>, src_ref: &'a SourceRef) -> Ve
                     placeholder_index += 1;
                     res
                 }
-            };
+            })
+            .collect();
+        // The greedy captures are ambiguous when placeholders are next to each other, so try to
+        // re-split the line using the kinds of values expected for each placeholder.
+        let mut ranges: Vec<std::ops::Range<usize>> = captures
+            .iter()
+            .skip(1)
+            .map(|cap| cap.unwrap().range())
+            .collect();
+        if let Some(kinds) = src_ref.value_kinds(&exprs) {
+            if !value_kind::is_plausible(line, &ranges, kinds) {
+                if let Some(split) = src_ref
+                    .segment_matchers()
+                    .and_then(|segments| value_kind::split_values(line, segments, kinds))
+                {
+                    ranges = split;
+                }
+            }
+        }
+        for (expr, range) in std::iter::zip(exprs, ranges) {
             variables.push(VariablePair {
                 expr,
-                value: cap.unwrap().as_str().to_string(),
+                value: line[range].to_string(),
             });
         }
     }
@@ -2463,11 +2485,14 @@ class Same {
         assert_eq!(src_refs.len(), 2);
         assert_eq!(
             src_refs[0].pattern().as_str(),
-            "(?s)^Opening href with external editor: (.+):(.+):(.+)$"
+            r"(?s)^Opening href with external editor: (.+):\s*([-+]?\d+)\s*:\s*([-+]?\d+)\s*$"
         );
         assert_eq!((src_refs[0].line_no, src_refs[0].end_line_no), (4, 8));
         assert_eq!(src_refs[0].vars, vec!["path", "line", "0"]);
-        assert_eq!(src_refs[1].pattern().as_str(), "(?s)^read (.+) bytes$");
+        assert_eq!(
+            src_refs[1].pattern().as_str(),
+            r"(?s)^read \s*([-+]?\d+)\s* bytes$"
+        );
         assert_eq!(src_refs[1].vars, vec!["size"]);
     }
 
@@ -2638,7 +2663,7 @@ def main(name, count, x):
             patterns,
             vec![
                 r"(?s)^first part second part (.+)$",
-                r"(?s)^user (.+) has (.+) items$",
+                r"(?s)^user (.+) has \s*([-+]?\d+)\s* items$",
                 r"(?s)^C:\\dir x\tz$",
                 r"(?s)^\{literal\} (.+)$",
                 r"(?s)^raw\\d \{x\}$",
@@ -3198,6 +3223,219 @@ fun handle(x: Boolean, y: Int) {
                 &["i"],
                 &["k"],
             ],
+        );
+    }
+
+    fn extract_pairs(path: &str, source: &str, index: usize, line: &str) -> Vec<(String, String)> {
+        let log_ref = LogRefBuilder::new().build(line);
+        let code = CodeSource::from_string(Path::new(path), source);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        extract_variables(&log_ref, &src_refs[index])
+            .into_iter()
+            .map(|pair| (pair.expr, pair.value))
+            .collect()
+    }
+
+    const JAVA_ADJACENT_SOURCE: &str = r#"
+public class Adjacent {
+    public void run() {
+        log.debug("foo bar: {} {} {}", a, b, c);
+        log.debug("sizes: {} {} {}", name, items.size(), other);
+        log.debug("flags: {}{}", ready, map.isEmpty());
+    }
+}
+"#;
+
+    #[test]
+    fn test_adjacent_java() {
+        assert_eq!(
+            extract_pairs(
+                "in-mem.java",
+                JAVA_ADJACENT_SOURCE,
+                0,
+                "foo bar: 1 2 [a, b]"
+            ),
+            pairs(&[("a", "1"), ("b", "2"), ("c", "[a, b]")])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.java",
+                JAVA_ADJACENT_SOURCE,
+                0,
+                "foo bar: {k=v, z=1} [x, y] 42"
+            ),
+            pairs(&[("a", "{k=v, z=1}"), ("b", "[x, y]"), ("c", "42")])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.java",
+                JAVA_ADJACENT_SOURCE,
+                1,
+                "sizes: hello world 5 foo bar"
+            ),
+            pairs(&[
+                ("name", "hello world"),
+                ("items.size()", "5"),
+                ("other", "foo bar")
+            ])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.java", JAVA_ADJACENT_SOURCE, 2, "flags: truefalse"),
+            pairs(&[("ready", "true"), ("map.isEmpty()", "false")])
+        );
+        // Without any hints, the split is ambiguous and the earlier placeholder gets more.
+        assert_eq!(
+            extract_pairs(
+                "in-mem.java",
+                JAVA_ADJACENT_SOURCE,
+                0,
+                "foo bar: 1 hello world 3"
+            ),
+            pairs(&[("a", "1 hello"), ("b", "world"), ("c", "3")])
+        );
+    }
+
+    const RUST_ADJACENT_SOURCE: &str = r#"
+fn adjacent(mask: u32, name: &str, point: Point) {
+    debug!("mask: {:x} {}", mask, name);
+    debug!("point: {:?} {:?}", name, point);
+    debug!("count: {} {}", name, v.len());
+    debug!("trailing: {} {}\n", name, point);
+}
+"#;
+
+    #[test]
+    fn test_adjacent_rust() {
+        assert_eq!(
+            extract_pairs("in-mem.rs", RUST_ADJACENT_SOURCE, 0, "mask: ff hello world"),
+            pairs(&[("mask", "ff"), ("name", "hello world")])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.rs",
+                RUST_ADJACENT_SOURCE,
+                1,
+                r#"point: "a b" Point { x: 1, y: 2 }"#
+            ),
+            pairs(&[("name", r#""a b""#), ("point", "Point { x: 1, y: 2 }")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.rs", RUST_ADJACENT_SOURCE, 2, "count: a b c 3"),
+            pairs(&[("name", "a b c"), ("v.len()", "3")])
+        );
+        // The trailing newline is optional and is not part of the last value.
+        for line in ["trailing: a [b, c]", "trailing: a [b, c]\n"] {
+            assert_eq!(
+                extract_pairs("in-mem.rs", RUST_ADJACENT_SOURCE, 3, line),
+                pairs(&[("name", "a"), ("point", "[b, c]")])
+            );
+        }
+    }
+
+    const CPP_ADJACENT_SOURCE: &str = r#"
+    #include <stdio.h>
+
+    int main(int argc, char* argv[]) {
+        printf("got: %d %s %5d|", argc, argv[1], count);
+    }
+    "#;
+
+    #[test]
+    fn test_adjacent_cpp() {
+        assert_eq!(
+            extract_pairs(
+                "in-mem.cc",
+                CPP_ADJACENT_SOURCE,
+                0,
+                "got: 1 hello world    42|"
+            ),
+            pairs(&[("argc", "1"), ("argv[1]", "hello world"), ("count", "42")])
+        );
+    }
+
+    const PYTHON_ADJACENT_SOURCE: &str = r#"
+def main(args):
+    logger.info(f"stats: {name} {count:d} {other}")
+    logger.info("items: %s %s", len(items), rest)
+"#;
+
+    #[test]
+    fn test_adjacent_python() {
+        assert_eq!(
+            extract_pairs(
+                "in-mem.py",
+                PYTHON_ADJACENT_SOURCE,
+                0,
+                "stats: hello world 3 foo bar"
+            ),
+            pairs(&[
+                ("name", "hello world"),
+                ("count", "3"),
+                ("other", "foo bar")
+            ])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.py",
+                PYTHON_ADJACENT_SOURCE,
+                1,
+                "items: 3 ['a b', 'c']"
+            ),
+            pairs(&[("len(items)", "3"), ("rest", "['a b', 'c']")])
+        );
+    }
+
+    const KOTLIN_ADJACENT_SOURCE: &str = r#"
+class Adjacent {
+    fun run(name: String, items: List<String>, other: String) {
+        logger.info("sizes: $name ${items.size} $other")
+    }
+}
+"#;
+
+    #[test]
+    fn test_adjacent_kotlin() {
+        assert_eq!(
+            extract_pairs(
+                "in-mem.kt",
+                KOTLIN_ADJACENT_SOURCE,
+                0,
+                "sizes: hello world 5 [a, b]"
+            ),
+            pairs(&[
+                ("name", "hello world"),
+                ("items.size", "5"),
+                ("other", "[a, b]")
+            ])
+        );
+    }
+
+    #[test]
+    fn test_adjacent_after_cache_round_trip() {
+        let code = CodeSource::from_string(Path::new("in-mem.java"), JAVA_ADJACENT_SOURCE);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let encoded =
+            bincode::serde::encode_to_vec(&src_refs[1], bincode::config::standard()).unwrap();
+        let (decoded, _): (SourceRef, usize) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        let log_ref = LogRefBuilder::new().build("sizes: hello world 5 foo bar");
+        let vars: Vec<(String, String)> = extract_variables(&log_ref, &decoded)
+            .into_iter()
+            .map(|pair| (pair.expr, pair.value))
+            .collect();
+        assert_eq!(
+            vars,
+            pairs(&[
+                ("name", "hello world"),
+                ("items.size()", "5"),
+                ("other", "foo bar")
+            ])
         );
     }
 

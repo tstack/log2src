@@ -218,9 +218,16 @@ fn synthesize(pattern: &str) -> Option<String> {
             HirKind::Empty | HirKind::Look(_) => {}
             HirKind::Literal(lit) => out.extend_from_slice(&lit.0),
             HirKind::Class(_) => out.push(b'z'),
-            HirKind::Capture(_) => {
+            HirKind::Capture(cap) => {
                 *counter += 1;
-                out.extend_from_slice(format!("val{}", counter).as_bytes());
+                // Placeholders that are not `(.+)` only match certain kinds of values, which
+                // are mostly numbers.
+                let value = if matches!(cap.sub.kind(), HirKind::Repetition(_)) {
+                    format!("val{}", counter)
+                } else {
+                    counter.to_string()
+                };
+                out.extend_from_slice(value.as_bytes());
             }
             HirKind::Repetition(rep) => walk(&rep.sub, out, counter),
             HirKind::Concat(subs) => subs.iter().for_each(|s| walk(s, out, counter)),

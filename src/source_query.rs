@@ -5,6 +5,7 @@ use tree_sitter::{
 };
 
 use crate::source_ref::FormatArgument;
+use crate::value_kind::ValueKind;
 use crate::{CodeSource, SourceLanguage};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -386,8 +387,17 @@ impl<'a> SourceQuery<'a> {
                         pattern.push_str(&content);
                     }
                     "interpolation" => {
-                        // Swap in a Python placeholder for the interpolation expression.
-                        pattern.push_str("%s");
+                        // Swap in a Python placeholder for the interpolation expression that
+                        // preserves the kind of value from the format spec, if there is one.
+                        let mut spec_cursor = string_child.walk();
+                        let kind = string_child
+                            .children(&mut spec_cursor)
+                            .find(|node| node.kind() == "format_specifier")
+                            .map_or(ValueKind::Any, |spec| {
+                                let spec = &self.source[spec.byte_range()];
+                                ValueKind::from_format_spec(spec.strip_prefix(':').unwrap_or(spec))
+                            });
+                        pattern.push_str(kind.printf_placeholder());
                         interpolated = true;
                         if let Some(expr) = string_child.child_by_field_name("expression") {
                             args.push(FormatArgument::Named(
