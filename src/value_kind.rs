@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::LazyLock;
+use tree_sitter::Node;
 
 /// The kind of value that is expected to be substituted for a placeholder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -157,107 +158,202 @@ impl ValueKind {
         }
     }
 
-    /// Guess the kind of value from the syntax of the argument expression.  Since we only have
-    /// a syntax tree and no type information, this is limited to things like literals, casts,
-    /// and calls/operators whose result type is obvious.
-    pub fn from_expression(language: SourceLanguage, expr: &str) -> ValueKind {
-        let expr = expr.trim();
-        let top = top_level(expr);
-        if top.contains('?')
-            || top.starts_with('|')
-            || top.starts_with("move ")
-            || top.starts_with("if ")
-            || top.starts_with("match ")
-            || top.starts_with("lambda")
-            || top.contains(" if ")
-            || (matches!(language, SourceLanguage::Java | SourceLanguage::Kotlin)
-                && top.contains("->"))
-        {
-            // Ternaries, closures, and conditional expressions.
-            return ValueKind::Any;
-        }
-
-        if LITERAL_BOOL_REGEX.is_match(expr) {
-            return ValueKind::Bool;
-        }
-        if LITERAL_INT_REGEX.is_match(expr) {
-            return ValueKind::Integer;
-        }
-        if LITERAL_FLOAT_REGEX.is_match(expr) {
-            return ValueKind::Float;
-        }
-
-        if language == SourceLanguage::Python && (top.contains(" and ") || top.contains(" or ")) {
-            // These evaluate to one of the operands, not a bool.
-            return ValueKind::Any;
-        }
-        let is_comparison = ["==", "!=", "<=", ">=", "&&", "||", " < ", " > "]
-            .iter()
-            .any(|op| top.contains(op) && !top.contains("<=>"));
-        let is_negation = (top.starts_with('!') && !top.starts_with("!="))
-            // In Rust, `!` is also bitwise-not for integers.
-            && language != SourceLanguage::Rust;
-        let is_python_test = language == SourceLanguage::Python
-            && (top.starts_with("not ")
-                || top.contains(" in ")
-                || top.contains(" is ")
-                || top.starts_with("isinstance("));
-        let is_java_test = language == SourceLanguage::Java && top.contains(" instanceof ");
-        let is_kotlin_test = language == SourceLanguage::Kotlin
-            && (top.contains(" in ") || top.contains(" !in ") || top.contains(" is "));
-        if is_comparison || is_negation || is_python_test || is_java_test || is_kotlin_test {
-            return ValueKind::Bool;
-        }
-
-        if matches!(language, SourceLanguage::Rust | SourceLanguage::Kotlin) {
-            // `as` binds tighter than the arithmetic operators and both sides of those need to
-            // be the same type, so a trailing cast determines the type of the whole expression.
-            if let Some(caps) = AS_CAST_REGEX.captures(&top) {
-                return Self::from_type_name(&caps[1]);
+    /// Guess the kind of value an argument expression produces from its syntax tree.  There is
+    /// no type information, so this is limited to things like literals, casts, comparisons, and
+    /// calls whose result type is obvious, like `items.size()`.
+    pub(crate) fn from_node(language: SourceLanguage, node: Node, source: &str) -> ValueKind {
+        let text = |n: Node| &source[n.byte_range()];
+        let recurse =
+            |n: Option<Node>| n.map_or(ValueKind::Any, |n| Self::from_node(language, n, source));
+        match node.kind() {
+            // Wrappers that have the same value as what they contain.
+            "parenthesized_expression" | "reference_expression" | "value_argument" => {
+                recurse(last_named_child(node))
             }
-        }
-
-        if let Some(caps) = C_CAST_REGEX.captures(expr) {
-            let kind = Self::from_type_name(&caps[1]);
-            if kind != ValueKind::Any {
-                return if has_binary_op(&top_level(&caps[2])) {
-                    ValueKind::Any
+            "decimal_integer_literal"
+            | "hex_integer_literal"
+            | "octal_integer_literal"
+            | "binary_integer_literal"
+            | "integer_literal"
+            | "integer" => ValueKind::Integer,
+            "decimal_floating_point_literal"
+            | "hex_floating_point_literal"
+            | "float_literal"
+            | "float" => ValueKind::Float,
+            "number_literal" => {
+                let number = text(node).to_ascii_lowercase();
+                let is_float = if number.starts_with("0x") {
+                    number.contains('p')
                 } else {
-                    kind
+                    number.contains(['.', 'e'])
                 };
+                if is_float {
+                    ValueKind::Float
+                } else {
+                    ValueKind::Integer
+                }
             }
-        }
-        if let Some(caps) = STATIC_CAST_REGEX.captures(&top) {
-            return Self::from_type_name(&caps[1]);
-        }
-        if has_binary_op(&top) {
-            return ValueKind::Any;
-        }
-        if let Some(caps) = CONVERSION_CALL_REGEX.captures(&top) {
-            return Self::from_type_name(&caps[1]);
-        }
-        if let Some(caps) = METHOD_CALL_REGEX.captures(&top) {
-            let method = &caps[1];
-            if INTEGER_METHODS.contains(&method) {
-                return ValueKind::Integer;
+            "true" | "false" | "boolean_literal" => ValueKind::Bool,
+            // The Kotlin grammar does not have boolean literals.
+            "identifier" if language == SourceLanguage::Kotlin => match text(node) {
+                "true" | "false" => ValueKind::Bool,
+                _ => ValueKind::Any,
+            },
+            "character_literal" | "char_literal" => ValueKind::Char,
+            "comparison_operator"
+            | "not_operator"
+            | "instanceof_expression"
+            | "in_expression"
+            | "is_expression" => ValueKind::Bool,
+            "binary_expression" | "binary_operator" => {
+                let left = recurse(node.child_by_field_name("left"));
+                let right = recurse(node.child_by_field_name("right"));
+                let operator = node.child_by_field_name("operator").map_or("", text);
+                Self::from_binary(language, operator, left, right)
             }
-            if FLOAT_METHODS.contains(&method) {
-                return ValueKind::Float;
+            "unary_expression" | "unary_operator" => {
+                let operator = node.child(0).map_or("", text);
+                let operand = recurse(last_named_child(node));
+                match operator {
+                    // In Rust, `!` is also bitwise-not for integers.
+                    "!" if language == SourceLanguage::Rust => match operand {
+                        ValueKind::Bool | ValueKind::Integer => operand,
+                        _ => ValueKind::Any,
+                    },
+                    "!" => ValueKind::Bool,
+                    "-" | "+" => match operand {
+                        ValueKind::Integer | ValueKind::Float => operand,
+                        _ => ValueKind::Any,
+                    },
+                    "~" if operand == ValueKind::Integer => operand,
+                    _ => ValueKind::Any,
+                }
             }
-            if BOOL_METHODS.contains(&method) || BOOL_METHOD_REGEX.is_match(method) {
-                return ValueKind::Bool;
+            "cast_expression" | "type_cast_expression" => node
+                .child_by_field_name("type")
+                .map_or(ValueKind::Any, |t| {
+                    Self::from_type_name(&normalize_whitespace(text(t)))
+                }),
+            "as_expression" => match node.child(1).map(text) {
+                // `as?` produces null if the cast fails.
+                Some("as") => node
+                    .child_by_field_name("right")
+                    .map_or(ValueKind::Any, |t| Self::from_type_name(text(t))),
+                _ => ValueKind::Any,
+            },
+            // Java's `array.length`.
+            "field_access" => match node.child_by_field_name("field").map(text) {
+                Some("length") => ValueKind::Integer,
+                _ => ValueKind::Any,
+            },
+            // Kotlin's `list.size` and `string.length`.
+            "navigation_expression" => {
+                let safe_call = node.children(&mut node.walk()).any(|c| text(c) == "?.");
+                match last_named_child(node).map(text) {
+                    Some("size" | "length") if !safe_call => ValueKind::Integer,
+                    _ => ValueKind::Any,
+                }
             }
+            "call_expression" | "method_invocation" | "call" => Self::from_call(node, source),
+            _ => ValueKind::Any,
         }
-        let is_size_property = match language {
-            SourceLanguage::Java => top.ends_with(".length"),
-            SourceLanguage::Kotlin => top.ends_with(".size") || top.ends_with(".length"),
-            _ => false,
-        };
-        if is_size_property {
-            return ValueKind::Integer;
-        }
+    }
 
-        ValueKind::Any
+    fn from_binary(
+        language: SourceLanguage,
+        operator: &str,
+        left: ValueKind,
+        right: ValueKind,
+    ) -> ValueKind {
+        use ValueKind::*;
+        match operator {
+            "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||" | "===" | "!==" => Bool,
+            "+" | "-" | "*" | "/" | "%" | "//" | "**" => match (left, right) {
+                // Python's `/` is always floating-point division.
+                (Integer | Float, Integer | Float)
+                    if operator == "/" && language == SourceLanguage::Python =>
+                {
+                    Float
+                }
+                (Integer, Integer) => Integer,
+                (Float, Integer | Float) | (Integer, Float) => Float,
+                // Rust does not convert numbers implicitly, so both sides are the same type.
+                (kind @ (Integer | Float), Any) | (Any, kind @ (Integer | Float))
+                    if language == SourceLanguage::Rust =>
+                {
+                    kind
+                }
+                _ => Any,
+            },
+            "&" | "|" | "^" | "<<" | ">>" => match (left, right) {
+                (Integer, Integer) => Integer,
+                (Bool, Bool) if !operator.starts_with(['<', '>']) => Bool,
+                _ => Any,
+            },
+            _ => Any,
+        }
+    }
+
+    fn from_call(node: Node, source: &str) -> ValueKind {
+        let text = |n: Node| &source[n.byte_range()];
+        let function = node
+            .child_by_field_name("function")
+            .or_else(|| node.named_child(0));
+        // A method call, like `items.size()`, or a function call, like `len(items)`.
+        let (method, function_name) = match node.kind() {
+            "method_invocation" => (node.child_by_field_name("name").map(text), None),
+            _ => match function {
+                Some(f) if matches!(f.kind(), "field_expression" | "attribute") => {
+                    let field = f
+                        .child_by_field_name("field")
+                        .or_else(|| f.child_by_field_name("attribute"));
+                    (field.map(text), None)
+                }
+                Some(f) if f.kind() == "navigation_expression" => {
+                    let safe_call = f.children(&mut f.walk()).any(|c| text(c) == "?.");
+                    if safe_call {
+                        return ValueKind::Any;
+                    }
+                    (last_named_child(f).map(text), None)
+                }
+                Some(f) => (None, Some(f)),
+                None => (None, None),
+            },
+        };
+        if let Some(method) = method {
+            return if INTEGER_METHODS.contains(&method) {
+                ValueKind::Integer
+            } else if FLOAT_METHODS.contains(&method) {
+                ValueKind::Float
+            } else if BOOL_METHODS.contains(&method) || BOOL_METHOD_REGEX.is_match(method) {
+                ValueKind::Bool
+            } else {
+                ValueKind::Any
+            };
+        }
+        let Some(function) = function_name else {
+            return ValueKind::Any;
+        };
+        match function.kind() {
+            // C++'s `static_cast<int>(x)`.
+            "template_function"
+                if function.child_by_field_name("name").map(text) == Some("static_cast") =>
+            {
+                function
+                    .child_by_field_name("arguments")
+                    .and_then(|args| args.named_child(0))
+                    .map_or(ValueKind::Any, |t| {
+                        Self::from_type_name(&normalize_whitespace(text(t)))
+                    })
+            }
+            // A conversion, like `int(x)` in C++ or Python.
+            "primitive_type" | "identifier" => match text(function) {
+                "len" => ValueKind::Integer,
+                "isinstance" | "issubclass" | "callable" | "hasattr" => ValueKind::Bool,
+                name => Self::from_type_name(name),
+            },
+            _ => ValueKind::Any,
+        }
     }
 
     fn from_type_name(name: &str) -> ValueKind {
@@ -314,36 +410,12 @@ impl ValueKind {
     }
 }
 
-static LITERAL_BOOL_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:true|false|True|False)$").unwrap());
-static LITERAL_INT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^-?(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\d[\d_]*)(?:[uUlL]{1,3}|[iu](?:8|16|32|64|128|size))?$",
-    )
-    .unwrap()
-});
-static LITERAL_FLOAT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^-?(?:\d[\d_]*\.\d*(?:[eE][-+]?\d+)?|\d+[eE][-+]?\d+)(?:[fFdD]|f32|f64)?$")
-        .unwrap()
-});
 static INTEGER_TYPE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^(?:(?:unsigned|signed)(?:\s+(?:char|short|int|long|long\s+long))?|(?:long\s+)?long(?:\s+int)?|short|int|byte|Int|Integer|Long|Short|Byte|(?:std::)?s?size_t|(?:std::)?u?int(?:8|16|32|64)_t|[iu](?:8|16|32|64|128|size)|len)$",
+        r"^(?:(?:unsigned|signed)(?:\s+(?:char|short|int|long|long\s+long))?|(?:long\s+)?long(?:\s+int)?|short|int|byte|Int|Integer|Long|Short|Byte|(?:std::)?s?size_t|(?:std::)?u?int(?:8|16|32|64)_t|[iu](?:8|16|32|64|128|size))$",
     )
     .unwrap()
 });
-static AS_CAST_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\sas\s+([A-Za-z0-9]+)$").unwrap());
-static C_CAST_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)^\(\s*([A-Za-z_][\w:]*(?:\s+[A-Za-z_]\w*)*)\s*\)\s*(\S.*)$").unwrap()
-});
-static STATIC_CAST_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^static_cast<\s*([^<>]+?)\s*>\(\)$").unwrap());
-static CONVERSION_CALL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(int|long|float|double|bool|len|(?:std::)?size_t)\s*\(\)$").unwrap()
-});
-static METHOD_CALL_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:\.|->)([A-Za-z_]\w*)\(\)$").unwrap());
 static BOOL_METHOD_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:is|has)(?:[A-Z_]\w*)?$").unwrap());
 
@@ -376,61 +448,15 @@ const BOOL_METHODS: &[&str] = &[
     "endswith",
 ];
 
-/// Reduce an expression to its top-level syntax by dropping the contents of any brackets and
-/// string/char literals.  For example, `foo(a == b).len()` becomes `foo().len()`.
-fn top_level(expr: &str) -> String {
-    let mut retval = String::with_capacity(expr.len());
-    let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    let mut prev: Option<char> = None;
-    for c in expr.chars() {
-        if let Some(q) = quote {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == q {
-                quote = None;
-                if depth == 0 {
-                    retval.push(c);
-                }
-            }
-        } else {
-            match c {
-                '(' | '[' | '{' => {
-                    if depth == 0 {
-                        retval.push(c);
-                    }
-                    depth += 1;
-                }
-                ')' | ']' | '}' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        retval.push(c);
-                    }
-                }
-                '"' | '\'' if prev.is_none_or(|p| !p.is_alphanumeric()) => {
-                    quote = Some(c);
-                    if depth == 0 {
-                        retval.push(c);
-                    }
-                }
-                _ if depth == 0 => retval.push(c),
-                _ => {}
-            }
-        }
-        prev = Some(c);
-    }
-    retval
+fn last_named_child(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| !child.kind().contains("comment"))
+        .last()
 }
 
-/// Check if a top-level expression contains any binary operators, ignoring member access.
-fn has_binary_op(top: &str) -> bool {
-    top.replace("->", ".").replace("::", ".").contains([
-        '+', '-', '*', '/', '%', '&', '|', '^', '<', '>', '=', '?', ':',
-    ]) || top.contains(" and ")
-        || top.contains(" or ")
+fn normalize_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Call `on_balanced` with each offset where a prefix of `text` has balanced brackets and
@@ -615,11 +641,43 @@ impl SplitSearch<'_> {
 mod tests {
     use super::*;
 
+    /// Parse `expr` as the second argument of a call and get the kind of value it produces.
+    fn kind_of(language: SourceLanguage, expr: &str) -> ValueKind {
+        let (source, list_kind) = match language {
+            SourceLanguage::Java => (
+                format!("class A {{ void f() {{ log.info(\"x\", {expr}); }} }}"),
+                "argument_list",
+            ),
+            SourceLanguage::Kotlin => (
+                format!("fun f() {{ log.info(\"x\", {expr}) }}"),
+                "value_arguments",
+            ),
+            SourceLanguage::Rust => (format!("fn f() {{ f(\"x\", {expr}); }}"), "arguments"),
+            SourceLanguage::Cpp => (format!("void f() {{ f(\"x\", {expr}); }}"), "argument_list"),
+            SourceLanguage::Python => (format!("f(\"x\", {expr})\n"), "argument_list"),
+        };
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language.into()).unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let list = find_node(tree.root_node(), list_kind).unwrap();
+        let arg = list.named_child(1).unwrap();
+        ValueKind::from_node(language, arg, &source)
+    }
+
+    /// Find the first node of the given kind in a pre-order walk, which is the outermost one.
+    fn find_node<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        let found = node
+            .children(&mut cursor)
+            .find_map(|child| find_node(child, kind));
+        found
+    }
+
     fn kinds_of(language: SourceLanguage, exprs: &[&str]) -> Vec<ValueKind> {
-        exprs
-            .iter()
-            .map(|expr| ValueKind::from_expression(language, expr))
-            .collect()
+        exprs.iter().map(|expr| kind_of(language, expr)).collect()
     }
 
     #[test]
@@ -685,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_expression() {
+    fn test_from_node() {
         use SourceLanguage::*;
         use ValueKind::*;
         let cases = [
@@ -744,13 +802,34 @@ mod tests {
             (Kotlin, "x is String", Bool),
             (Kotlin, "items?.size", Any),
             (Kotlin, "x ?: 0", Any),
+            // Cases that need the syntax tree to get right.
+            (Java, "1 + 2", Integer),
+            (Java, "count + 1", Any),
+            (Java, "(double) total / 2", Float),
+            (Java, "'c'", Char),
+            (Java, "\"a == b\"", Any),
+            (Java, "list.size() > 0 ? a : b", Any),
+            (Java, "-items.size()", Integer),
+            (Rust, "a + b as f64", Float),
+            (Rust, "!(a == b)", Bool),
+            (Rust, "&v.len()", Integer),
+            (Cpp, "a<b", Bool),
+            (Cpp, "1.5f", Float),
+            (Cpp, "0x1F", Integer),
+            (Cpp, "int(x)", Integer),
+            (Cpp, "a <=> b", Any),
+            (Python, "items.count(x)", Integer),
+            (Python, "len(a) / 2", Float),
+            (Python, "len(a) // 2", Integer),
+            (Python, "-len(x)", Integer),
+            (Python, "exc_info=True", Any),
+            (Kotlin, "true", Bool),
+            (Kotlin, "x as? Int", Any),
+            (Kotlin, "items?.isEmpty()", Any),
+            (Kotlin, "if (a) 1 else 2", Any),
         ];
         for (language, expr, expected) in cases {
-            assert_eq!(
-                ValueKind::from_expression(language, expr),
-                expected,
-                "{language:?} {expr}"
-            );
+            assert_eq!(kind_of(language, expr), expected, "{language:?} {expr}");
         }
     }
 

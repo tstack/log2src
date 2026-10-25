@@ -18,6 +18,9 @@ pub struct SourceQuery<'a> {
     source_language: SourceLanguage,
 }
 
+/// An argument for a placeholder and the kind of value its expression produces.
+pub(crate) type Arg = (FormatArgument, ValueKind);
+
 pub(crate) struct QueryResult {
     pub kind: String,
     pub range: TSRange,
@@ -25,8 +28,10 @@ pub(crate) struct QueryResult {
     pub qualified_name: String,
     pub block_id: u32,
     pub pattern: Option<String>,
-    pub args: Vec<FormatArgument>,
+    pub args: Vec<Arg>,
     pub raw: bool,
+    /// For an argument of the log call, the kind of value it produces.
+    pub value_kind: ValueKind,
 }
 
 impl<'a> SourceQuery<'a> {
@@ -221,6 +226,7 @@ impl<'a> SourceQuery<'a> {
                         pattern: concat_pattern.take(),
                         args: std::mem::take(&mut concat_args),
                         raw: false,
+                        value_kind: ValueKind::Any,
                     });
                     if self.source_language == SourceLanguage::Python
                         && matches!(child.kind(), "string" | "concatenated_string")
@@ -235,8 +241,15 @@ impl<'a> SourceQuery<'a> {
                         // siblings.
                         child = parent;
                     }
+                    // The expressions between the current separators.
+                    let mut arg_nodes: Vec<Node> = vec![];
                     while let Some(next_child) = child.next_sibling() {
                         if matches!(next_child.kind(), "," | ")") {
+                            let value_kind = match arg_nodes[..] {
+                                [node] => self.value_kind(node),
+                                _ => ValueKind::Any,
+                            };
+                            arg_nodes.clear();
                             if let Some(start) = arg_start {
                                 if start.0 < next_child.start_byte() {
                                     results.push(QueryResult {
@@ -253,10 +266,16 @@ impl<'a> SourceQuery<'a> {
                                         pattern: None,
                                         args: vec![],
                                         raw: false,
+                                        value_kind,
                                     });
                                 }
                             }
                             arg_start = Some((next_child.end_byte(), next_child.end_position()));
+                        } else if arg_start.is_some()
+                            && next_child.is_named()
+                            && !next_child.kind().contains("comment")
+                        {
+                            arg_nodes.push(next_child);
                         }
                         child = next_child;
                     }
@@ -353,7 +372,7 @@ impl<'a> SourceQuery<'a> {
     /// single non-raw string-literal.  Interpolations are replaced with placeholders and, if
     /// there are any, the returned arguments list every placeholder in order.  If there are no
     /// `format_args`, a `%` in the string is literal text.
-    fn python_pattern(&self, node: Node, format_args: bool) -> (String, Vec<FormatArgument>) {
+    fn python_pattern(&self, node: Node, format_args: bool) -> (String, Vec<Arg>) {
         let mut pattern = String::new();
         let mut args = Vec::new();
         let mut counter = ArgCounter::default();
@@ -406,7 +425,7 @@ impl<'a> SourceQuery<'a> {
                                 if let Substitution::Value(arg) =
                                     counter.substitution(self.source_language, &cap)
                                 {
-                                    args.push(arg);
+                                    args.push((arg, ValueKind::Any));
                                 }
                             }
                         } else {
@@ -428,8 +447,11 @@ impl<'a> SourceQuery<'a> {
                         pattern.push_str(kind.printf_placeholder());
                         interpolated = true;
                         if let Some(expr) = string_child.child_by_field_name("expression") {
-                            args.push(FormatArgument::Named(
-                                self.source[expr.start_byte()..expr.end_byte()].to_string(),
+                            args.push((
+                                FormatArgument::Named(
+                                    self.source[expr.start_byte()..expr.end_byte()].to_string(),
+                                ),
+                                self.value_kind(expr),
                             ));
                         }
                     }
@@ -448,7 +470,7 @@ impl<'a> SourceQuery<'a> {
     /// string-literal with SLF4J placeholders.  Templates are replaced with placeholders and, if
     /// there are any, the returned arguments list every placeholder in order.  Returns None for
     /// raw strings since they are usually trimmed with `trimIndent()`.
-    fn kotlin_pattern(&self, node: Node) -> Option<(String, Vec<FormatArgument>)> {
+    fn kotlin_pattern(&self, node: Node) -> Option<(String, Vec<Arg>)> {
         let (pattern, mut args, interpolated) = self.kotlin_template(node)?;
         if !interpolated {
             // The placeholders will be found when building the matcher.
@@ -459,7 +481,7 @@ impl<'a> SourceQuery<'a> {
 
     /// Convert a Kotlin string-literal into a pattern and the arguments for all of its
     /// placeholders.  Also returns whether the string has any templates.
-    fn kotlin_template(&self, node: Node) -> Option<(String, Vec<FormatArgument>, bool)> {
+    fn kotlin_template(&self, node: Node) -> Option<(String, Vec<Arg>, bool)> {
         static TEMPLATE_REGEX: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r#"\$([a-zA-Z_][a-zA-Z0-9_]*)|\{[^}]*}"#).unwrap());
 
@@ -474,7 +496,7 @@ impl<'a> SourceQuery<'a> {
         let mut content = String::new();
         let flush = |content: &mut String,
                      pattern: &mut String,
-                     args: &mut Vec<FormatArgument>,
+                     args: &mut Vec<Arg>,
                      interpolated: &mut bool| {
             let mut last_end = 0;
             for cap in TEMPLATE_REGEX.captures_iter(content) {
@@ -483,12 +505,15 @@ impl<'a> SourceQuery<'a> {
                 match cap.get(1) {
                     Some(name) => {
                         pattern.push_str("{}");
-                        args.push(FormatArgument::Named(name.as_str().to_string()));
+                        args.push((
+                            FormatArgument::Named(name.as_str().to_string()),
+                            ValueKind::Any,
+                        ));
                         *interpolated = true;
                     }
                     None => {
                         pattern.push_str(whole.as_str());
-                        args.push(FormatArgument::Placeholder);
+                        args.push((FormatArgument::Placeholder, ValueKind::Any));
                     }
                 }
                 last_end = whole.end();
@@ -511,7 +536,10 @@ impl<'a> SourceQuery<'a> {
                     pattern.push_str("{}");
                     interpolated = true;
                     let expr = child.named_child(0).unwrap_or(child);
-                    args.push(FormatArgument::Named(self.normalized_text(expr)));
+                    args.push((
+                        FormatArgument::Named(self.normalized_text(expr)),
+                        self.value_kind(expr),
+                    ));
                 }
                 _ => {}
             }
@@ -524,7 +552,7 @@ impl<'a> SourceQuery<'a> {
     /// the contents of a single string-literal.  Kotlin has no `+` that takes a number on the
     /// left and a string on the right, so a concatenation always starts with a string.
     /// Returns None if the expression is not a concatenation starting with a string-literal.
-    fn kotlin_concat_pattern(&self, node: Node) -> Option<(String, Vec<FormatArgument>)> {
+    fn kotlin_concat_pattern(&self, node: Node) -> Option<(String, Vec<Arg>)> {
         let mut operands = vec![];
         let mut curr = node;
         while curr.kind() == "binary_expression"
@@ -550,7 +578,10 @@ impl<'a> SourceQuery<'a> {
                 interpolated |= piece_interpolated;
             } else {
                 pattern.push_str("{}");
-                args.push(FormatArgument::Named(self.normalized_text(operand)));
+                args.push((
+                    FormatArgument::Named(self.normalized_text(operand)),
+                    self.value_kind(operand),
+                ));
                 interpolated = true;
             }
         }
@@ -574,7 +605,7 @@ impl<'a> SourceQuery<'a> {
     /// contents of a single string-literal.  The non-literal operands are replaced with
     /// placeholders whose argument is the operand's expression.  Returns None if the expression
     /// is not a concatenation involving a string-literal.
-    fn java_concat_pattern(&self, node: Node) -> Option<(String, Vec<FormatArgument>)> {
+    fn java_concat_pattern(&self, node: Node) -> Option<(String, Vec<Arg>)> {
         let mut pieces = Vec::new();
         if !self.flatten_java_concat(node, &mut pieces) {
             return None;
@@ -586,14 +617,17 @@ impl<'a> SourceQuery<'a> {
                 ConcatPiece::Literal(text) => {
                     let language = self.source_language;
                     for cap in language.get_placeholder_regex().captures_iter(text) {
-                        args.push(language.captures_to_format_arg(&cap));
+                        args.push((language.captures_to_format_arg(&cap), ValueKind::Any));
                     }
                     pattern.push_str(text);
                 }
                 ConcatPiece::Expr(expr) => {
                     pattern.push_str("{}");
-                    args.push(FormatArgument::Named(
-                        self.source[expr.start_byte()..expr.end_byte()].to_string(),
+                    args.push((
+                        FormatArgument::Named(
+                            self.source[expr.start_byte()..expr.end_byte()].to_string(),
+                        ),
+                        self.value_kind(expr),
                     ));
                 }
             }
@@ -988,6 +1022,10 @@ impl<'a> SourceQuery<'a> {
 
     /// Get the text of a node with runs of whitespace collapsed into a single space, since a
     /// name can be split across lines.
+    fn value_kind(&self, node: Node) -> ValueKind {
+        ValueKind::from_node(self.source_language, node, self.source)
+    }
+
     fn normalized_text(&self, node: Node) -> String {
         self.source[node.byte_range()]
             .split_whitespace()

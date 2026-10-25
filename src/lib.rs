@@ -146,7 +146,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "21")]
+    #[serde(rename = "22")]
     Current,
 }
 
@@ -1505,6 +1505,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                             block_id: result.block_id,
                             text: text.to_string(),
                             vars: vec![],
+                            var_kinds: vec![],
                             candidates: symbols.candidates(text, range.start_byte),
                         });
                         args_target = ArgsTarget::MessageRef;
@@ -1529,10 +1530,12 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                                     let prior = message_refs.last_mut().unwrap();
                                     prior.end_line_no = end_line_no;
                                     prior.vars.push(var);
+                                    prior.var_kinds.push(result.value_kind);
                                 } else {
                                     let prior = matched.last_mut().unwrap();
                                     prior.end_line_no = end_line_no;
                                     prior.vars.push(var);
+                                    prior.var_kinds.push(result.value_kind);
                                 }
                             }
                         }

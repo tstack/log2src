@@ -22,6 +22,6 @@ info:
 success: true
 exit_code: 0
 ----- stdout -----
-{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/stack.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"b","qualifiedName":"b","blockId":139,"text":"\"Hello from b\"","quality":10,"pattern":"(?s)^Hello from b$","args":[],"vars":[],"kinds":[],"segments":["Hello from b"]},"variables":[]}
+{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/stack.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"b","qualifiedName":"b","blockId":139,"text":"\"Hello from b\"","quality":10,"pattern":"(?s)^Hello from b$","args":[],"argKinds":[],"vars":[],"varKinds":[],"kinds":[],"segments":["Hello from b"]},"variables":[]}
 
 ----- stderr -----

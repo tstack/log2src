@@ -107,7 +107,13 @@ pub struct SourceRef {
     #[serde(skip)]
     pub pattern_str: String,
     pub(crate) args: Vec<FormatArgument>,
+    /// The kind of value produced by the expression of each `FormatArgument::Named` in `args`.
+    #[serde(rename(serialize = "argKinds"))]
+    pub(crate) arg_kinds: Vec<ValueKind>,
     pub(crate) vars: Vec<String>,
+    /// The kind of value produced by each expression in `vars`.
+    #[serde(rename(serialize = "varKinds"))]
+    pub(crate) var_kinds: Vec<ValueKind>,
     /// The kind of value expected for each placeholder based on its format spec.
     pub(crate) kinds: Vec<ValueKind>,
     /// The regexes in `pattern` for the literal text before, between, and after the
@@ -156,9 +162,13 @@ impl SourceRef {
         }) = build_matcher(result.raw, &unquoted, code.info.language)
         {
             let name = source[result.name_range].to_string();
-            if !result.args.is_empty() {
-                args = result.args;
-            }
+            let arg_kinds = if result.args.is_empty() {
+                vec![ValueKind::Any; args.len()]
+            } else {
+                let arg_kinds;
+                (args, arg_kinds) = result.args.into_iter().unzip();
+                arg_kinds
+            };
             Some(SourceRef {
                 source_path: code.filename.clone(),
                 language: code.info.language,
@@ -173,7 +183,9 @@ impl SourceRef {
                 pattern_str: matcher.as_str().to_string(),
                 pattern: matcher,
                 args,
+                arg_kinds,
                 vars: vec![],
+                var_kinds: vec![],
                 kinds,
                 segments,
                 value_kinds: OnceLock::new(),
@@ -211,8 +223,10 @@ impl SourceRef {
             quality,
             pattern_str: matcher.as_str().to_string(),
             pattern: matcher,
+            arg_kinds: vec![ValueKind::Any; args.len()],
             args,
             vars: message_ref.vars.clone(),
+            var_kinds: message_ref.var_kinds.clone(),
             kinds,
             segments,
             value_kinds: OnceLock::new(),
@@ -229,27 +243,36 @@ impl SourceRef {
         &self.pattern
     }
 
-    /// The argument expressions for each placeholder, in the order the placeholders appear in
-    /// the message.
-    pub(crate) fn arg_exprs(&self) -> Vec<&str> {
+    /// The argument expression for each placeholder and the kind of value it produces, in the
+    /// order the placeholders appear in the message.
+    fn resolved_args(&self) -> impl Iterator<Item = (&str, ValueKind)> {
+        let var = |index: usize| {
+            (
+                self.vars.get(index).map_or("<unknown>", String::as_str),
+                self.var_kinds.get(index).copied().unwrap_or(ValueKind::Any),
+            )
+        };
         let mut placeholder_index = 0;
         self.args
             .iter()
-            .map(|placeholder| match placeholder {
-                FormatArgument::Named(name) => name.as_str(),
-                FormatArgument::Positional(pos) => {
-                    self.vars.get(*pos).map_or("<unknown>", |s| s.as_str())
-                }
+            .enumerate()
+            .map(move |(index, arg)| match arg {
+                FormatArgument::Named(name) => (
+                    name.as_str(),
+                    self.arg_kinds.get(index).copied().unwrap_or(ValueKind::Any),
+                ),
+                FormatArgument::Positional(pos) => var(*pos),
                 FormatArgument::Placeholder => {
-                    let res = self
-                        .vars
-                        .get(placeholder_index)
-                        .map_or("<unknown>", |s| s.as_str());
                     placeholder_index += 1;
-                    res
+                    var(placeholder_index - 1)
                 }
             })
-            .collect()
+    }
+
+    /// The argument expressions for each placeholder, in the order the placeholders appear in
+    /// the message.
+    pub(crate) fn arg_exprs(&self) -> Vec<&str> {
+        self.resolved_args().map(|(expr, _)| expr).collect()
     }
 
     /// The kinds of values expected for the placeholders, based on the format spec and, when
@@ -257,9 +280,9 @@ impl SourceRef {
     /// time they are needed and then cached.
     pub(crate) fn value_kinds(&self) -> &[ValueKind] {
         self.value_kinds.get_or_init(|| {
-            std::iter::zip(&self.kinds, self.arg_exprs())
-                .map(|(kind, expr)| match kind {
-                    ValueKind::Any => ValueKind::from_expression(self.language, expr),
+            std::iter::zip(&self.kinds, self.resolved_args())
+                .map(|(kind, (_, expr_kind))| match kind {
+                    ValueKind::Any => expr_kind,
                     _ => *kind,
                 })
                 .collect()

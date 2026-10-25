@@ -16,9 +16,15 @@ expression: src_refs
   args:
     - Placeholder
     - Placeholder
+  argKinds:
+    - Any
+    - Any
   vars:
     - user.name
     - count
+  varKinds:
+    - Any
+    - Any
   kinds:
     - Any
     - Any
@@ -40,7 +46,11 @@ expression: src_refs
   args:
     - Named: user
     - Named: user.messages.size
+  argKinds:
+    - Any
+    - Integer
   vars: []
+  varKinds: []
   kinds:
     - Any
     - Any
@@ -62,8 +72,13 @@ expression: src_refs
   args:
     - Placeholder
     - Named: count
+  argKinds:
+    - Any
+    - Any
   vars:
     - user
+  varKinds:
+    - Any
   kinds:
     - Any
     - Any
@@ -84,7 +99,10 @@ expression: src_refs
   pattern: (?s)^Lazy (.+)$
   args:
     - Named: user.id
+  argKinds:
+    - Any
   vars: []
+  varKinds: []
   kinds:
     - Any
   segments:
@@ -103,7 +121,10 @@ expression: src_refs
   pattern: (?s)^Failed for (.+)$
   args:
     - Named: user
+  argKinds:
+    - Any
   vars: []
+  varKinds: []
   kinds:
     - Any
   segments:
@@ -122,7 +143,10 @@ expression: src_refs
   pattern: (?s)^Concat (.+) items$
   args:
     - Named: count
+  argKinds:
+    - Any
   vars: []
+  varKinds: []
   kinds:
     - Any
   segments:
@@ -143,7 +167,12 @@ expression: src_refs
     - Named: user.messages.size
     - Named: count / 1000.0
     - Named: count
+  argKinds:
+    - Integer
+    - Any
+    - Any
   vars: []
+  varKinds: []
   kinds:
     - Any
     - Any

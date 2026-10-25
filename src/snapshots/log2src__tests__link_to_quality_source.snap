@@ -15,7 +15,10 @@ quality: 7
 pattern: "(?s)^Hello, (.+)!$"
 args:
   - Named: name
+argKinds:
+  - Any
 vars: []
+varKinds: []
 kinds:
   - Any
 segments:

@@ -15,8 +15,12 @@ expression: src_refs
   pattern: "(?s)^(.+): Started$"
   args:
     - Placeholder
+  argKinds:
+    - Any
   vars:
     - this
+  varKinds:
+    - Any
   kinds:
     - Any
   segments:
@@ -35,8 +39,12 @@ expression: src_refs
   pattern: "(?s)^(.+): Stopped$"
   args:
     - Placeholder
+  argKinds:
+    - Any
   vars:
     - this
+  varKinds:
+    - Any
   kinds:
     - Any
   segments:

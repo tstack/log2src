@@ -15,8 +15,12 @@ expression: src_refs
   pattern: (?s)^foo (.+) .$
   args:
     - Placeholder
+  argKinds:
+    - Any
   vars:
     - test_var
+  varKinds:
+    - Any
   kinds:
     - Any
   segments:
@@ -35,7 +39,10 @@ expression: src_refs
   pattern: "(?s)^Hello, (.+)!$"
   args:
     - Named: "args[1]"
+  argKinds:
+    - Any
   vars: []
+  varKinds: []
   kinds:
     - Any
   segments:
@@ -53,7 +60,9 @@ expression: src_refs
   quality: 29
   pattern: "(?s)^warning message:\\nlow disk space$"
   args: []
+  argKinds: []
   vars: []
+  varKinds: []
   kinds: []
   segments:
     - "warning message:\\nlow disk space"
@@ -70,7 +79,10 @@ expression: src_refs
   pattern: "(?s)^info message:\\nprocessing \\\\started -- (.+)$"
   args:
     - Named: "args[0]"
+  argKinds:
+    - Any
   vars: []
+  varKinds: []
   kinds:
     - Any
   segments:
