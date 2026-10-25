@@ -24,25 +24,32 @@ pub enum LogLevel {
 
 impl LogLevel {
     /// Map the name of a logging function/macro/method, like `log::warn`, `logger.warning`,
-    /// `spdlog::info`, or `SPDLOG_ERROR`, to a level.  Returns `None` for calls that don't
-    /// indicate a level, like `println` or `printf`.
-    pub fn from_call_name(call_name: &str) -> Option<LogLevel> {
-        let name = call_name
+    /// `spdlog::info`, `log_debug`, or `SPDLOG_ERROR`, to a level.  This is also used for
+    /// level arguments, like `LOG_ERR` or `spdlog::level::warn`.  Returns `None` for names that
+    /// don't indicate a level, like `println` or `printf`.
+    pub fn from_name(name: &str) -> Option<LogLevel> {
+        let name = name
             .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .find(|s| !s.is_empty())?;
-        // Macros like `SPDLOG_INFO` or `LOG_ERROR` put the level at the end.
-        let name = if name.chars().all(|c| !c.is_lowercase()) {
-            name.rsplit('_').next().unwrap_or(name)
-        } else {
-            name
-        };
-        match name.to_lowercase().as_str() {
+            .find(|s| !s.is_empty())?
+            .to_lowercase();
+        let mut words = name.split('_').filter(|s| !s.is_empty());
+        let last = words.next_back()?;
+        // For names like `log_debug`, `SPDLOG_INFO`, or `LOG_ERR`, the level is at the end and
+        // one of the other words needs to look logging related so that something like
+        // `report_error` is not treated as a log statement.
+        let mut prefix = words.peekable();
+        if prefix.peek().is_some()
+            && !prefix.any(|w| w.contains("log") || w == "level" || w == "lvl")
+        {
+            return None;
+        }
+        match last {
             "trace" | "finer" | "finest" => Some(LogLevel::Trace),
-            "debug" | "fine" => Some(LogLevel::Debug),
+            "debug" | "dbg" | "fine" => Some(LogLevel::Debug),
             "info" | "notice" => Some(LogLevel::Info),
             "warn" | "warning" => Some(LogLevel::Warn),
-            "error" | "exception" | "severe" => Some(LogLevel::Error),
-            "fatal" | "critical" => Some(LogLevel::Fatal),
+            "error" | "err" | "exception" | "severe" => Some(LogLevel::Error),
+            "fatal" | "critical" | "crit" | "alert" | "emerg" => Some(LogLevel::Fatal),
             _ => None,
         }
     }
@@ -114,10 +121,13 @@ impl SourceRef {
         }) = build_matcher(result.raw, &unquoted, code.info.language)
         {
             let name = source[result.name_range].to_string();
+            // A level passed as an argument, like `syslog(LOG_ERR, ...)`, takes precedence
+            // over the name of the call.
             let level = result
-                .call_name
-                .as_deref()
-                .and_then(LogLevel::from_call_name);
+                .leading_args
+                .iter()
+                .chain(result.call_name.iter())
+                .find_map(|name| LogLevel::from_name(name));
             if !result.args.is_empty() {
                 args = result.args;
             }
@@ -276,7 +286,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_log_level_from_call_name() {
+    fn test_log_level_from_name() {
         let cases = [
             ("debug", Some(LogLevel::Debug)),
             ("log::warn", Some(LogLevel::Warn)),
@@ -291,13 +301,20 @@ mod tests {
             ("logging.exception", Some(LogLevel::Error)),
             ("self.log.critical", Some(LogLevel::Fatal)),
             ("fine", Some(LogLevel::Debug)),
+            ("log_debug", Some(LogLevel::Debug)),
+            ("log_warning", Some(LogLevel::Warn)),
+            ("LOG_ERR", Some(LogLevel::Error)),
+            ("LOG_CRIT", Some(LogLevel::Fatal)),
+            ("APLOG_MARK", None),
+            ("spdlog::level::warn", Some(LogLevel::Warn)),
+            ("LEVEL_INFO", Some(LogLevel::Info)),
             ("println", None),
             ("printf", None),
             ("print", None),
             ("report_error", None),
         ];
-        for (call_name, expected) in cases {
-            assert_eq!(LogLevel::from_call_name(call_name), expected, "{call_name}");
+        for (name, expected) in cases {
+            assert_eq!(LogLevel::from_name(name), expected, "{name}");
         }
     }
 

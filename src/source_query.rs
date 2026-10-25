@@ -22,6 +22,9 @@ pub(crate) struct QueryResult {
     /// The text of the last capture before the format string, which is the name of the logging
     /// function/macro/method being called (e.g. `log::warn`, `logger.info`).
     pub call_name: Option<String>,
+    /// The text of the arguments before the format string, which might include the log level,
+    /// as in `syslog(LOG_ERR, "...")`.
+    pub leading_args: Vec<String>,
 }
 
 impl<'a> SourceQuery<'a> {
@@ -80,6 +83,7 @@ impl<'a> SourceQuery<'a> {
                         args: vec![],
                         raw: false,
                         call_name: call_name.clone(),
+                        leading_args: self.leading_args(child),
                     });
                     let mut pattern = String::new();
                     if child.kind() == "string" {
@@ -128,6 +132,7 @@ impl<'a> SourceQuery<'a> {
                                         args: vec![],
                                         raw: false,
                                         call_name: None,
+                                        leading_args: vec![],
                                     });
                                 }
                             }
@@ -140,6 +145,19 @@ impl<'a> SourceQuery<'a> {
         });
 
         results
+    }
+
+    fn leading_args(&self, node: Node) -> Vec<String> {
+        let mut args = Vec::new();
+        if node.parent().is_some_and(|p| p.kind() == "argument_list") {
+            let mut prev = node.prev_named_sibling();
+            while let Some(arg) = prev {
+                args.push(self.source[arg.byte_range()].to_string());
+                prev = arg.prev_named_sibling();
+            }
+            args.reverse();
+        }
+        args
     }
 
     fn find_fn_range(node: Node) -> Range<usize> {

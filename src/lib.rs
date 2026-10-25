@@ -1234,6 +1234,11 @@ int main(int argc, char* argv[]) {
     logger->warn("warn message");
     SPDLOG_ERROR("error message");
     spdlog::critical("critical message");
+    log_debug("lnav debug message");
+    log_warning("lnav warn message");
+    syslog(LOG_ERR, "syslog error message");
+    spdlog::log(spdlog::level::trace, "spdlog trace message");
+    report_error("not a log message");
     printf("plain message");
 }
 "#,
@@ -1245,6 +1250,11 @@ int main(int argc, char* argv[]) {
                 ("\"warn message\"".to_string(), Some(LogLevel::Warn)),
                 ("\"error message\"".to_string(), Some(LogLevel::Error)),
                 ("\"critical message\"".to_string(), Some(LogLevel::Fatal)),
+                ("\"lnav debug message\"".to_string(), Some(LogLevel::Debug)),
+                ("\"lnav warn message\"".to_string(), Some(LogLevel::Warn)),
+                ("\"syslog error message\"".to_string(), Some(LogLevel::Error)),
+                ("\"spdlog trace message\"".to_string(), Some(LogLevel::Trace)),
+                ("\"not a log message\"".to_string(), None),
                 ("\"plain message\"".to_string(), None),
             ]
         );
