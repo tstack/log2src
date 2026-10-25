@@ -498,7 +498,7 @@ impl<'a> SourceQuery<'a> {
     /// placeholders.  Also returns whether the string has any templates.
     fn kotlin_template(&self, node: Node) -> Option<(String, Vec<Arg>, bool)> {
         static TEMPLATE_REGEX: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r#"\$([a-zA-Z_][a-zA-Z0-9_]*)|\{[^}]*}"#).unwrap());
+            LazyLock::new(|| Regex::new(r#"\$([a-zA-Z_][a-zA-Z0-9_]*)|\{[^{}]*}"#).unwrap());
 
         if self.source[node.byte_range()].starts_with("\"\"\"") {
             return None;

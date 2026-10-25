@@ -26,7 +26,7 @@ pub struct CallSite {
 
 /// What a placeholder in a format string is replaced with at runtime.
 pub(crate) enum Substitution {
-    /// A literal character, like the `%` for `%%`.
+    /// A literal character, like the `%` for `%%` or the `{` for `{{`.
     Literal(char),
     /// Nothing, like for `%n`, which stores the number of characters written so far.
     Nothing,
@@ -52,6 +52,11 @@ impl ArgCounter {
         caps: &Captures,
     ) -> Substitution {
         let text = caps.get(0).unwrap().as_str();
+        match text {
+            "{{" => return Substitution::Literal('{'),
+            "}}" => return Substitution::Literal('}'),
+            _ => {}
+        }
         if let Some(spec) = text.strip_prefix('%') {
             if spec.ends_with('%') {
                 return Substitution::Literal('%');
@@ -894,5 +899,69 @@ mod tests {
             args,
             vec![FormatArgument::Positional(1), FormatArgument::Positional(2)]
         );
+    }
+
+    #[test]
+    fn test_build_matcher_braces() {
+        use FormatArgument::*;
+        let cases = [
+            // Escaped braces in Rust and fmt.
+            (
+                SourceLanguage::Rust,
+                "a {{x}} b {}",
+                r"(?s)^a \{x\} b (.*)$",
+                vec![Placeholder],
+            ),
+            (
+                SourceLanguage::Rust,
+                "{{{}}}",
+                r"(?s)^\{(.*)\}$",
+                vec![Placeholder],
+            ),
+            (
+                SourceLanguage::Rust,
+                "x {{0}} {0}",
+                r"(?s)^x \{0\} (.*)$",
+                vec![Positional(0)],
+            ),
+            (
+                SourceLanguage::Rust,
+                "{}}}",
+                r"(?s)^(.*)\}$",
+                vec![Placeholder],
+            ),
+            (
+                SourceLanguage::Cpp,
+                "map {{{}: {}}}",
+                r"(?s)^map \{(.*): (.*)\}$",
+                vec![Placeholder, Placeholder],
+            ),
+            // Other braces in an SLF4J message are literal.
+            (
+                SourceLanguage::Java,
+                r#"json {{"a": {}}}"#,
+                r#"(?s)^json \{\{"a": (.*)\}\}$"#,
+                vec![Placeholder],
+            ),
+            (
+                SourceLanguage::Kotlin,
+                "obj {} {{}}",
+                r"(?s)^obj (.*) \{(.*)\}$",
+                vec![Placeholder, Placeholder],
+            ),
+            // java.util.logging's placeholders.
+            (
+                SourceLanguage::Java,
+                "{0} of {1}",
+                r"(?s)^(.*) of (.*)$",
+                vec![Placeholder, Placeholder],
+            ),
+        ];
+        for (language, text, pattern, expected_args) in cases {
+            let MessageMatcher { matcher, args, .. } =
+                build_matcher(false, text, language).unwrap();
+            assert_eq!(matcher.as_str(), pattern, "{language:?} {text:?}");
+            assert_eq!(args, expected_args, "{language:?} {text:?}");
+        }
     }
 }

@@ -147,7 +147,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "24")]
+    #[serde(rename = "25")]
     Current,
 }
 
@@ -941,20 +941,23 @@ const IDENTS_PYTHON: &[&str] = &["debug", "info", "warn", "trace"];
 
 const IDENTS_KOTLIN: &[&str] = IDENTS_JAVA;
 
+/// The `{{` and `}}` alternatives are escaped braces, which are found so that they are not
+/// mistaken for the start or end of a placeholder.
 static RUST_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\{(?:([a-zA-Z_][a-zA-Z0-9_.]*)|(\d+))?\s*(?::[^}]*)?}"#).unwrap()
+    Regex::new(r#"\{\{|\}\}|\{(?:([a-zA-Z_][a-zA-Z0-9_.]*)|(\d+))?\s*(?::[^}]*)?}"#).unwrap()
 });
 
+/// Other braces in an SLF4J message are literal, so a placeholder cannot contain a `{`.
 static JAVA_PLACEHOLDER_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"\{[^}]*}|\\\{([^}]*)}"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"\{[^{}]*}|\\\{([^}]*)}"#).unwrap());
 
 static CPP_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*[diuoxXfFeEgGaAcspn%]|\{(?:([a-zA-Z_][a-zA-Z0-9_.]*)|(\d+))?\s*(?::[^}]*)?}"#).unwrap()
+    Regex::new(r#"%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*[diuoxXfFeEgGaAcspn%]|\{\{|\}\}|\{(?:([a-zA-Z_][a-zA-Z0-9_.]*)|(\d+))?\s*(?::[^}]*)?}"#).unwrap()
 });
 
 /// SLF4J-style placeholders.  String templates are converted to these placeholders, too.
 static KOTLIN_PLACEHOLDER_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"\{[^}]*}"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"\{[^{}]*}"#).unwrap());
 
 static PYTHON_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*[diuoxXfFeEgGaAcrspn%]"#).unwrap()
@@ -3619,6 +3622,50 @@ class Empty {
         assert_eq!(
             extract_pairs("in-mem.kt", kotlin, 0, "name=."),
             pairs(&[("name", "")])
+        );
+    }
+
+    #[test]
+    fn test_escaped_braces() {
+        let rust = r#"
+fn f(x: &str) {
+    debug!("set {{{}}}", x);
+}
+"#;
+        assert_eq!(
+            extract_pairs("in-mem.rs", rust, 0, "set {a b}"),
+            pairs(&[("x", "a b")])
+        );
+        let cpp = r#"
+    void f() {
+        spdlog::info("map {{{}: {}}}", k, v);
+    }
+    "#;
+        assert_eq!(
+            extract_pairs("in-mem.cc", cpp, 0, "map {a: 1}"),
+            pairs(&[("k", "a"), ("v", "1")])
+        );
+        let java = r#"
+public class Braces {
+    public void run() {
+        log.info("json {\"a\": {}}", v);
+    }
+}
+"#;
+        assert_eq!(
+            extract_pairs("in-mem.java", java, 0, r#"json {"a": 1}"#),
+            pairs(&[("v", "1")])
+        );
+        let kotlin = r#"
+class Braces {
+    fun run(a: String, b: String) {
+        logger.info("obj {} {{}}", a, b)
+    }
+}
+"#;
+        assert_eq!(
+            extract_pairs("in-mem.kt", kotlin, 0, "obj a {b}"),
+            pairs(&[("a", "a"), ("b", "b")])
         );
     }
 
