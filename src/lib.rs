@@ -146,7 +146,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "17")]
+    #[serde(rename = "18")]
     Current,
 }
 
@@ -3414,6 +3414,73 @@ class Adjacent {
                 ("items.size()", "5"),
                 ("other", "foo bar")
             ])
+        );
+    }
+
+    const CPP_PERCENT_SOURCE: &str = r#"
+    #include <stdio.h>
+
+    int main(int argc, char* argv[]) {
+        printf("100%% done in %d steps", steps);
+        printf("[%*d] %s", width, value, name);
+        printf("wrote%n %s", &count, name);
+    }
+    "#;
+
+    #[test]
+    fn test_percent_cpp() {
+        assert_eq!(
+            extract_pairs("in-mem.cc", CPP_PERCENT_SOURCE, 0, "100% done in 5 steps"),
+            pairs(&[("steps", "5")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.cc", CPP_PERCENT_SOURCE, 1, "[   42] bob"),
+            pairs(&[("value", "42"), ("name", "bob")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.cc", CPP_PERCENT_SOURCE, 2, "wrote bob"),
+            pairs(&[("name", "bob")])
+        );
+    }
+
+    const PYTHON_PERCENT_SOURCE: &str = r#"
+def main(x, t, pct):
+    logger.info("100% done")
+    logger.info("50% done", exc_info=True)
+    logger.info(f"{x} is 50% done")
+    logger.info(f"{x} took %s", t)
+    logger.info("%d%% done", pct)
+"#;
+
+    #[test]
+    fn test_percent_python() {
+        let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_PERCENT_SOURCE);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
+        assert_eq!(
+            patterns,
+            vec![
+                r"(?s)^100% done$",
+                r"(?s)^50% done$",
+                r"(?s)^(.+) is 50% done$",
+                r"(?s)^(.+) took (.+)$",
+                r"(?s)^\s*([-+]?\d+)\s*% done$",
+            ]
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_PERCENT_SOURCE, 2, "job is 50% done"),
+            pairs(&[("x", "job")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_PERCENT_SOURCE, 3, "job took 5s"),
+            pairs(&[("x", "job"), ("t", "5s")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_PERCENT_SOURCE, 4, "75% done"),
+            pairs(&[("pct", "75")])
         );
     }
 

@@ -4,7 +4,7 @@ use tree_sitter::{
     Language, Node, Parser, Point, Query, QueryCursor, Range as TSRange, StreamingIterator, Tree,
 };
 
-use crate::source_ref::FormatArgument;
+use crate::source_ref::{ArgCounter, FormatArgument, Substitution};
 use crate::value_kind::ValueKind;
 use crate::{CodeSource, SourceLanguage};
 use regex::Regex;
@@ -225,7 +225,8 @@ impl<'a> SourceQuery<'a> {
                     if self.source_language == SourceLanguage::Python
                         && matches!(child.kind(), "string" | "concatenated_string")
                     {
-                        let (pattern, args) = self.python_pattern(child);
+                        let (pattern, args) =
+                            self.python_pattern(child, Self::has_python_format_args(child));
                         results[qr_index].pattern = Some(pattern);
                         results[qr_index].args = args;
                     }
@@ -331,12 +332,31 @@ impl<'a> SourceQuery<'a> {
         Some(pattern)
     }
 
+    /// Check if a Python log message is followed by positional arguments.  The `logging` module
+    /// only applies %-formatting to the message when there are arguments, and the `%` operator
+    /// always has an argument.
+    fn has_python_format_args(message: Node) -> bool {
+        let mut next = message.next_named_sibling();
+        while let Some(node) = next {
+            if !matches!(
+                node.kind(),
+                "keyword_argument" | "dictionary_splat" | "comment"
+            ) {
+                return true;
+            }
+            next = node.next_named_sibling();
+        }
+        false
+    }
+
     /// Convert a Python string, or adjacent strings like `"abc " f"{x}"`, into the contents of a
     /// single non-raw string-literal.  Interpolations are replaced with placeholders and, if
-    /// there are any, the returned arguments list every placeholder in order.
-    fn python_pattern(&self, node: Node) -> (String, Vec<FormatArgument>) {
+    /// there are any, the returned arguments list every placeholder in order.  If there are no
+    /// `format_args`, a `%` in the string is literal text.
+    fn python_pattern(&self, node: Node, format_args: bool) -> (String, Vec<FormatArgument>) {
         let mut pattern = String::new();
         let mut args = Vec::new();
+        let mut counter = ArgCounter::default();
         let mut interpolated = false;
         let mut cursor = node.walk();
         let strings: Vec<Node> = if node.kind() == "concatenated_string" {
@@ -377,12 +397,20 @@ impl<'a> SourceQuery<'a> {
                             // backslashes in a raw string need to be escaped.
                             content = content.replace('\\', "\\\\");
                         }
-                        for cap in self
-                            .source_language
-                            .get_placeholder_regex()
-                            .captures_iter(&content)
-                        {
-                            args.push(self.source_language.captures_to_format_arg(&cap));
+                        if format_args {
+                            for cap in self
+                                .source_language
+                                .get_placeholder_regex()
+                                .captures_iter(&content)
+                            {
+                                if let Substitution::Value(arg) =
+                                    counter.substitution(self.source_language, &cap)
+                                {
+                                    args.push(arg);
+                                }
+                            }
+                        } else {
+                            content = content.replace('%', "%%");
                         }
                         pattern.push_str(&content);
                     }

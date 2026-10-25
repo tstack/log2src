@@ -24,6 +24,61 @@ pub struct CallSite {
     pub line_no: usize,
 }
 
+/// What a placeholder in a format string is replaced with at runtime.
+pub(crate) enum Substitution {
+    /// A literal character, like the `%` for `%%`.
+    Literal(char),
+    /// Nothing, like for `%n`, which stores the number of characters written so far.
+    Nothing,
+    /// The value of an argument.
+    Value(FormatArgument),
+}
+
+/// Tracks the arguments used by the placeholders in a format string.  Some printf-style
+/// placeholders use arguments without printing them, like `%n` or the `*` in `%*d`, so the
+/// placeholders after them refer to their arguments by position.
+#[derive(Default)]
+pub(crate) struct ArgCounter {
+    /// The number of arguments used so far.
+    used: usize,
+    /// The number of `FormatArgument::Placeholder`s returned so far.
+    placeholders: usize,
+}
+
+impl ArgCounter {
+    pub(crate) fn substitution(
+        &mut self,
+        language: SourceLanguage,
+        caps: &Captures,
+    ) -> Substitution {
+        let text = caps.get(0).unwrap().as_str();
+        if let Some(spec) = text.strip_prefix('%') {
+            if spec.ends_with('%') {
+                return Substitution::Literal('%');
+            }
+            // A `*` width or precision is taken from an argument.
+            self.used += spec.matches('*').count();
+            if spec.ends_with('n') {
+                self.used += 1;
+                return Substitution::Nothing;
+            }
+        }
+        Substitution::Value(match language.captures_to_format_arg(caps) {
+            FormatArgument::Placeholder => {
+                let index = self.used;
+                self.used += 1;
+                if index == self.placeholders {
+                    self.placeholders += 1;
+                    FormatArgument::Placeholder
+                } else {
+                    FormatArgument::Positional(index)
+                }
+            }
+            arg => arg,
+        })
+    }
+}
+
 // TODO: get rid of this clone?
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SourceRef {
@@ -248,24 +303,41 @@ fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<Mess
     // Where the capture group for the last placeholder ends in `pattern`.
     let mut last_group_end = pattern.len();
     let mut quality = 0;
+    // The regex for literal text that has not been added to `pattern` yet.
+    let mut pending = String::new();
+    let mut counter = ArgCounter::default();
     for cap in language.get_placeholder_regex().captures_iter(text) {
         let placeholder = cap.get(0).unwrap();
         if !raw && is_unicode_escape(&text[..placeholder.start()]) {
             // Something like Rust's "\u{1F600}" is an escape and not a placeholder.
             continue;
         }
-        let subtext = literal_to_regex(raw, language, &text[last_end..placeholder.start()]);
+        pending.push_str(&literal_to_regex(
+            raw,
+            language,
+            &text[last_end..placeholder.start()],
+        ));
+        last_end = placeholder.end();
+        let arg = match counter.substitution(language, &cap) {
+            Substitution::Literal(c) => {
+                push_regex_literal(&mut pending, c);
+                continue;
+            }
+            Substitution::Nothing => continue,
+            Substitution::Value(arg) => arg,
+        };
+        let subtext = std::mem::take(&mut pending);
         quality += subtext.chars().filter(|c| !c.is_whitespace()).count();
         pattern.push_str(subtext.as_str());
         segments.push(subtext);
-        last_end = placeholder.end();
         let kind = ValueKind::from_placeholder(language, placeholder.as_str());
         pattern.push_str(kind.capture_regex());
         last_group_end = pattern.len();
         kinds.push(kind);
-        args.push(language.captures_to_format_arg(&cap));
+        args.push(arg);
     }
-    let subtext = literal_to_regex(raw, language, &text[last_end..]);
+    let mut subtext = pending;
+    subtext.push_str(&literal_to_regex(raw, language, &text[last_end..]));
     quality += subtext.chars().filter(|c| !c.is_whitespace()).count();
     if quality == 0 {
         None
@@ -730,6 +802,36 @@ mod tests {
         assert_eq!(
             segments_and_kinds("a {:x}\n", SourceLanguage::Rust),
             (vec!["a ".to_string(), r"\s*".to_string()], vec![Hex])
+        );
+    }
+
+    #[test]
+    fn test_build_matcher_percent() {
+        let MessageMatcher { matcher, args, .. } =
+            build_matcher(false, "100%% done %d", SourceLanguage::Cpp).unwrap();
+        assert_eq!(matcher.as_str(), r"(?s)^100% done \s*([-+]?\d+)\s*$");
+        assert_eq!(args, vec![FormatArgument::Placeholder]);
+
+        let MessageMatcher { matcher, args, .. } =
+            build_matcher(false, "%s at 50%%", SourceLanguage::Python).unwrap();
+        assert_eq!(matcher.as_str(), r"(?s)^(.+) at 50%$");
+        assert_eq!(args, vec![FormatArgument::Placeholder]);
+    }
+
+    #[test]
+    fn test_build_matcher_unprinted_args() {
+        // `%n` uses an argument but prints nothing.
+        let MessageMatcher { matcher, args, .. } =
+            build_matcher(false, "wrote%n %s", SourceLanguage::Cpp).unwrap();
+        assert_eq!(matcher.as_str(), r"(?s)^wrote (.+)$");
+        assert_eq!(args, vec![FormatArgument::Positional(1)]);
+
+        // A `*` width uses an argument.
+        let MessageMatcher { args, .. } =
+            build_matcher(false, "%*d items %s", SourceLanguage::Cpp).unwrap();
+        assert_eq!(
+            args,
+            vec![FormatArgument::Positional(1), FormatArgument::Positional(2)]
         );
     }
 }
