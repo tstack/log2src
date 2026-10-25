@@ -57,7 +57,7 @@ impl ValueKind {
     }
 
     /// The capture group to use in a message matcher for a placeholder of this kind.  Padding
-    /// for numbers is matched outside the group, so it is not included in the value.
+    /// is matched outside the group, so it is not included in the value.
     pub fn capture_regex(&self) -> &'static str {
         match self {
             ValueKind::Any => ANY_CAPTURE,
@@ -68,7 +68,7 @@ impl ValueKind {
             ValueKind::Float => {
                 r"\s*([-+]?(?:(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?|(?i:inf(?:inity)?|nan)))\s*"
             }
-            ValueKind::Char => "(.)",
+            ValueKind::Char => r"\s*(.)\s*",
             ValueKind::Bool => r"\s*((?i:true|false))\s*",
         }
     }
@@ -101,14 +101,16 @@ impl ValueKind {
     pub fn from_format_spec(spec: &str) -> ValueKind {
         let mut chars = spec.chars();
         let rest = match (chars.next(), chars.next()) {
-            (Some(fill), Some('<' | '>' | '^' | '=')) => {
+            // Python's `=` alignment puts the padding between the sign and the digits.
+            (_, Some('=')) | (Some('='), _) => return ValueKind::Any,
+            (Some(fill), Some('<' | '>' | '^')) => {
                 if !fill.is_whitespace() {
                     // A fill character would be mixed in with the value.
                     return ValueKind::Any;
                 }
                 chars.as_str()
             }
-            (Some('<' | '>' | '^' | '='), _) => &spec[1..],
+            (Some('<' | '>' | '^'), _) => &spec[1..],
             _ => spec,
         };
         if rest.contains([',', '_', 'L']) {
@@ -652,6 +654,9 @@ mod tests {
         assert_eq!(ValueKind::from_format_spec("_x"), ValueKind::Any);
         assert_eq!(ValueKind::from_format_spec(".1%"), ValueKind::Any);
         assert_eq!(ValueKind::from_format_spec("n"), ValueKind::Any);
+        assert_eq!(ValueKind::from_format_spec("=5d"), ValueKind::Any);
+        assert_eq!(ValueKind::from_format_spec(" =+8.2f"), ValueKind::Any);
+        assert_eq!(ValueKind::from_format_spec(">5c"), ValueKind::Char);
     }
 
     #[test]
@@ -859,5 +864,47 @@ mod tests {
         ));
         // Trailing whitespace is more likely to be padding.
         assert!(!is_plausible("a  42", &[0..2, 3..5], &[Any, Integer]));
+    }
+
+    /// The default formatting of values in each language, which is what a placeholder without a
+    /// format spec produces when the kind comes from the argument expression.
+    #[test]
+    fn test_value_range_default_formats() {
+        use ValueKind::*;
+        let cases = [
+            // Java/Kotlin
+            (Integer, "-2147483648"),
+            (Float, "1.0E20"),
+            (Float, "1.0E-7"),
+            (Float, "Infinity"),
+            (Float, "-Infinity"),
+            (Float, "NaN"),
+            (Bool, "true"),
+            (Char, "a"),
+            // Rust
+            (Float, "100000000000000000000"),
+            (Float, "0.0000001"),
+            (Float, "inf"),
+            (Float, "-inf"),
+            // Python
+            (Float, "1e+20"),
+            (Float, "1e-07"),
+            (Float, "nan"),
+            (Bool, "False"),
+            // C++ std::format/fmt
+            (Float, "-0"),
+            (Char, " "),
+        ];
+        for (kind, text) in cases {
+            assert_eq!(
+                kind.value_range(text),
+                Some(0..text.len()),
+                "{kind:?} {text:?}"
+            );
+        }
+        // Padding is not part of the value.
+        assert_eq!(Char.value_range("    a"), Some(4..5));
+        assert_eq!(Char.value_range("a    "), Some(0..1));
+        assert_eq!(Integer.value_range("  42"), Some(2..4));
     }
 }
