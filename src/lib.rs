@@ -370,12 +370,6 @@ impl SourceTree {
     }
 }
 
-/// Order the candidate statements for a log message from best to worst.  Higher quality is
-/// better and, for the same quality, a statement closer to the line number in the log message.
-/// The line number is only a tie-breaker since it is not always the line of the log call, like
-/// for a message built in a lambda.  Then, a statement with fewer placeholders is better.  Any
-/// remaining tie goes to the earliest location in the source so that the choice does not depend
-/// on the order the candidates were found in.
 /// Find the first of the ordered candidates whose statement matches `body`.  A statement that
 /// only matches with an empty value for a placeholder is passed over for a later candidate that
 /// matches without one, even a lower quality one, since a missing value is less likely than the
@@ -419,6 +413,12 @@ fn line_distance(src_ref: &SourceRef, lineno: Option<usize>) -> usize {
     })
 }
 
+/// Order the candidate statements for a log message from best to worst.  Higher quality is
+/// better and, for the same quality, a statement closer to the line number in the log message.
+/// The line number is only a tie-breaker since it is not always the line of the log call, like
+/// for a message built in a lambda.  Then, a statement with fewer placeholders is better.  Any
+/// remaining tie goes to the earliest location in the source so that the choice does not depend
+/// on the order the candidates were found in.
 fn compare_candidates(lhs: &SourceRef, rhs: &SourceRef, lineno: Option<usize>) -> Ordering {
     let distance = |src_ref: &SourceRef| line_distance(src_ref, lineno);
     rhs.quality
