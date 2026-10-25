@@ -353,10 +353,11 @@ fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<Mess
         quality += subtext.chars().filter(|c| !c.is_whitespace()).count();
         pattern.push_str(subtext.as_str());
         segments.push(subtext);
-        let kind = ValueKind::from_placeholder(language, placeholder.as_str());
-        pattern.push_str(kind.capture_regex());
+        // The kind of value is only used to split the values, so a value that does not look
+        // like the format spec, such as a date for `{:%Y-%m-%d}`, still matches.
+        pattern.push_str(ANY_CAPTURE);
         last_group_end = pattern.len();
-        kinds.push(kind);
+        kinds.push(ValueKind::from_placeholder(language, placeholder.as_str()));
         args.push(arg);
     }
     let mut subtext = pending;
@@ -637,7 +638,7 @@ mod tests {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "they are %d years old", SourceLanguage::Cpp).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^they are \s*([-+]?\d+)\s* years old$"#)
+            Regex::new(r#"(?s)^they are (.+) years old$"#)
                 .unwrap()
                 .as_str(),
             matcher.as_str()
@@ -650,7 +651,7 @@ mod tests {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "they are {0:d} years old", SourceLanguage::Cpp).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^they are \s*([-+]?\d+)\s* years old$"#)
+            Regex::new(r#"(?s)^they are (.+) years old$"#)
                 .unwrap()
                 .as_str(),
             matcher.as_str()
@@ -781,9 +782,9 @@ mod tests {
         } = build_matcher(false, text, language).unwrap();
         // The segments and capture groups should make up the whole pattern.
         let mut pattern = "(?s)^".to_string();
-        for (segment, kind) in std::iter::zip(&segments, &kinds) {
+        for segment in &segments[..segments.len() - 1] {
             pattern.push_str(segment);
-            pattern.push_str(kind.capture_regex());
+            pattern.push_str(ANY_CAPTURE);
         }
         pattern.push_str(segments.last().unwrap());
         pattern.push('$');
@@ -832,7 +833,7 @@ mod tests {
     fn test_build_matcher_percent() {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "100%% done %d", SourceLanguage::Cpp).unwrap();
-        assert_eq!(matcher.as_str(), r"(?s)^100% done \s*([-+]?\d+)\s*$");
+        assert_eq!(matcher.as_str(), r"(?s)^100% done (.+)$");
         assert_eq!(args, vec![FormatArgument::Placeholder]);
 
         let MessageMatcher { matcher, args, .. } =

@@ -12,10 +12,11 @@
 use crate::SourceLanguage;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::LazyLock;
-use tree_sitter::Node;
+use tree_sitter::{Node, Parser};
 
 /// The kind of value that is expected to be substituted for a placeholder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -61,9 +62,9 @@ impl ValueKind {
         *self as usize
     }
 
-    /// The capture group to use in a message matcher for a placeholder of this kind.  Padding
-    /// is matched outside the group, so it is not included in the value.
-    pub fn capture_regex(&self) -> &'static str {
+    /// A regex for a value of this kind where the capture group is the value.  Padding is
+    /// matched outside the group, so it is not included in the value.
+    fn capture_regex(&self) -> &'static str {
         match self {
             ValueKind::Any => ANY_CAPTURE,
             ValueKind::Integer => r"\s*([-+]?\d+)\s*",
@@ -114,6 +115,10 @@ impl ValueKind {
     /// Derive the kind from a `std::fmt`/`fmt::format`/Python format spec, which is the part
     /// after the colon in a `{...}` placeholder.
     pub fn from_format_spec(spec: &str) -> ValueKind {
+        if spec.contains('%') {
+            // A strftime-style spec for a date/time, like `%Y-%m-%d`, or a Python percentage.
+            return ValueKind::Any;
+        }
         let mut chars = spec.chars();
         let rest = match (chars.next(), chars.next()) {
             // Python's `=` alignment puts the padding between the sign and the digits.
@@ -142,19 +147,6 @@ impl ValueKind {
             Some('c') => ValueKind::Char,
             Some('p') => ValueKind::Pointer,
             _ => ValueKind::Any,
-        }
-    }
-
-    /// The printf-style placeholder that is equivalent to this kind.
-    pub fn printf_placeholder(&self) -> &'static str {
-        match self {
-            ValueKind::Integer => "%d",
-            ValueKind::Hex => "%x",
-            ValueKind::Octal => "%o",
-            ValueKind::Float => "%f",
-            ValueKind::Char => "%c",
-            ValueKind::Pointer => "%p",
-            ValueKind::Any | ValueKind::Binary | ValueKind::HexFloat | ValueKind::Bool => "%s",
         }
     }
 
@@ -257,6 +249,40 @@ impl ValueKind {
             "call_expression" | "method_invocation" | "call" => Self::from_call(node, source),
             _ => ValueKind::Any,
         }
+    }
+
+    /// Guess the kind of value of a Rust macro argument.  The arguments of a macro are a token
+    /// tree instead of expressions, so the text needs to be parsed as an expression first.
+    pub(crate) fn from_rust_tokens(tokens: &str) -> ValueKind {
+        thread_local! {
+            static PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+        }
+        let tokens = tokens.trim();
+        if tokens.is_empty() {
+            return ValueKind::Any;
+        }
+        let source = format!("fn f() {{ f({tokens}); }}");
+        PARSER.with_borrow_mut(|parser| {
+            let parser = parser.get_or_insert_with(|| {
+                let mut parser = Parser::new();
+                parser
+                    .set_language(&SourceLanguage::Rust.into())
+                    .expect("the Rust grammar is valid");
+                parser
+            });
+            let Some(tree) = parser.parse(&source, None) else {
+                return ValueKind::Any;
+            };
+            match find_node(tree.root_node(), "arguments") {
+                // The tokens might not be a single expression, like `a, b` in a nested macro.
+                Some(args) if !args.has_error() && args.named_child_count() == 1 => {
+                    args.named_child(0).map_or(ValueKind::Any, |expr| {
+                        Self::from_node(SourceLanguage::Rust, expr, &source)
+                    })
+                }
+                _ => ValueKind::Any,
+            }
+        })
     }
 
     fn from_binary(
@@ -379,11 +405,16 @@ impl ValueKind {
     fn candidate_ends(&self, text: &str) -> Vec<usize> {
         match self {
             ValueKind::Any => balanced_ends(text),
-            ValueKind::Char => text
-                .chars()
-                .next()
-                .map(|c| vec![c.len_utf8()])
-                .unwrap_or_default(),
+            ValueKind::Char => {
+                // The character may be padded with whitespace on either side, so the value
+                // cannot extend past the second non-whitespace character.
+                let limit = text
+                    .char_indices()
+                    .filter(|(_, c)| !c.is_whitespace())
+                    .nth(1)
+                    .map_or(text.len(), |(index, _)| index);
+                (1..=limit).filter(|&i| text.is_char_boundary(i)).collect()
+            }
             _ => {
                 // None of these values contain whitespace except for padding, so the value
                 // cannot extend past the second run of whitespace.
@@ -400,7 +431,7 @@ impl ValueKind {
 
     /// Check if `text` is a valid value of this kind and return the range of the value without
     /// any padding.
-    fn value_range(&self, text: &str) -> Option<Range<usize>> {
+    pub(crate) fn value_range(&self, text: &str) -> Option<Range<usize>> {
         if *self == ValueKind::Any {
             return Some(0..text.len());
         }
@@ -447,6 +478,18 @@ const BOOL_METHODS: &[&str] = &[
     "startswith",
     "endswith",
 ];
+
+/// Find the first node of the given kind in a pre-order walk, which is the outermost one.
+fn find_node<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .find_map(|child| find_node(child, kind));
+    found
+}
 
 fn last_named_child(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
@@ -664,18 +707,6 @@ mod tests {
         ValueKind::from_node(language, arg, &source)
     }
 
-    /// Find the first node of the given kind in a pre-order walk, which is the outermost one.
-    fn find_node<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
-        if node.kind() == kind {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        let found = node
-            .children(&mut cursor)
-            .find_map(|child| find_node(child, kind));
-        found
-    }
-
     fn kinds_of(language: SourceLanguage, exprs: &[&str]) -> Vec<ValueKind> {
         exprs.iter().map(|expr| kind_of(language, expr)).collect()
     }
@@ -716,6 +747,11 @@ mod tests {
             (Rust, "{:e}", Float),
             (Rust, "{:.2}", Any),
             (Rust, "{:>width$}", Any),
+            // Date/time specs for chrono and std::chrono.
+            (Cpp, "{:%Y-%m-%d}", Any),
+            (Cpp, "{:%c}", Any),
+            (Cpp, "{:%x}", Any),
+            (Rust, "{:%F}", Any),
             (Python, "%d", Integer),
             (Python, "%s", Any),
             (Java, "{}", Any),
@@ -740,6 +776,8 @@ mod tests {
         assert_eq!(ValueKind::from_format_spec("=5d"), ValueKind::Any);
         assert_eq!(ValueKind::from_format_spec(" =+8.2f"), ValueKind::Any);
         assert_eq!(ValueKind::from_format_spec(">5c"), ValueKind::Char);
+        assert_eq!(ValueKind::from_format_spec("%Y-%m-%d"), ValueKind::Any);
+        assert_eq!(ValueKind::from_format_spec("%H:%M:%S"), ValueKind::Any);
     }
 
     #[test]
@@ -834,6 +872,25 @@ mod tests {
     }
 
     #[test]
+    fn test_from_rust_tokens() {
+        use ValueKind::*;
+        let cases = [
+            ("v.len()", Integer),
+            (" x as u8 ", Integer),
+            ("(a == b)", Bool),
+            ("-1", Integer),
+            ("!v.is_empty()", Bool),
+            ("name", Any),
+            ("a, b", Any),
+            ("", Any),
+            ("foo(", Any),
+        ];
+        for (tokens, expected) in cases {
+            assert_eq!(ValueKind::from_rust_tokens(tokens), expected, "{tokens:?}");
+        }
+    }
+
+    #[test]
     fn test_balanced_ends() {
         assert_eq!(balanced_ends("a [b, c] d"), vec![1, 2, 8, 9, 10]);
         assert_eq!(balanced_ends("a) b"), vec![1]);
@@ -919,6 +976,15 @@ mod tests {
         assert_eq!(
             split("flag: true yes", &["flag: ", " ", ""], &[Bool, Any]),
             Some(vec!["true".into(), "yes".into()])
+        );
+        // A padded `%3c` after a string.
+        assert_eq!(
+            split("a b  z|", &["", "", r"\|"], &[Any, Char]),
+            Some(vec!["a b".into(), "z".into()])
+        );
+        assert_eq!(
+            split("ab|", &["", "", r"\|"], &[Char, Any]),
+            Some(vec!["a".into(), "b".into()])
         );
     }
 

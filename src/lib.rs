@@ -1439,16 +1439,22 @@ pub fn extract_variables<'a>(log_ref: &LogRef<'a>, src_ref: &'a SourceRef) -> Ve
             .skip(1)
             .map(|cap| cap.unwrap().range())
             .collect();
-        // With fewer than two placeholders, there is only one way to split the line.
-        if ranges.len() >= 2 {
-            let kinds = src_ref.value_kinds();
-            if kinds.len() == ranges.len() && !value_kind::is_plausible(line, &ranges, kinds) {
-                if let Some(split) = src_ref
-                    .segment_matchers()
-                    .and_then(|segments| value_kind::split_values(line, segments, kinds))
-                {
-                    ranges = split;
-                }
+        let kinds = src_ref.value_kinds();
+        if let ([range], [kind]) = (&mut ranges[..], kinds) {
+            // With one placeholder, there is only one way to split the line, but the value
+            // might be padded.
+            if let Some(value) = kind.value_range(&line[range.clone()]) {
+                *range = range.start + value.start..range.start + value.end;
+            }
+        } else if ranges.len() >= 2
+            && kinds.len() == ranges.len()
+            && !value_kind::is_plausible(line, &ranges, kinds)
+        {
+            if let Some(split) = src_ref
+                .segment_matchers()
+                .and_then(|segments| value_kind::split_values(line, segments, kinds))
+            {
+                ranges = split;
             }
         }
         for (expr, range) in std::iter::zip(exprs, ranges) {
@@ -2466,14 +2472,11 @@ class Same {
         assert_eq!(src_refs.len(), 2);
         assert_eq!(
             src_refs[0].pattern().as_str(),
-            r"(?s)^Opening href with external editor: (.+):\s*([-+]?\d+)\s*:\s*([-+]?\d+)\s*$"
+            "(?s)^Opening href with external editor: (.+):(.+):(.+)$"
         );
         assert_eq!((src_refs[0].line_no, src_refs[0].end_line_no), (4, 8));
         assert_eq!(src_refs[0].vars, vec!["path", "line", "0"]);
-        assert_eq!(
-            src_refs[1].pattern().as_str(),
-            r"(?s)^read \s*([-+]?\d+)\s* bytes$"
-        );
+        assert_eq!(src_refs[1].pattern().as_str(), "(?s)^read (.+) bytes$");
         assert_eq!(src_refs[1].vars, vec!["size"]);
     }
 
@@ -2644,7 +2647,7 @@ def main(name, count, x):
             patterns,
             vec![
                 r"(?s)^first part second part (.+)$",
-                r"(?s)^user (.+) has \s*([-+]?\d+)\s* items$",
+                r"(?s)^user (.+) has (.+) items$",
                 r"(?s)^C:\\dir x\tz$",
                 r"(?s)^\{literal\} (.+)$",
                 r"(?s)^raw\\d \{x\}$",
@@ -3285,6 +3288,8 @@ fn adjacent(mask: u32, name: &str, point: Point) {
     debug!("point: {:?} {:?}", name, point);
     debug!("count: {} {}", name, v.len());
     debug!("trailing: {} {}\n", name, point);
+    debug!("len: {} {}", v.len(), name);
+    debug!("cast: {} {}", x as u8, name);
 }
 "#;
 
@@ -3314,6 +3319,15 @@ fn adjacent(mask: u32, name: &str, point: Point) {
                 pairs(&[("name", "a"), ("point", "[b, c]")])
             );
         }
+        // The arguments of a macro are tokens, so they are parsed to get the kind of value.
+        assert_eq!(
+            extract_pairs("in-mem.rs", RUST_ADJACENT_SOURCE, 4, "len: 3 a b c"),
+            pairs(&[("v.len()", "3"), ("name", "a b c")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.rs", RUST_ADJACENT_SOURCE, 5, "cast: 7 a b"),
+            pairs(&[("x as u8", "7"), ("name", "a b")])
+        );
     }
 
     const CPP_ADJACENT_SOURCE: &str = r#"
@@ -3321,6 +3335,9 @@ fn adjacent(mask: u32, name: &str, point: Point) {
 
     int main(int argc, char* argv[]) {
         printf("got: %d %s %5d|", argc, argv[1], count);
+        printf("char: %s%3c|", name, c);
+        spdlog::info("day {:%Y-%m-%d} {}", tp, name);
+        printf("padded: %5d|", count);
     }
     "#;
 
@@ -3335,12 +3352,43 @@ fn adjacent(mask: u32, name: &str, point: Point) {
             ),
             pairs(&[("argc", "1"), ("argv[1]", "hello world"), ("count", "42")])
         );
+        assert_eq!(
+            extract_pairs("in-mem.cc", CPP_ADJACENT_SOURCE, 1, "char: a b  z|"),
+            pairs(&[("name", "a b"), ("c", "z")])
+        );
+        // A date/time spec does not end with a kind of value.
+        assert_eq!(
+            extract_pairs("in-mem.cc", CPP_ADJACENT_SOURCE, 2, "day 2026-10-25 a b"),
+            pairs(&[("tp", "2026-10-25 a"), ("name", "b")])
+        );
+        // The padding is left out of the value even when there is only one placeholder.
+        assert_eq!(
+            extract_pairs("in-mem.cc", CPP_ADJACENT_SOURCE, 3, "padded:    42|"),
+            pairs(&[("count", "42")])
+        );
+    }
+
+    #[test]
+    fn test_type_mismatch_still_matches() {
+        // The format spec only helps split the values, so a value that does not look like the
+        // spec still matches.
+        let source = r#"
+    int main() {
+        printf("value: %f", x);
+    }
+    "#;
+        assert_eq!(
+            extract_pairs("in-mem.cc", source, 0, "value: -nan(ind)"),
+            pairs(&[("x", "-nan(ind)")])
+        );
     }
 
     const PYTHON_ADJACENT_SOURCE: &str = r#"
 def main(args):
     logger.info(f"stats: {name} {count:d} {other}")
     logger.info("items: %s %s", len(items), rest)
+    logger.info(f"bits: {mask:b} {name}")
+    logger.info(f"day: {d:%Y-%m-%d}")
 "#;
 
     #[test]
@@ -3366,6 +3414,14 @@ def main(args):
                 "items: 3 ['a b', 'c']"
             ),
             pairs(&[("len(items)", "3"), ("rest", "['a b', 'c']")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_ADJACENT_SOURCE, 2, "bits: 101 a b"),
+            pairs(&[("mask", "101"), ("name", "a b")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_ADJACENT_SOURCE, 3, "day: 2026-10-25"),
+            pairs(&[("d", "2026-10-25")])
         );
     }
 
@@ -3470,7 +3526,7 @@ def main(x, t, pct):
                 r"(?s)^50% done$",
                 r"(?s)^(.+) is 50% done$",
                 r"(?s)^(.+) took (.+)$",
-                r"(?s)^\s*([-+]?\d+)\s*% done$",
+                r"(?s)^(.+)% done$",
             ]
         );
         assert_eq!(

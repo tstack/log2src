@@ -245,8 +245,18 @@ impl<'a> SourceQuery<'a> {
                     let mut arg_nodes: Vec<Node> = vec![];
                     while let Some(next_child) = child.next_sibling() {
                         if matches!(next_child.kind(), "," | ")") {
-                            let value_kind = match arg_nodes[..] {
-                                [node] => self.value_kind(node),
+                            let value_kind = match (arg_start, &arg_nodes[..]) {
+                                // The arguments of a Rust macro are tokens, not expressions.
+                                (Some(start), _)
+                                    if next_child
+                                        .parent()
+                                        .is_some_and(|p| p.kind() == "token_tree") =>
+                                {
+                                    ValueKind::from_rust_tokens(
+                                        &self.source[start.0..next_child.start_byte()],
+                                    )
+                                }
+                                (_, [node]) => self.value_kind(*node),
                                 _ => ValueKind::Any,
                             };
                             arg_nodes.clear();
@@ -434,24 +444,29 @@ impl<'a> SourceQuery<'a> {
                         pattern.push_str(&content);
                     }
                     "interpolation" => {
-                        // Swap in a Python placeholder for the interpolation expression that
-                        // preserves the kind of value from the format spec, if there is one.
+                        // Swap in a Python placeholder for the interpolation expression.  The
+                        // kind of value comes from the format spec, if there is one, and
+                        // otherwise from the expression.
+                        pattern.push_str("%s");
+                        interpolated = true;
                         let mut spec_cursor = string_child.walk();
-                        let kind = string_child
+                        let spec_kind = string_child
                             .children(&mut spec_cursor)
                             .find(|node| node.kind() == "format_specifier")
                             .map_or(ValueKind::Any, |spec| {
                                 let spec = &self.source[spec.byte_range()];
                                 ValueKind::from_format_spec(spec.strip_prefix(':').unwrap_or(spec))
                             });
-                        pattern.push_str(kind.printf_placeholder());
-                        interpolated = true;
                         if let Some(expr) = string_child.child_by_field_name("expression") {
+                            let kind = match spec_kind {
+                                ValueKind::Any => self.value_kind(expr),
+                                _ => spec_kind,
+                            };
                             args.push((
                                 FormatArgument::Named(
                                     self.source[expr.start_byte()..expr.end_byte()].to_string(),
                                 ),
-                                self.value_kind(expr),
+                                kind,
                             ));
                         }
                     }
