@@ -54,6 +54,10 @@ impl<'a> SourceQuery<'a> {
             let mut got_string_literal = false;
             let mut call_name: Option<String> = None;
             for capture in m.captures {
+                // captures starting with an underscore are only used for predicates
+                if query.capture_names()[capture.index as usize].starts_with('_') {
+                    continue;
+                }
                 let mut child = capture.node;
                 match child.kind() {
                     "string_literal" | "string" => {
@@ -147,15 +151,46 @@ impl<'a> SourceQuery<'a> {
         results
     }
 
+    /// Collect the arguments before the format string that might be a log level, like the
+    /// `LOG_ERR` in `syslog(LOG_ERR, "...")` or the `Level::Warn` in `log!(Level::Warn, "...")`.
     fn leading_args(&self, node: Node) -> Vec<String> {
         let mut args = Vec::new();
-        if node.parent().is_some_and(|p| p.kind() == "argument_list") {
-            let mut prev = node.prev_named_sibling();
-            while let Some(arg) = prev {
-                args.push(self.source[arg.byte_range()].to_string());
-                prev = arg.prev_named_sibling();
+        match node.parent().map(|p| p.kind()) {
+            Some("argument_list") => {
+                let mut prev = node.prev_named_sibling();
+                while let Some(arg) = prev {
+                    // Only names can be level constants, other arguments like string literals
+                    // could contain level words that aren't relevant.
+                    if matches!(
+                        arg.kind(),
+                        "identifier"
+                            | "qualified_identifier"
+                            | "field_expression"
+                            | "field_access"
+                            | "attribute"
+                    ) {
+                        args.push(self.source[arg.byte_range()].to_string());
+                    }
+                    prev = arg.prev_named_sibling();
+                }
+                args.reverse();
             }
-            args.reverse();
+            Some("token_tree") => {
+                // Macro arguments are a flat list of tokens, so split the text before the
+                // format string on commas.
+                let parent = node.parent().unwrap();
+                let start = parent.start_byte() + 1;
+                if start < node.start_byte() {
+                    args.extend(
+                        self.source[start..node.start_byte()]
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|arg| !arg.is_empty() && !arg.contains('"'))
+                            .map(str::to_string),
+                    );
+                }
+            }
+            _ => {}
         }
         args
     }
