@@ -14,7 +14,12 @@ expression: src_refs
   quality: 30
   pattern: "(?s)^you're only as funky as your last cut$"
   args: []
+  argKinds: []
   vars: []
+  varKinds: []
+  kinds: []
+  segments:
+    - "you're only as funky as your last cut"
 - sourcePath: in-mem.rs
   language: Rust
   lineNumber: 18
@@ -25,13 +30,26 @@ expression: src_refs
   blockId: 224
   text: "\"this won't match i={}; j={}\""
   quality: 19
-  pattern: "(?s)^this won't match i=(.+); j=(.+)$"
+  pattern: "(?s)^this won't match i=(.*); j=(.*)$"
   args:
     - Placeholder
     - Placeholder
+  argKinds:
+    - Any
+    - Any
   vars:
     - i
     - j
+  varKinds:
+    - Any
+    - Any
+  kinds:
+    - Any
+    - Any
+  segments:
+    - "this won't match i="
+    - ; j=
+    - ""
 - sourcePath: in-mem.rs
   language: Rust
   lineNumber: 22
@@ -42,11 +60,22 @@ expression: src_refs
   blockId: 326
   text: "\"{salutation}, {name}!\""
   quality: 2
-  pattern: "(?s)^(.+), (.+)!$"
+  pattern: "(?s)^(.*), (.*)!$"
   args:
     - Named: salutation
     - Named: name
+  argKinds:
+    - Any
+    - Any
   vars: []
+  varKinds: []
+  kinds:
+    - Any
+    - Any
+  segments:
+    - ""
+    - ", "
+    - "!"
 - sourcePath: in-mem.rs
   language: Rust
   lineNumber: 27
@@ -57,10 +86,18 @@ expression: src_refs
   blockId: 427
   text: "\"Hello, {name}!\""
   quality: 7
-  pattern: "(?s)^Hello, (.+)!$"
+  pattern: "(?s)^Hello, (.*)!$"
   args:
     - Named: name
+  argKinds:
+    - Any
   vars: []
+  varKinds: []
+  kinds:
+    - Any
+  segments:
+    - "Hello, "
+    - "!"
 - sourcePath: in-mem.rs
   language: Rust
   lineNumber: 31
@@ -71,8 +108,19 @@ expression: src_refs
   blockId: 548
   text: "\"{salutation}, {name}!\""
   quality: 2
-  pattern: "(?s)^(.+), (.+)!$"
+  pattern: "(?s)^(.*), (.*)!$"
   args:
     - Named: salutation
     - Named: name
+  argKinds:
+    - Any
+    - Any
   vars: []
+  varKinds: []
+  kinds:
+    - Any
+    - Any
+  segments:
+    - ""
+    - ", "
+    - "!"

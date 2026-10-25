@@ -12,7 +12,7 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,6 +29,7 @@ mod progress;
 mod source_hier;
 mod source_query;
 mod source_ref;
+mod value_kind;
 
 // TODO: doesn't need to be exposed if we can clean up the arguments to do_mapping
 use crate::java_symbols::{JavaSymbols, MessageRef, StringConstant};
@@ -36,6 +37,7 @@ use crate::prefilter::{Prefilter, StatementID};
 use crate::progress::{ProgressReader, WorkGuard};
 use crate::source_hier::{ScanEvent, SourceFileID, SourceHierContent, SourceHierTree};
 use crate::source_ref::{CallSite, FormatArgument};
+use crate::value_kind::SplitOrder;
 pub use code_source::CodeSource;
 pub use log_format::LogFormat;
 pub use progress::ProgressTracker;
@@ -145,7 +147,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "15")]
+    #[serde(rename = "25")]
     Current,
 }
 
@@ -308,15 +310,15 @@ impl SourceTree {
             .line_cache
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        cache
+        let candidates = cache
             .get(filename)?
             .get(&lineno)?
             .iter()
             .filter_map(|(file_id, index)| {
                 self.files_with_statements.get(file_id)?.statement(*index)
             })
-            .filter(|src_ref| src_ref.pattern.is_match(body))
-            .min_by(|lhs, rhs| compare_candidates(lhs, rhs, Some(lineno)))
+            .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, Some(lineno)));
+        first_match(candidates, body, Some(lineno), |src_ref| src_ref)
     }
 
     /// Find the highest quality statement that matches the given log message, preferring the one
@@ -349,9 +351,7 @@ impl SourceTree {
         });
         let lineno = log_ref.details.as_ref().and_then(|details| details.lineno);
         candidates.sort_by(|lhs, rhs| compare_candidates(lhs.1, rhs.1, lineno));
-        let (stmt_id, src_ref) = candidates
-            .into_iter()
-            .find(|(_, src_ref)| src_ref.pattern.is_match(body))?;
+        let (stmt_id, src_ref) = first_match(candidates, body, lineno, |(_, src_ref)| src_ref)?;
         if let Some((filename, lineno)) = self.line_cache_key(log_ref) {
             let mut cache = self
                 .line_cache
@@ -370,24 +370,62 @@ impl SourceTree {
     }
 }
 
+/// Find the first of the ordered candidates whose statement matches `body`.  A statement that
+/// only matches with an empty value for a placeholder is passed over for a later candidate that
+/// matches without one, even a lower quality one, since a missing value is less likely than the
+/// line coming from a different statement.  The exception is when the statement is closer to
+/// the line number in the log message, which is better evidence than the values.
+fn first_match<'a, T>(
+    candidates: impl IntoIterator<Item = T>,
+    body: &str,
+    lineno: Option<usize>,
+    src_ref: impl Fn(&T) -> &'a SourceRef,
+) -> Option<T> {
+    let mut with_empty_value: Option<T> = None;
+    for candidate in candidates {
+        let stmt = src_ref(&candidate);
+        if !stmt.pattern.is_match(body) {
+            continue;
+        }
+        if stmt.matches_without_empty_values(body) {
+            return match with_empty_value {
+                Some(prior)
+                    if line_distance(src_ref(&prior), lineno) < line_distance(stmt, lineno) =>
+                {
+                    Some(prior)
+                }
+                _ => Some(candidate),
+            };
+        }
+        with_empty_value.get_or_insert(candidate);
+    }
+    with_empty_value
+}
+
+/// How far a statement is from the line number in a log message, or zero if there is none.
+fn line_distance(src_ref: &SourceRef, lineno: Option<usize>) -> usize {
+    lineno.map_or(0, |lineno| {
+        if lineno < src_ref.line_no {
+            src_ref.line_no - lineno
+        } else {
+            lineno.saturating_sub(src_ref.end_line_no)
+        }
+    })
+}
+
 /// Order the candidate statements for a log message from best to worst.  Higher quality is
 /// better and, for the same quality, a statement closer to the line number in the log message.
 /// The line number is only a tie-breaker since it is not always the line of the log call, like
-/// for a message built in a lambda.  Any remaining tie goes to the earliest location in the
-/// source so that the choice does not depend on the order the candidates were found in.
+/// for a message built in a lambda.  Then, a statement with fewer placeholders is better.  Any
+/// remaining tie goes to the earliest location in the source so that the choice does not depend
+/// on the order the candidates were found in.
 fn compare_candidates(lhs: &SourceRef, rhs: &SourceRef, lineno: Option<usize>) -> Ordering {
-    let distance = |src_ref: &SourceRef| {
-        lineno.map_or(0, |lineno| {
-            if lineno < src_ref.line_no {
-                src_ref.line_no - lineno
-            } else {
-                lineno.saturating_sub(src_ref.end_line_no)
-            }
-        })
-    };
+    let distance = |src_ref: &SourceRef| line_distance(src_ref, lineno);
     rhs.quality
         .cmp(&lhs.quality)
         .then_with(|| distance(lhs).cmp(&distance(rhs)))
+        // A placeholder can be empty, so a message like "Done" matches both "Done" and "Done{}".
+        .then_with(|| lhs.kinds.len().cmp(&rhs.kinds.len()))
         .then_with(|| {
             (&lhs.source_path, lhs.line_no, lhs.column).cmp(&(
                 &rhs.source_path,
@@ -903,20 +941,23 @@ const IDENTS_PYTHON: &[&str] = &["debug", "info", "warn", "trace"];
 
 const IDENTS_KOTLIN: &[&str] = IDENTS_JAVA;
 
+/// The `{{` and `}}` alternatives are escaped braces, which are found so that they are not
+/// mistaken for the start or end of a placeholder.
 static RUST_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\{(?:([a-zA-Z_][a-zA-Z0-9_.]*)|(\d+))?\s*(?::[^}]*)?}"#).unwrap()
+    Regex::new(r#"\{\{|\}\}|\{(?:([a-zA-Z_][a-zA-Z0-9_.]*)|(\d+))?\s*(?::[^}]*)?}"#).unwrap()
 });
 
+/// Other braces in an SLF4J message are literal, so a placeholder cannot contain a `{`.
 static JAVA_PLACEHOLDER_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"\{[^}]*}|\\\{([^}]*)}"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"\{[^{}]*}|\\\{([^}]*)}"#).unwrap());
 
 static CPP_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*[diuoxXfFeEgGaAcspn%]|\{(?:([a-zA-Z_][a-zA-Z0-9_.]*)|(\d+))?\s*(?::[^}]*)?}"#).unwrap()
+    Regex::new(r#"%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*[diuoxXfFeEgGaAcspn%]|\{\{|\}\}|\{(?:([a-zA-Z_][a-zA-Z0-9_.]*)|(\d+))?\s*(?::[^}]*)?}"#).unwrap()
 });
 
 /// SLF4J-style placeholders.  String templates are converted to these placeholders, too.
 static KOTLIN_PLACEHOLDER_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"\{[^}]*}"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"\{[^{}]*}"#).unwrap());
 
 static PYTHON_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*[diuoxXfFeEgGaAcrspn%]"#).unwrap()
@@ -1168,6 +1209,9 @@ impl SourceLanguage {
 pub struct VariablePair {
     pub expr: String,
     pub value: String,
+    /// The line could also be split so that this variable has a different value.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ambiguous: bool,
 }
 
 #[derive(Serialize)]
@@ -1396,10 +1440,10 @@ impl<'a> LogRef<'a> {
 }
 
 pub fn link_to_source<'a>(log_ref: &LogRef, src_refs: &'a [SourceRef]) -> Option<&'a SourceRef> {
-    src_refs
+    let candidates = src_refs
         .iter()
-        .sorted_by(|lhs, rhs| rhs.quality.cmp(&lhs.quality))
-        .find(|&source_ref| source_ref.captures(log_ref.body()).is_some())
+        .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, None));
+    first_match(candidates, log_ref.body(), None, |src_ref| src_ref)
 }
 
 pub fn lookup_source<'a>(
@@ -1430,36 +1474,92 @@ pub fn extract_variables<'a>(log_ref: &LogRef<'a>, src_ref: &'a SourceRef) -> Ve
         None => log_ref.line,
     };
     if let Some(captures) = src_ref.captures(line) {
-        let mut placeholder_index = 0;
-        for (cap, placeholder) in std::iter::zip(captures.iter().skip(1), src_ref.args.iter()) {
-            let expr = match placeholder {
-                FormatArgument::Named(name) => name.clone(),
-                FormatArgument::Positional(pos) => src_ref
-                    .vars
-                    .get(*pos)
-                    .map(|s| s.as_str())
-                    .unwrap_or("<unknown>")
-                    .to_string(),
-                FormatArgument::Placeholder => {
-                    let res = src_ref
-                        .vars
-                        .get(placeholder_index)
-                        .map(|s| s.as_str())
-                        .unwrap_or("<unknown>")
-                        .to_string();
-
-                    placeholder_index += 1;
-                    res
-                }
-            };
+        let exprs = src_ref.arg_exprs();
+        let greedy = captures
+            .iter()
+            .skip(1)
+            .map(|cap| cap.unwrap().range())
+            .collect();
+        let (ranges, ambiguous) = find_values(line, src_ref, greedy);
+        for ((expr, range), ambiguous) in std::iter::zip(exprs, ranges).zip(ambiguous) {
             variables.push(VariablePair {
-                expr,
-                value: cap.unwrap().as_str().to_string(),
+                expr: expr.to_string(),
+                value: line[range].to_string(),
+                ambiguous,
             });
         }
     }
 
     variables
+}
+
+/// Find the values of the placeholders in a line, starting from the greedy captures of the
+/// statement's matcher, and whether each value is ambiguous.  The greedy captures give
+/// everything to the first placeholder when the placeholders are next to each other, so the line
+/// might be re-split using the kinds of values expected for each placeholder.
+fn find_values(
+    line: &str,
+    src_ref: &SourceRef,
+    greedy: Vec<Range<usize>>,
+) -> (Vec<Range<usize>>, Vec<bool>) {
+    let not_ambiguous = vec![false; greedy.len()];
+    let kinds = src_ref.value_kinds();
+    if let ([range], [kind]) = (&greedy[..], kinds) {
+        // With one placeholder, there is only one way to split the line, but the value might
+        // be padded.
+        let value = kind
+            .value_range(&line[range.clone()])
+            .map_or(range.clone(), |value| {
+                range.start + value.start..range.start + value.end
+            });
+        return (vec![value], not_ambiguous);
+    }
+    if greedy.len() < 2 || kinds.len() != greedy.len() {
+        return (greedy, not_ambiguous);
+    }
+    // The lazy captures find the split with the shortest values for the earlier placeholders.
+    // If that is the same as the greedy split, there is only one way to split the line.  The
+    // lazy captures are skipped when a cheaper check shows there is no other split.
+    let may_be_ambiguous = src_ref
+        .separators()
+        .is_none_or(|separators| value_kind::may_be_ambiguous(line, &greedy, separators));
+    let lazy: Option<Vec<Range<usize>>> = src_ref
+        .lazy_matcher()
+        .filter(|_| may_be_ambiguous)
+        .and_then(|matcher| matcher.captures(line))
+        .map(|caps| {
+            caps.iter()
+                .skip(1)
+                .map(|cap| cap.unwrap().range())
+                .collect()
+        });
+    let unique = lazy.as_ref().is_none_or(|lazy| *lazy == greedy);
+    if unique && value_kind::is_plausible(line, &greedy, kinds) {
+        return (greedy, not_ambiguous);
+    }
+    let differs = |lhs: &[Range<usize>], rhs: &[Range<usize>]| -> Vec<bool> {
+        std::iter::zip(lhs, rhs).map(|(l, r)| l != r).collect()
+    };
+    let split = |order| {
+        src_ref
+            .segment_matchers()
+            .and_then(|segments| value_kind::split_values(line, segments, kinds, order))
+    };
+    match split(SplitOrder::LongestFirst) {
+        Some(longest) if unique => (longest, not_ambiguous),
+        Some(longest) => {
+            // The values that are the same whether the split prefers longer or shorter values
+            // are not ambiguous.
+            let ambiguous = split(SplitOrder::ShortestFirst)
+                .map_or(not_ambiguous, |shortest| differs(&longest, &shortest));
+            (longest, ambiguous)
+        }
+        // No split has values that look like their kinds, so use the greedy captures.
+        None => {
+            let ambiguous = lazy.map_or(not_ambiguous, |lazy| differs(&greedy, &lazy));
+            (greedy, ambiguous)
+        }
+    }
 }
 
 pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec<StatementsInFile> {
@@ -1505,6 +1605,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                             block_id: result.block_id,
                             text: text.to_string(),
                             vars: vec![],
+                            var_kinds: vec![],
                             candidates: symbols.candidates(text, range.start_byte),
                         });
                         args_target = ArgsTarget::MessageRef;
@@ -1529,10 +1630,12 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                                     let prior = message_refs.last_mut().unwrap();
                                     prior.end_line_no = end_line_no;
                                     prior.vars.push(var);
+                                    prior.var_kinds.push(result.value_kind);
                                 } else {
                                     let prior = matched.last_mut().unwrap();
                                     prior.end_line_no = end_line_no;
                                     prior.vars.push(var);
+                                    prior.var_kinds.push(result.value_kind);
                                 }
                             }
                         }
@@ -1710,7 +1813,8 @@ fn main() {
             vars,
             [VariablePair {
                 expr: "adjective".to_string(),
-                value: "funky".to_string()
+                value: "funky".to_string(),
+                ambiguous: false,
             }]
         );
     }
@@ -1743,11 +1847,13 @@ fn main() {
             vec![
                 VariablePair {
                     expr: "i".to_string(),
-                    value: "1".to_string()
+                    value: "1".to_string(),
+                    ambiguous: false,
                 },
                 VariablePair {
                     expr: "j".to_string(),
-                    value: "2".to_string()
+                    value: "2".to_string(),
+                    ambiguous: false,
                 }
             ]
         );
@@ -1767,7 +1873,8 @@ fn main() {
             vars,
             vec![VariablePair {
                 expr: "name".to_string(),
-                value: "Tim".to_string()
+                value: "Tim".to_string(),
+                ambiguous: false,
             },]
         );
     }
@@ -1803,7 +1910,8 @@ fn main() {
             vars,
             vec![VariablePair {
                 expr: "this".to_string(),
-                value: "JvmPauseMonitor-n0".to_string()
+                value: "JvmPauseMonitor-n0".to_string(),
+                ambiguous: false,
             },]
         );
     }
@@ -1834,7 +1942,8 @@ fn main() {
             vars,
             vec![VariablePair {
                 expr: "cl".to_string(),
-                value: "jdk.internal.loader".to_string()
+                value: "jdk.internal.loader".to_string(),
+                ambiguous: false,
             },]
         );
         assert_eq!(src_refs[1].line_no, 4);
@@ -1863,9 +1972,9 @@ fn main() {
             patterns,
             vec![
                 "(?s)^Can''t find our classloader for the Driver; attempting to use the thread context classloader$",
-                "(?s)^User (.+) logged in from (.+)$",
-                "(?s)^(.+) total$",
-                "(?s)^sum=(.+)!$",
+                "(?s)^User (.*) logged in from (.*)$",
+                "(?s)^(.*) total$",
+                "(?s)^sum=(.*)!$",
             ]
         );
         assert_eq!((src_refs[0].line_no, src_refs[0].end_line_no), (3, 4));
@@ -1877,11 +1986,13 @@ fn main() {
             vec![
                 VariablePair {
                     expr: "name".to_string(),
-                    value: "alice".to_string()
+                    value: "alice".to_string(),
+                    ambiguous: false,
                 },
                 VariablePair {
                     expr: "host".to_string(),
-                    value: "example.com".to_string()
+                    value: "example.com".to_string(),
+                    ambiguous: false,
                 },
             ]
         );
@@ -1892,7 +2003,8 @@ fn main() {
             extract_variables(&log_ref, &src_refs[2]),
             vec![VariablePair {
                 expr: "a + b".to_string(),
-                value: "42".to_string()
+                value: "42".to_string(),
+                ambiguous: false,
             }]
         );
         assert_eq!(
@@ -2463,11 +2575,11 @@ class Same {
         assert_eq!(src_refs.len(), 2);
         assert_eq!(
             src_refs[0].pattern().as_str(),
-            "(?s)^Opening href with external editor: (.+):(.+):(.+)$"
+            "(?s)^Opening href with external editor: (.*):(.*):(.*)$"
         );
         assert_eq!((src_refs[0].line_no, src_refs[0].end_line_no), (4, 8));
         assert_eq!(src_refs[0].vars, vec!["path", "line", "0"]);
-        assert_eq!(src_refs[1].pattern().as_str(), "(?s)^read (.+) bytes$");
+        assert_eq!(src_refs[1].pattern().as_str(), "(?s)^read (.*) bytes$");
         assert_eq!(src_refs[1].vars, vec!["size"]);
     }
 
@@ -2611,7 +2723,8 @@ int other(int x) {
             vars,
             vec![VariablePair {
                 expr: "argv[1]".to_string(),
-                value: "Steve".to_string()
+                value: "Steve".to_string(),
+                ambiguous: false,
             },]
         );
     }
@@ -2637,10 +2750,10 @@ def main(name, count, x):
         assert_eq!(
             patterns,
             vec![
-                r"(?s)^first part second part (.+)$",
-                r"(?s)^user (.+) has (.+) items$",
+                r"(?s)^first part second part (.*)$",
+                r"(?s)^user (.*) has (.*) items$",
                 r"(?s)^C:\\dir x\tz$",
-                r"(?s)^\{literal\} (.+)$",
+                r"(?s)^\{literal\} (.*)$",
                 r"(?s)^raw\\d \{x\}$",
             ]
         );
@@ -2654,11 +2767,13 @@ def main(name, count, x):
             vec![
                 VariablePair {
                     expr: "name".to_string(),
-                    value: "bob".to_string()
+                    value: "bob".to_string(),
+                    ambiguous: false,
                 },
                 VariablePair {
                     expr: "count".to_string(),
-                    value: "3".to_string()
+                    value: "3".to_string(),
+                    ambiguous: false,
                 },
             ]
         );
@@ -2689,7 +2804,8 @@ processing \started -- {args[0]}""")
             vars,
             vec![VariablePair {
                 expr: "test_var".to_string(),
-                value: "bar".to_string()
+                value: "bar".to_string(),
+                ambiguous: false,
             },]
         );
     }
@@ -3198,6 +3314,638 @@ fun handle(x: Boolean, y: Int) {
                 &["i"],
                 &["k"],
             ],
+        );
+    }
+
+    fn extract_pairs(path: &str, source: &str, index: usize, line: &str) -> Vec<(String, String)> {
+        let log_ref = LogRefBuilder::new().build(line);
+        let code = CodeSource::from_string(Path::new(path), source);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        extract_variables(&log_ref, &src_refs[index])
+            .into_iter()
+            .map(|pair| (pair.expr, pair.value))
+            .collect()
+    }
+
+    const JAVA_ADJACENT_SOURCE: &str = r#"
+public class Adjacent {
+    public void run() {
+        log.debug("foo bar: {} {} {}", a, b, c);
+        log.debug("sizes: {} {} {}", name, items.size(), other);
+        log.debug("flags: {}{}", ready, map.isEmpty());
+    }
+}
+"#;
+
+    #[test]
+    fn test_adjacent_java() {
+        assert_eq!(
+            extract_pairs(
+                "in-mem.java",
+                JAVA_ADJACENT_SOURCE,
+                0,
+                "foo bar: 1 2 [a, b]"
+            ),
+            pairs(&[("a", "1"), ("b", "2"), ("c", "[a, b]")])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.java",
+                JAVA_ADJACENT_SOURCE,
+                0,
+                "foo bar: {k=v, z=1} [x, y] 42"
+            ),
+            pairs(&[("a", "{k=v, z=1}"), ("b", "[x, y]"), ("c", "42")])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.java",
+                JAVA_ADJACENT_SOURCE,
+                1,
+                "sizes: hello world 5 foo bar"
+            ),
+            pairs(&[
+                ("name", "hello world"),
+                ("items.size()", "5"),
+                ("other", "foo bar")
+            ])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.java", JAVA_ADJACENT_SOURCE, 2, "flags: truefalse"),
+            pairs(&[("ready", "true"), ("map.isEmpty()", "false")])
+        );
+        // Without any hints, the split is ambiguous and the earlier placeholder gets more.
+        assert_eq!(
+            extract_pairs(
+                "in-mem.java",
+                JAVA_ADJACENT_SOURCE,
+                0,
+                "foo bar: 1 hello world 3"
+            ),
+            pairs(&[("a", "1 hello"), ("b", "world"), ("c", "3")])
+        );
+    }
+
+    const RUST_ADJACENT_SOURCE: &str = r#"
+fn adjacent(mask: u32, name: &str, point: Point) {
+    debug!("mask: {:x} {}", mask, name);
+    debug!("point: {:?} {:?}", name, point);
+    debug!("count: {} {}", name, v.len());
+    debug!("trailing: {} {}\n", name, point);
+    debug!("len: {} {}", v.len(), name);
+    debug!("cast: {} {}", x as u8, name);
+}
+"#;
+
+    #[test]
+    fn test_adjacent_rust() {
+        assert_eq!(
+            extract_pairs("in-mem.rs", RUST_ADJACENT_SOURCE, 0, "mask: ff hello world"),
+            pairs(&[("mask", "ff"), ("name", "hello world")])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.rs",
+                RUST_ADJACENT_SOURCE,
+                1,
+                r#"point: "a b" Point { x: 1, y: 2 }"#
+            ),
+            pairs(&[("name", r#""a b""#), ("point", "Point { x: 1, y: 2 }")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.rs", RUST_ADJACENT_SOURCE, 2, "count: a b c 3"),
+            pairs(&[("name", "a b c"), ("v.len()", "3")])
+        );
+        // The trailing newline is optional and is not part of the last value.
+        for line in ["trailing: a [b, c]", "trailing: a [b, c]\n"] {
+            assert_eq!(
+                extract_pairs("in-mem.rs", RUST_ADJACENT_SOURCE, 3, line),
+                pairs(&[("name", "a"), ("point", "[b, c]")])
+            );
+        }
+        // The arguments of a macro are tokens, so they are parsed to get the kind of value.
+        assert_eq!(
+            extract_pairs("in-mem.rs", RUST_ADJACENT_SOURCE, 4, "len: 3 a b c"),
+            pairs(&[("v.len()", "3"), ("name", "a b c")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.rs", RUST_ADJACENT_SOURCE, 5, "cast: 7 a b"),
+            pairs(&[("x as u8", "7"), ("name", "a b")])
+        );
+    }
+
+    const CPP_ADJACENT_SOURCE: &str = r#"
+    #include <stdio.h>
+
+    int main(int argc, char* argv[]) {
+        printf("got: %d %s %5d|", argc, argv[1], count);
+        printf("char: %s%3c|", name, c);
+        spdlog::info("day {:%Y-%m-%d} {}", tp, name);
+        printf("padded: %5d|", count);
+    }
+    "#;
+
+    #[test]
+    fn test_adjacent_cpp() {
+        assert_eq!(
+            extract_pairs(
+                "in-mem.cc",
+                CPP_ADJACENT_SOURCE,
+                0,
+                "got: 1 hello world    42|"
+            ),
+            pairs(&[("argc", "1"), ("argv[1]", "hello world"), ("count", "42")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.cc", CPP_ADJACENT_SOURCE, 1, "char: a b  z|"),
+            pairs(&[("name", "a b"), ("c", "z")])
+        );
+        // A date/time spec does not end with a kind of value.
+        assert_eq!(
+            extract_pairs("in-mem.cc", CPP_ADJACENT_SOURCE, 2, "day 2026-10-25 a b"),
+            pairs(&[("tp", "2026-10-25 a"), ("name", "b")])
+        );
+        // The padding is left out of the value even when there is only one placeholder.
+        assert_eq!(
+            extract_pairs("in-mem.cc", CPP_ADJACENT_SOURCE, 3, "padded:    42|"),
+            pairs(&[("count", "42")])
+        );
+    }
+
+    #[test]
+    fn test_type_mismatch_still_matches() {
+        // The format spec only helps split the values, so a value that does not look like the
+        // spec still matches.
+        let source = r#"
+    int main() {
+        printf("value: %f", x);
+        printf("values: %f %s", x, name);
+    }
+    "#;
+        assert_eq!(
+            extract_pairs("in-mem.cc", source, 0, "value: -nan(ind)"),
+            pairs(&[("x", "-nan(ind)")])
+        );
+        // With more than one placeholder, there is no split where the values match their kinds,
+        // so the greedy split is used.
+        assert_eq!(
+            extract_pairs("in-mem.cc", source, 1, "values: -nan(ind) hello world"),
+            pairs(&[("x", "-nan(ind) hello"), ("name", "world")])
+        );
+    }
+
+    /// Extract the variables and get the names of the ones that are ambiguous.
+    fn ambiguous_vars(path: &str, source: &str, index: usize, line: &str) -> Vec<String> {
+        let log_ref = LogRefBuilder::new().build(line);
+        let code = CodeSource::from_string(Path::new(path), source);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        extract_variables(&log_ref, &src_refs[index])
+            .into_iter()
+            .filter(|pair| pair.ambiguous)
+            .map(|pair| pair.expr)
+            .collect()
+    }
+
+    #[test]
+    fn test_ambiguous_variables() {
+        let java = |index, line| ambiguous_vars("in-mem.java", JAVA_ADJACENT_SOURCE, index, line);
+        // Every value could be different: "1 hello", "world", "3" or "1", "hello", "world 3".
+        assert_eq!(
+            java(0, "foo bar: 1 hello world 3"),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        // The brackets and the kinds of values leave only one valid split.
+        assert!(java(0, "foo bar: 1 2 [a, b]").is_empty());
+        assert!(java(1, "sizes: hello world 5 foo bar").is_empty());
+        // There is only one way to split the line.
+        assert!(java(0, "foo bar: 1 2 3").is_empty());
+
+        let source = r#"
+    int main() {
+        printf("pair: %s %s, count=%d", a, b, count);
+        printf("padded: %5d %5d|", x, y);
+        printf("values: %f %s", x, name);
+    }
+    "#;
+        let cpp = |index, line| ambiguous_vars("in-mem.cc", source, index, line);
+        // Only the values next to each other are ambiguous.
+        assert_eq!(
+            cpp(0, "pair: a b c, count=5"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // Padding is not ambiguity.
+        assert!(cpp(1, "padded:     1     2|").is_empty());
+        // No split has values that look like their kinds.
+        assert_eq!(
+            cpp(2, "values: -nan(ind) hello world"),
+            vec!["x".to_string(), "name".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_ambiguous_json() {
+        let pair = |ambiguous| VariablePair {
+            expr: "a".to_string(),
+            value: "1".to_string(),
+            ambiguous,
+        };
+        assert_eq!(
+            serde_json::to_string(&pair(false)).unwrap(),
+            r#"{"expr":"a","value":"1"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&pair(true)).unwrap(),
+            r#"{"expr":"a","value":"1","ambiguous":true}"#
+        );
+    }
+
+    #[test]
+    fn test_empty_values() {
+        let java = r#"
+public class Empty {
+    public void run() {
+        log.info("user={} logged in", name);
+        log.info("pair: [{}] [{}]", a, b);
+    }
+}
+"#;
+        assert_eq!(
+            extract_pairs("in-mem.java", java, 0, "user= logged in"),
+            pairs(&[("name", "")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.java", java, 1, "pair: [] [x y]"),
+            pairs(&[("a", ""), ("b", "x y")])
+        );
+        let rust = r#"
+fn f(a: &str, b: u32) {
+    debug!("a={} b={}", a, b);
+}
+"#;
+        assert_eq!(
+            extract_pairs("in-mem.rs", rust, 0, "a= b=2"),
+            pairs(&[("a", ""), ("b", "2")])
+        );
+        let cpp = r#"
+    int main() {
+        printf("name: '%s'", name);
+    }
+    "#;
+        assert_eq!(
+            extract_pairs("in-mem.cc", cpp, 0, "name: ''"),
+            pairs(&[("name", "")])
+        );
+        let python = r#"
+def main(name):
+    logger.info("name=%s.", name)
+    logger.info(f"name={name}.")
+"#;
+        for index in [0, 1] {
+            assert_eq!(
+                extract_pairs("in-mem.py", python, index, "name=."),
+                pairs(&[("name", "")])
+            );
+        }
+        let kotlin = r#"
+class Empty {
+    fun run(name: String) {
+        logger.info("name=$name.")
+    }
+}
+"#;
+        assert_eq!(
+            extract_pairs("in-mem.kt", kotlin, 0, "name=."),
+            pairs(&[("name", "")])
+        );
+    }
+
+    #[test]
+    fn test_escaped_braces() {
+        let rust = r#"
+fn f(x: &str) {
+    debug!("set {{{}}}", x);
+}
+"#;
+        assert_eq!(
+            extract_pairs("in-mem.rs", rust, 0, "set {a b}"),
+            pairs(&[("x", "a b")])
+        );
+        let cpp = r#"
+    void f() {
+        spdlog::info("map {{{}: {}}}", k, v);
+    }
+    "#;
+        assert_eq!(
+            extract_pairs("in-mem.cc", cpp, 0, "map {a: 1}"),
+            pairs(&[("k", "a"), ("v", "1")])
+        );
+        let java = r#"
+public class Braces {
+    public void run() {
+        log.info("json {\"a\": {}}", v);
+    }
+}
+"#;
+        assert_eq!(
+            extract_pairs("in-mem.java", java, 0, r#"json {"a": 1}"#),
+            pairs(&[("v", "1")])
+        );
+        let kotlin = r#"
+class Braces {
+    fun run(a: String, b: String) {
+        logger.info("obj {} {{}}", a, b)
+    }
+}
+"#;
+        assert_eq!(
+            extract_pairs("in-mem.kt", kotlin, 0, "obj a {b}"),
+            pairs(&[("a", "a"), ("b", "b")])
+        );
+    }
+
+    #[test]
+    fn test_empty_values_ambiguous() {
+        let source = r#"
+public class Empty {
+    public void run() {
+        log.info("joined: {}{}", a, b);
+        log.info("words: {} {}", a, b);
+    }
+}
+"#;
+        // Either value could be empty.
+        assert_eq!(
+            ambiguous_vars("in-mem.java", source, 0, "joined: ab"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // Neither value can be empty since the message does not have a space next to them.
+        assert!(ambiguous_vars("in-mem.java", source, 1, "words: a b").is_empty());
+        // The first value is empty.
+        assert!(ambiguous_vars("in-mem.java", source, 1, "words:  b").is_empty());
+    }
+
+    #[test]
+    fn test_prefer_fewer_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Done.java"),
+            r#"
+public class Done {
+    public void run() {
+        log.info("Done{}", suffix);
+        log.info("Done");
+    }
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(dir.path());
+        let line_of = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref.map(|src_ref| src_ref.line_no))
+        };
+        // Both statements match, but "Done{}" would need an empty value.
+        assert_eq!(line_of("Done"), Some(5));
+        assert_eq!(line_of("Done now"), Some(4));
+    }
+
+    #[test]
+    fn test_prefer_non_empty_values() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Failed.java"),
+            r#"
+public class Failed {
+    public void run() {
+        log.info("Failed: {} at {}", what, where);
+        log.info("Failed: {}", what);
+        log.info("Stopped {} at {}", what, where);
+    }
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(dir.path());
+        let line_of = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref.map(|src_ref| src_ref.line_no))
+        };
+        // The higher quality statement would need an empty value.
+        assert_eq!(line_of("Failed: x at "), Some(5));
+        assert_eq!(line_of("Failed: x at y"), Some(4));
+        // An empty value is fine when no other statement matches.
+        assert_eq!(line_of("Stopped x at "), Some(6));
+
+        // A line number is better evidence than whether a value is empty.
+        let line_at = |msg: &str, lineno: usize| {
+            let log_ref = LogRefBuilder::new()
+                .with_file(Some("Failed.java"))
+                .with_lineno(Some(lineno))
+                .with_body(Some(msg))
+                .build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref.map(|src_ref| src_ref.line_no))
+        };
+        assert_eq!(line_at("Failed: x at ", 4), Some(4));
+        assert_eq!(line_at("Failed: x at ", 5), Some(5));
+        // The second time, the statement is found through the line number cache.
+        assert_eq!(line_at("Failed: x at ", 4), Some(4));
+        assert_eq!(line_at("Failed: x at ", 5), Some(5));
+    }
+
+    #[test]
+    fn test_link_to_source_prefers_non_empty_values() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.java"),
+            r#"
+public class Done {
+    public void run() {
+        log.info("Done{}", suffix);
+        log.info("Done");
+    }
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let line_of = |msg: &str| {
+            let log_ref = LogRefBuilder::new().build(msg);
+            link_to_source(&log_ref, &src_refs).map(|src_ref| src_ref.line_no)
+        };
+        assert_eq!(line_of("Done"), Some(5));
+        assert_eq!(line_of("Done now"), Some(4));
+    }
+
+    const PYTHON_ADJACENT_SOURCE: &str = r#"
+def main(args):
+    logger.info(f"stats: {name} {count:d} {other}")
+    logger.info("items: %s %s", len(items), rest)
+    logger.info(f"bits: {mask:b} {name}")
+    logger.info(f"day: {d:%Y-%m-%d}")
+"#;
+
+    #[test]
+    fn test_adjacent_python() {
+        assert_eq!(
+            extract_pairs(
+                "in-mem.py",
+                PYTHON_ADJACENT_SOURCE,
+                0,
+                "stats: hello world 3 foo bar"
+            ),
+            pairs(&[
+                ("name", "hello world"),
+                ("count", "3"),
+                ("other", "foo bar")
+            ])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.py",
+                PYTHON_ADJACENT_SOURCE,
+                1,
+                "items: 3 ['a b', 'c']"
+            ),
+            pairs(&[("len(items)", "3"), ("rest", "['a b', 'c']")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_ADJACENT_SOURCE, 2, "bits: 101 a b"),
+            pairs(&[("mask", "101"), ("name", "a b")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_ADJACENT_SOURCE, 3, "day: 2026-10-25"),
+            pairs(&[("d", "2026-10-25")])
+        );
+    }
+
+    const KOTLIN_ADJACENT_SOURCE: &str = r#"
+class Adjacent {
+    fun run(name: String, items: List<String>, other: String) {
+        logger.info("sizes: $name ${items.size} $other")
+    }
+}
+"#;
+
+    #[test]
+    fn test_adjacent_kotlin() {
+        assert_eq!(
+            extract_pairs(
+                "in-mem.kt",
+                KOTLIN_ADJACENT_SOURCE,
+                0,
+                "sizes: hello world 5 [a, b]"
+            ),
+            pairs(&[
+                ("name", "hello world"),
+                ("items.size", "5"),
+                ("other", "[a, b]")
+            ])
+        );
+    }
+
+    #[test]
+    fn test_adjacent_after_cache_round_trip() {
+        let code = CodeSource::from_string(Path::new("in-mem.java"), JAVA_ADJACENT_SOURCE);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let encoded =
+            bincode::serde::encode_to_vec(&src_refs[1], bincode::config::standard()).unwrap();
+        let (decoded, _): (SourceRef, usize) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        let log_ref = LogRefBuilder::new().build("sizes: hello world 5 foo bar");
+        let vars: Vec<(String, String)> = extract_variables(&log_ref, &decoded)
+            .into_iter()
+            .map(|pair| (pair.expr, pair.value))
+            .collect();
+        assert_eq!(
+            vars,
+            pairs(&[
+                ("name", "hello world"),
+                ("items.size()", "5"),
+                ("other", "foo bar")
+            ])
+        );
+    }
+
+    const CPP_PERCENT_SOURCE: &str = r#"
+    #include <stdio.h>
+
+    int main(int argc, char* argv[]) {
+        printf("100%% done in %d steps", steps);
+        printf("[%*d] %s", width, value, name);
+        printf("wrote%n %s", &count, name);
+    }
+    "#;
+
+    #[test]
+    fn test_percent_cpp() {
+        assert_eq!(
+            extract_pairs("in-mem.cc", CPP_PERCENT_SOURCE, 0, "100% done in 5 steps"),
+            pairs(&[("steps", "5")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.cc", CPP_PERCENT_SOURCE, 1, "[   42] bob"),
+            pairs(&[("value", "42"), ("name", "bob")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.cc", CPP_PERCENT_SOURCE, 2, "wrote bob"),
+            pairs(&[("name", "bob")])
+        );
+    }
+
+    const PYTHON_PERCENT_SOURCE: &str = r#"
+def main(x, t, pct):
+    logger.info("100% done")
+    logger.info("50% done", exc_info=True)
+    logger.info(f"{x} is 50% done")
+    logger.info(f"{x} took %s", t)
+    logger.info("%d%% done", pct)
+"#;
+
+    #[test]
+    fn test_percent_python() {
+        let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_PERCENT_SOURCE);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
+        assert_eq!(
+            patterns,
+            vec![
+                r"(?s)^100% done$",
+                r"(?s)^50% done$",
+                r"(?s)^(.*) is 50% done$",
+                r"(?s)^(.*) took (.*)$",
+                r"(?s)^(.*)% done$",
+            ]
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_PERCENT_SOURCE, 2, "job is 50% done"),
+            pairs(&[("x", "job")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_PERCENT_SOURCE, 3, "job took 5s"),
+            pairs(&[("x", "job"), ("t", "5s")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_PERCENT_SOURCE, 4, "75% done"),
+            pairs(&[("pct", "75")])
         );
     }
 

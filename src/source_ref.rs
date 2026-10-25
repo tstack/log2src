@@ -1,9 +1,11 @@
 use crate::java_symbols::MessageRef;
+use crate::value_kind::{self, ValueKind, ANY_CAPTURE};
 use crate::{CodeSource, QueryResult, SourceLanguage};
 use core::fmt;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use std::str::Chars;
+use std::sync::OnceLock;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum FormatArgument {
@@ -20,6 +22,66 @@ pub struct CallSite {
     pub language: SourceLanguage,
     #[serde(rename(serialize = "lineNumber"))]
     pub line_no: usize,
+}
+
+/// What a placeholder in a format string is replaced with at runtime.
+pub(crate) enum Substitution {
+    /// A literal character, like the `%` for `%%` or the `{` for `{{`.
+    Literal(char),
+    /// Nothing, like for `%n`, which stores the number of characters written so far.
+    Nothing,
+    /// The value of an argument.
+    Value(FormatArgument),
+}
+
+/// Tracks the arguments used by the placeholders in a format string.  Some printf-style
+/// placeholders use arguments without printing them, like `%n` or the `*` in `%*d`, so the
+/// placeholders after them refer to their arguments by position.
+#[derive(Default)]
+pub(crate) struct ArgCounter {
+    /// The number of arguments used so far.
+    used: usize,
+    /// The number of `FormatArgument::Placeholder`s returned so far.
+    placeholders: usize,
+}
+
+impl ArgCounter {
+    pub(crate) fn substitution(
+        &mut self,
+        language: SourceLanguage,
+        caps: &Captures,
+    ) -> Substitution {
+        let text = caps.get(0).unwrap().as_str();
+        match text {
+            "{{" => return Substitution::Literal('{'),
+            "}}" => return Substitution::Literal('}'),
+            _ => {}
+        }
+        if let Some(spec) = text.strip_prefix('%') {
+            if spec.ends_with('%') {
+                return Substitution::Literal('%');
+            }
+            // A `*` width or precision is taken from an argument.
+            self.used += spec.matches('*').count();
+            if spec.ends_with('n') {
+                self.used += 1;
+                return Substitution::Nothing;
+            }
+        }
+        Substitution::Value(match language.captures_to_format_arg(caps) {
+            FormatArgument::Placeholder => {
+                let index = self.used;
+                self.used += 1;
+                if index == self.placeholders {
+                    self.placeholders += 1;
+                    FormatArgument::Placeholder
+                } else {
+                    FormatArgument::Positional(index)
+                }
+            }
+            arg => arg,
+        })
+    }
 }
 
 // TODO: get rid of this clone?
@@ -50,13 +112,38 @@ pub struct SourceRef {
     #[serde(skip)]
     pub pattern_str: String,
     pub(crate) args: Vec<FormatArgument>,
+    /// The kind of value produced by the expression of each `FormatArgument::Named` in `args`.
+    #[serde(rename(serialize = "argKinds"))]
+    pub(crate) arg_kinds: Vec<ValueKind>,
     pub(crate) vars: Vec<String>,
+    /// The kind of value produced by each expression in `vars`.
+    #[serde(rename(serialize = "varKinds"))]
+    pub(crate) var_kinds: Vec<ValueKind>,
+    /// The kind of value expected for each placeholder based on its format spec.
+    pub(crate) kinds: Vec<ValueKind>,
+    /// The regexes in `pattern` for the literal text before, between, and after the
+    /// placeholders.
+    pub(crate) segments: Vec<String>,
+    /// `kinds` refined by the argument expressions.  This, and `segment_matchers`, are only
+    /// computed when needed since most statements are never matched.
+    #[serde(skip)]
+    value_kinds: OnceLock<Vec<ValueKind>>,
+    #[serde(skip)]
+    segment_matchers: OnceLock<Option<Vec<Regex>>>,
+    #[serde(skip)]
+    lazy_matcher: OnceLock<Option<Regex>>,
+    #[serde(skip)]
+    separators: OnceLock<Option<Vec<Regex>>>,
+    #[serde(skip)]
+    non_empty_matcher: OnceLock<Option<Regex>>,
 }
 
 struct MessageMatcher {
     matcher: Regex,
     quality: usize,
     args: Vec<FormatArgument>,
+    kinds: Vec<ValueKind>,
+    segments: Vec<String>,
 }
 
 impl SourceRef {
@@ -81,12 +168,18 @@ impl SourceRef {
             matcher,
             mut args,
             quality,
+            kinds,
+            segments,
         }) = build_matcher(result.raw, &unquoted, code.info.language)
         {
             let name = source[result.name_range].to_string();
-            if !result.args.is_empty() {
-                args = result.args;
-            }
+            let arg_kinds = if result.args.is_empty() {
+                vec![ValueKind::Any; args.len()]
+            } else {
+                let arg_kinds;
+                (args, arg_kinds) = result.args.into_iter().unzip();
+                arg_kinds
+            };
             Some(SourceRef {
                 source_path: code.filename.clone(),
                 language: code.info.language,
@@ -101,7 +194,16 @@ impl SourceRef {
                 pattern_str: matcher.as_str().to_string(),
                 pattern: matcher,
                 args,
+                arg_kinds,
                 vars: vec![],
+                var_kinds: vec![],
+                kinds,
+                segments,
+                value_kinds: OnceLock::new(),
+                segment_matchers: OnceLock::new(),
+                lazy_matcher: OnceLock::new(),
+                separators: OnceLock::new(),
+                non_empty_matcher: OnceLock::new(),
             })
         } else {
             None
@@ -119,6 +221,8 @@ impl SourceRef {
             matcher,
             args,
             quality,
+            kinds,
+            segments,
         } = build_matcher(false, value, SourceLanguage::Java)?;
         Some(SourceRef {
             source_path: source_path.to_string(),
@@ -133,8 +237,17 @@ impl SourceRef {
             quality,
             pattern_str: matcher.as_str().to_string(),
             pattern: matcher,
+            arg_kinds: vec![ValueKind::Any; args.len()],
             args,
             vars: message_ref.vars.clone(),
+            var_kinds: message_ref.var_kinds.clone(),
+            kinds,
+            segments,
+            value_kinds: OnceLock::new(),
+            segment_matchers: OnceLock::new(),
+            lazy_matcher: OnceLock::new(),
+            separators: OnceLock::new(),
+            non_empty_matcher: OnceLock::new(),
         })
     }
 
@@ -145,6 +258,84 @@ impl SourceRef {
     /// The regex used to match log messages to this statement.
     pub fn pattern(&self) -> &Regex {
         &self.pattern
+    }
+
+    /// The argument expression for each placeholder and the kind of value it produces, in the
+    /// order the placeholders appear in the message.
+    fn resolved_args(&self) -> impl Iterator<Item = (&str, ValueKind)> {
+        let var = |index: usize| {
+            (
+                self.vars.get(index).map_or("<unknown>", String::as_str),
+                self.var_kinds.get(index).copied().unwrap_or(ValueKind::Any),
+            )
+        };
+        let mut placeholder_index = 0;
+        self.args
+            .iter()
+            .enumerate()
+            .map(move |(index, arg)| match arg {
+                FormatArgument::Named(name) => (
+                    name.as_str(),
+                    self.arg_kinds.get(index).copied().unwrap_or(ValueKind::Any),
+                ),
+                FormatArgument::Positional(pos) => var(*pos),
+                FormatArgument::Placeholder => {
+                    placeholder_index += 1;
+                    var(placeholder_index - 1)
+                }
+            })
+    }
+
+    /// The argument expressions for each placeholder, in the order the placeholders appear in
+    /// the message.
+    pub(crate) fn arg_exprs(&self) -> Vec<&str> {
+        self.resolved_args().map(|(expr, _)| expr).collect()
+    }
+
+    /// The kinds of values expected for the placeholders, based on the format spec and, when
+    /// the spec does not have a kind, the argument expression.  These are computed the first
+    /// time they are needed and then cached.
+    pub(crate) fn value_kinds(&self) -> &[ValueKind] {
+        self.value_kinds.get_or_init(|| {
+            std::iter::zip(&self.kinds, self.resolved_args())
+                .map(|(kind, (_, expr_kind))| match kind {
+                    ValueKind::Any => expr_kind,
+                    _ => *kind,
+                })
+                .collect()
+        })
+    }
+
+    /// Anchored regexes for the literal text before, between, and after the placeholders.
+    pub(crate) fn segment_matchers(&self) -> Option<&[Regex]> {
+        self.segment_matchers
+            .get_or_init(|| value_kind::compile_segments(&self.segments))
+            .as_deref()
+    }
+
+    /// A matcher like `pattern`, but with lazy captures.
+    pub(crate) fn lazy_matcher(&self) -> Option<&Regex> {
+        self.lazy_matcher
+            .get_or_init(|| value_kind::compile_matcher(&self.segments, "(.*?)"))
+            .as_ref()
+    }
+
+    /// Unanchored regexes for the literal text after each placeholder.
+    pub(crate) fn separators(&self) -> Option<&[Regex]> {
+        self.separators
+            .get_or_init(|| value_kind::compile_separators(&self.segments))
+            .as_deref()
+    }
+
+    /// Check if `body` matches this statement with a non-empty value for every placeholder.
+    pub(crate) fn matches_without_empty_values(&self, body: &str) -> bool {
+        if self.kinds.is_empty() {
+            return self.pattern.is_match(body);
+        }
+        self.non_empty_matcher
+            .get_or_init(|| value_kind::compile_matcher(&self.segments, "(.+)"))
+            .as_ref()
+            .is_some_and(|matcher| matcher.is_match(body))
     }
 }
 
@@ -170,23 +361,49 @@ impl PartialEq for SourceRef {
 
 fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<MessageMatcher> {
     let mut args = Vec::new();
+    let mut kinds = Vec::new();
+    let mut segments = Vec::new();
     let mut last_end = 0;
     let mut pattern = "(?s)^".to_string();
+    // Where the capture group for the last placeholder ends in `pattern`.
+    let mut last_group_end = pattern.len();
     let mut quality = 0;
+    // The regex for literal text that has not been added to `pattern` yet.
+    let mut pending = String::new();
+    let mut counter = ArgCounter::default();
     for cap in language.get_placeholder_regex().captures_iter(text) {
         let placeholder = cap.get(0).unwrap();
         if !raw && is_unicode_escape(&text[..placeholder.start()]) {
             // Something like Rust's "\u{1F600}" is an escape and not a placeholder.
             continue;
         }
-        let subtext = literal_to_regex(raw, language, &text[last_end..placeholder.start()]);
+        pending.push_str(&literal_to_regex(
+            raw,
+            language,
+            &text[last_end..placeholder.start()],
+        ));
+        last_end = placeholder.end();
+        let arg = match counter.substitution(language, &cap) {
+            Substitution::Literal(c) => {
+                push_regex_literal(&mut pending, c);
+                continue;
+            }
+            Substitution::Nothing => continue,
+            Substitution::Value(arg) => arg,
+        };
+        let subtext = std::mem::take(&mut pending);
         quality += subtext.chars().filter(|c| !c.is_whitespace()).count();
         pattern.push_str(subtext.as_str());
-        last_end = placeholder.end();
-        pattern.push_str("(.+)");
-        args.push(language.captures_to_format_arg(&cap));
+        segments.push(subtext);
+        // The kind of value is only used to split the values, so a value that does not look
+        // like the format spec, such as a date for `{:%Y-%m-%d}`, still matches.
+        pattern.push_str(ANY_CAPTURE);
+        last_group_end = pattern.len();
+        kinds.push(ValueKind::from_placeholder(language, placeholder.as_str()));
+        args.push(arg);
     }
-    let subtext = literal_to_regex(raw, language, &text[last_end..]);
+    let mut subtext = pending;
+    subtext.push_str(&literal_to_regex(raw, language, &text[last_end..]));
     quality += subtext.chars().filter(|c| !c.is_whitespace()).count();
     if quality == 0 {
         None
@@ -197,12 +414,14 @@ fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<Mess
         let trimmed_len = trim_trailing_whitespace_regex(&pattern).len();
         if trimmed_len < pattern.len() && trimmed_len > "(?s)^".len() {
             pattern.truncate(trimmed_len);
-            if pattern.ends_with("(.+)") {
+            if pattern.ends_with(ANY_CAPTURE) {
                 // Leave the whitespace out of the value of a placeholder at the end.
                 pattern.insert(pattern.len() - 1, '?');
+                last_group_end += 1;
             }
             pattern.push_str("\\s*");
         }
+        segments.push(pattern[last_group_end..].to_string());
         pattern.push('$');
         // A pattern that does not compile is not usable, so skip the log statement.
         Regex::new(pattern.as_str())
@@ -211,6 +430,8 @@ fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<Mess
                 matcher,
                 quality,
                 args,
+                kinds,
+                segments,
             })
     }
 }
@@ -415,7 +636,7 @@ mod tests {
             ..
         } = build_matcher(false, "{}) {}, {} \\033", SourceLanguage::Cpp).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^(.+)\) (.+), (.+) \x1B$"#)
+            Regex::new(r#"(?s)^(.*)\) (.*), (.*) \x1B$"#)
                 .unwrap()
                 .as_str(),
             matcher.as_str()
@@ -427,7 +648,7 @@ mod tests {
         let MessageMatcher { matcher, .. } =
             build_matcher(false, "abc {main_path:?} def", SourceLanguage::Rust).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^abc (.+) def$"#).unwrap().as_str(),
+            Regex::new(r#"(?s)^abc (.*) def$"#).unwrap().as_str(),
             matcher.as_str()
         );
     }
@@ -437,7 +658,7 @@ mod tests {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "{}) {:?}, {foo.bar}", SourceLanguage::Rust).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^(.+)\) (.+), (.+)$"#).unwrap().as_str(),
+            Regex::new(r#"(?s)^(.*)\) (.*), (.*)$"#).unwrap().as_str(),
             matcher.as_str()
         );
         assert_eq!(args[2], FormatArgument::Named("foo.bar".to_string()));
@@ -448,7 +669,7 @@ mod tests {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "second={2}", SourceLanguage::Rust).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^second=(.+)$"#).unwrap().as_str(),
+            Regex::new(r#"(?s)^second=(.*)$"#).unwrap().as_str(),
             matcher.as_str()
         );
         assert_eq!(args[0], FormatArgument::Positional(2));
@@ -459,7 +680,7 @@ mod tests {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "they are %d years old", SourceLanguage::Cpp).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^they are (.+) years old$"#)
+            Regex::new(r#"(?s)^they are (.*) years old$"#)
                 .unwrap()
                 .as_str(),
             matcher.as_str()
@@ -472,7 +693,7 @@ mod tests {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "they are {0:d} years old", SourceLanguage::Cpp).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^they are (.+) years old$"#)
+            Regex::new(r#"(?s)^they are (.*) years old$"#)
                 .unwrap()
                 .as_str(),
             matcher.as_str()
@@ -506,7 +727,7 @@ mod tests {
     fn test_build_matcher_trailing_whitespace() {
         let MessageMatcher { matcher, .. } =
             build_matcher(false, "Headers:\\n{}\\n \\t", SourceLanguage::Kotlin).unwrap();
-        assert_eq!(r#"(?s)^Headers:\n(.+?)\s*$"#, matcher.as_str());
+        assert_eq!(r#"(?s)^Headers:\n(.*?)\s*$"#, matcher.as_str());
         assert!(matcher.is_match("Headers:\nA: b\n"));
         assert!(matcher.is_match("Headers:\nA: b"));
 
@@ -592,5 +813,155 @@ mod tests {
         let MessageMatcher { matcher, .. } =
             build_matcher(false, r"bullet \u{2022} {}", SourceLanguage::Rust).unwrap();
         assert!(matcher.is_match("bullet • 42"));
+    }
+
+    fn segments_and_kinds(text: &str, language: SourceLanguage) -> (Vec<String>, Vec<ValueKind>) {
+        let MessageMatcher {
+            matcher,
+            kinds,
+            segments,
+            ..
+        } = build_matcher(false, text, language).unwrap();
+        // The segments and capture groups should make up the whole pattern.
+        let mut pattern = "(?s)^".to_string();
+        for segment in &segments[..segments.len() - 1] {
+            pattern.push_str(segment);
+            pattern.push_str(ANY_CAPTURE);
+        }
+        pattern.push_str(segments.last().unwrap());
+        pattern.push('$');
+        assert_eq!(
+            pattern.replace("(.*?)", "(.*)"),
+            matcher.as_str().replace("(.*?)", "(.*)")
+        );
+        (segments, kinds)
+    }
+
+    #[test]
+    fn test_build_matcher_segments() {
+        use ValueKind::*;
+        assert_eq!(
+            segments_and_kinds("foo (x) %s %5d%c", SourceLanguage::Cpp),
+            (
+                vec![
+                    r"foo \(x\) ".to_string(),
+                    " ".to_string(),
+                    "".to_string(),
+                    "".to_string()
+                ],
+                vec![Any, Integer, Char]
+            )
+        );
+        assert_eq!(
+            segments_and_kinds("no placeholders", SourceLanguage::Rust),
+            (vec!["no placeholders".to_string()], vec![])
+        );
+        // Trailing whitespace is optional.
+        assert_eq!(
+            segments_and_kinds("a {} b\n", SourceLanguage::Rust),
+            (vec!["a ".to_string(), r" b\s*".to_string()], vec![Any])
+        );
+        assert_eq!(
+            segments_and_kinds("a {}\n", SourceLanguage::Rust),
+            (vec!["a ".to_string(), r"\s*".to_string()], vec![Any])
+        );
+        assert_eq!(
+            segments_and_kinds("a {:x}\n", SourceLanguage::Rust),
+            (vec!["a ".to_string(), r"\s*".to_string()], vec![Hex])
+        );
+    }
+
+    #[test]
+    fn test_build_matcher_percent() {
+        let MessageMatcher { matcher, args, .. } =
+            build_matcher(false, "100%% done %d", SourceLanguage::Cpp).unwrap();
+        assert_eq!(matcher.as_str(), r"(?s)^100% done (.*)$");
+        assert_eq!(args, vec![FormatArgument::Placeholder]);
+
+        let MessageMatcher { matcher, args, .. } =
+            build_matcher(false, "%s at 50%%", SourceLanguage::Python).unwrap();
+        assert_eq!(matcher.as_str(), r"(?s)^(.*) at 50%$");
+        assert_eq!(args, vec![FormatArgument::Placeholder]);
+    }
+
+    #[test]
+    fn test_build_matcher_unprinted_args() {
+        // `%n` uses an argument but prints nothing.
+        let MessageMatcher { matcher, args, .. } =
+            build_matcher(false, "wrote%n %s", SourceLanguage::Cpp).unwrap();
+        assert_eq!(matcher.as_str(), r"(?s)^wrote (.*)$");
+        assert_eq!(args, vec![FormatArgument::Positional(1)]);
+
+        // A `*` width uses an argument.
+        let MessageMatcher { args, .. } =
+            build_matcher(false, "%*d items %s", SourceLanguage::Cpp).unwrap();
+        assert_eq!(
+            args,
+            vec![FormatArgument::Positional(1), FormatArgument::Positional(2)]
+        );
+    }
+
+    #[test]
+    fn test_build_matcher_braces() {
+        use FormatArgument::*;
+        let cases = [
+            // Escaped braces in Rust and fmt.
+            (
+                SourceLanguage::Rust,
+                "a {{x}} b {}",
+                r"(?s)^a \{x\} b (.*)$",
+                vec![Placeholder],
+            ),
+            (
+                SourceLanguage::Rust,
+                "{{{}}}",
+                r"(?s)^\{(.*)\}$",
+                vec![Placeholder],
+            ),
+            (
+                SourceLanguage::Rust,
+                "x {{0}} {0}",
+                r"(?s)^x \{0\} (.*)$",
+                vec![Positional(0)],
+            ),
+            (
+                SourceLanguage::Rust,
+                "{}}}",
+                r"(?s)^(.*)\}$",
+                vec![Placeholder],
+            ),
+            (
+                SourceLanguage::Cpp,
+                "map {{{}: {}}}",
+                r"(?s)^map \{(.*): (.*)\}$",
+                vec![Placeholder, Placeholder],
+            ),
+            // Other braces in an SLF4J message are literal.
+            (
+                SourceLanguage::Java,
+                r#"json {{"a": {}}}"#,
+                r#"(?s)^json \{\{"a": (.*)\}\}$"#,
+                vec![Placeholder],
+            ),
+            (
+                SourceLanguage::Kotlin,
+                "obj {} {{}}",
+                r"(?s)^obj (.*) \{(.*)\}$",
+                vec![Placeholder, Placeholder],
+            ),
+            // java.util.logging's placeholders.
+            (
+                SourceLanguage::Java,
+                "{0} of {1}",
+                r"(?s)^(.*) of (.*)$",
+                vec![Placeholder, Placeholder],
+            ),
+        ];
+        for (language, text, pattern, expected_args) in cases {
+            let MessageMatcher { matcher, args, .. } =
+                build_matcher(false, text, language).unwrap();
+            assert_eq!(matcher.as_str(), pattern, "{language:?} {text:?}");
+            assert_eq!(args, expected_args, "{language:?} {text:?}");
+        }
     }
 }

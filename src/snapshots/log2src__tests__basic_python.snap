@@ -12,11 +12,20 @@ expression: src_refs
   blockId: 21
   text: "\"foo %s \\N{greek small letter pi}\""
   quality: 4
-  pattern: (?s)^foo (.+) .$
+  pattern: (?s)^foo (.*) .$
   args:
     - Placeholder
+  argKinds:
+    - Any
   vars:
     - test_var
+  varKinds:
+    - Any
+  kinds:
+    - Any
+  segments:
+    - "foo "
+    - " ."
 - sourcePath: in-mem.py
   language: Python
   lineNumber: 4
@@ -27,10 +36,18 @@ expression: src_refs
   blockId: 21
   text: "f'Hello, {args[1]}!'"
   quality: 7
-  pattern: "(?s)^Hello, (.+)!$"
+  pattern: "(?s)^Hello, (.*)!$"
   args:
     - Named: "args[1]"
+  argKinds:
+    - Any
   vars: []
+  varKinds: []
+  kinds:
+    - Any
+  segments:
+    - "Hello, "
+    - "!"
 - sourcePath: in-mem.py
   language: Python
   lineNumber: 5
@@ -43,7 +60,12 @@ expression: src_refs
   quality: 29
   pattern: "(?s)^warning message:\\nlow disk space$"
   args: []
+  argKinds: []
   vars: []
+  varKinds: []
+  kinds: []
+  segments:
+    - "warning message:\\nlow disk space"
 - sourcePath: in-mem.py
   language: Python
   lineNumber: 6
@@ -54,7 +76,15 @@ expression: src_refs
   blockId: 21
   text: "rf\"\"\"info message:\nprocessing \\started -- {args[0]}\"\"\""
   quality: 35
-  pattern: "(?s)^info message:\\nprocessing \\\\started -- (.+)$"
+  pattern: "(?s)^info message:\\nprocessing \\\\started -- (.*)$"
   args:
     - Named: "args[0]"
+  argKinds:
+    - Any
   vars: []
+  varKinds: []
+  kinds:
+    - Any
+  segments:
+    - "info message:\\nprocessing \\\\started -- "
+    - ""

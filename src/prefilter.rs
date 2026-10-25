@@ -10,7 +10,7 @@ pub(crate) type StatementID = (SourceFileID, usize);
 
 /// A prefilter for finding the log statements that could possibly match a log message.
 ///
-/// The patterns generated for log statements are mostly literal text with `(.+)` in place of
+/// The patterns generated for log statements are mostly literal text with `(.*)` in place of
 /// the format placeholders.  So, we pick the longest literal run out of each pattern and put
 /// them all into a single Aho-Corasick automaton.  A log message is then scanned once to find
 /// the candidate statements, and only those have their full regex evaluated.
@@ -112,17 +112,17 @@ mod tests {
     #[test]
     fn test_longest_literal() {
         assert_eq!(
-            longest_literal(r"(?s)^Hello from foo i=(.+)$"),
+            longest_literal(r"(?s)^Hello from foo i=(.*)$"),
             Some(b"Hello from foo i=".to_vec())
         );
         assert_eq!(
-            longest_literal(r"(?s)^a=(.+) and then b=(.+)$"),
+            longest_literal(r"(?s)^a=(.*) and then b=(.*)$"),
             Some(b" and then b=".to_vec())
         );
         assert_eq!(
-            longest_literal(r"(?s)^x\.y\{(.+)\}$"),
+            longest_literal(r"(?s)^x\.y\{(.*)\}$"),
             Some(b"x.y{".to_vec())
         );
-        assert_eq!(longest_literal(r"(?s)^(.+)$"), None);
+        assert_eq!(longest_literal(r"(?s)^(.*)$"), None);
     }
 }

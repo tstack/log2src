@@ -12,7 +12,15 @@ qualifiedName: namedarg
 blockId: 427
 text: "\"Hello, {name}!\""
 quality: 7
-pattern: "(?s)^Hello, (.+)!$"
+pattern: "(?s)^Hello, (.*)!$"
 args:
   - Named: name
+argKinds:
+  - Any
 vars: []
+varKinds: []
+kinds:
+  - Any
+segments:
+  - "Hello, "
+  - "!"

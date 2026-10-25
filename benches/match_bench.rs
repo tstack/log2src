@@ -213,23 +213,29 @@ fn prefilter_stats(stmts: &[&SourceRef], label: &str, bodies: &[&str]) {
 
 /// Generate a message that should be matched by the given pattern.
 fn synthesize(pattern: &str) -> Option<String> {
-    fn walk(hir: &Hir, out: &mut Vec<u8>, counter: &mut usize) {
+    synthesize_with(pattern, |counter| format!("val{}", counter))
+}
+
+/// Generate a message that should be matched by the given pattern, with `value` giving the
+/// value of each capture.
+fn synthesize_with(pattern: &str, value: fn(usize) -> String) -> Option<String> {
+    fn walk(hir: &Hir, out: &mut Vec<u8>, counter: &mut usize, value: fn(usize) -> String) {
         match hir.kind() {
             HirKind::Empty | HirKind::Look(_) => {}
             HirKind::Literal(lit) => out.extend_from_slice(&lit.0),
             HirKind::Class(_) => out.push(b'z'),
             HirKind::Capture(_) => {
                 *counter += 1;
-                out.extend_from_slice(format!("val{}", counter).as_bytes());
+                out.extend_from_slice(value(*counter).as_bytes());
             }
-            HirKind::Repetition(rep) => walk(&rep.sub, out, counter),
-            HirKind::Concat(subs) => subs.iter().for_each(|s| walk(s, out, counter)),
-            HirKind::Alternation(subs) => walk(&subs[0], out, counter),
+            HirKind::Repetition(rep) => walk(&rep.sub, out, counter, value),
+            HirKind::Concat(subs) => subs.iter().for_each(|s| walk(s, out, counter, value)),
+            HirKind::Alternation(subs) => walk(&subs[0], out, counter, value),
         }
     }
     let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
     let mut out = Vec::new();
-    walk(&hir, &mut out, &mut 0);
+    walk(&hir, &mut out, &mut 0, value);
     String::from_utf8(out).ok()
 }
 
@@ -498,6 +504,46 @@ fn main() {
             old_elapsed.as_secs_f64() / elapsed.as_secs_f64(),
             better,
             worse
+        );
+    }
+
+    // Extracting the variables of statements with more than one placeholder, which is where
+    // the line might need to be re-split.  Values with spaces make more of the splits ambiguous.
+    let value_styles: [(&str, fn(usize) -> String); 2] = [
+        ("one-word values", |n| format!("val{n}")),
+        ("multi-word values", |n| format!("val {n} x")),
+    ];
+    for (label, value) in value_styles {
+        let pairs: Vec<(&SourceRef, String)> = stmts
+            .iter()
+            .filter(|stmt| stmt.pattern().captures_len() > 2)
+            .filter_map(|stmt| Some((*stmt, synthesize_with(stmt.pattern().as_str(), value)?)))
+            .filter(|(stmt, body)| stmt.pattern().is_match(body))
+            .collect();
+        if pairs.is_empty() {
+            continue;
+        }
+        let mut ambiguous = 0;
+        let start = Instant::now();
+        for round in 0..rounds {
+            for (stmt, body) in &pairs {
+                let log_ref = LogRefBuilder::new()
+                    .with_body(Some(body.as_str()))
+                    .build(body);
+                let vars = extract_variables(&log_ref, stmt);
+                if round == 0 && vars.iter().any(|var| var.ambiguous) {
+                    ambiguous += 1;
+                }
+            }
+        }
+        let elapsed = start.elapsed() / rounds as u32;
+        println!(
+            "{:>17}: {:>10.2?} total, {:>8.2?}/line, {} lines, {} ambiguous  [extract_variables]",
+            label,
+            elapsed,
+            elapsed / pairs.len() as u32,
+            pairs.len(),
+            ambiguous
         );
     }
 }

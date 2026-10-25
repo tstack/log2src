@@ -12,11 +12,20 @@ expression: src_refs
   blockId: 24
   text: "\"{}: Started\""
   quality: 8
-  pattern: "(?s)^(.+): Started$"
+  pattern: "(?s)^(.*): Started$"
   args:
     - Placeholder
+  argKinds:
+    - Any
   vars:
     - this
+  varKinds:
+    - Any
+  kinds:
+    - Any
+  segments:
+    - ""
+    - ": Started"
 - sourcePath: in-mem.java
   language: Java
   lineNumber: 9
@@ -27,8 +36,17 @@ expression: src_refs
   blockId: 69
   text: "\"{}: Stopped\""
   quality: 8
-  pattern: "(?s)^(.+): Stopped$"
+  pattern: "(?s)^(.*): Stopped$"
   args:
     - Placeholder
+  argKinds:
+    - Any
   vars:
     - this
+  varKinds:
+    - Any
+  kinds:
+    - Any
+  segments:
+    - ""
+    - ": Stopped"

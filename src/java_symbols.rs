@@ -14,6 +14,7 @@
 //! have.  After all the files are extracted, the references are resolved across the whole tree.
 
 use crate::source_query::SourceQuery;
+use crate::value_kind::ValueKind;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -43,6 +44,8 @@ pub(crate) struct MessageRef {
     /// The reference as written in the source, like `Messages.LOG_STARTING`.
     pub text: String,
     pub vars: Vec<String>,
+    /// The kind of value produced by each expression in `vars`.
+    pub var_kinds: Vec<ValueKind>,
     /// The fully-qualified names the reference could refer to, in the order Java checks them.
     pub candidates: Vec<String>,
 }
