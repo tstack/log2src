@@ -25,6 +25,7 @@ pub enum ValueKind {
     Octal,
     Binary,
     Float,
+    HexFloat,
     Char,
     Bool,
     Pointer,
@@ -42,13 +43,14 @@ static VALUE_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 impl ValueKind {
-    const ALL: [ValueKind; 9] = [
+    const ALL: [ValueKind; 10] = [
         ValueKind::Any,
         ValueKind::Integer,
         ValueKind::Hex,
         ValueKind::Octal,
         ValueKind::Binary,
         ValueKind::Float,
+        ValueKind::HexFloat,
         ValueKind::Char,
         ValueKind::Bool,
         ValueKind::Pointer,
@@ -70,6 +72,10 @@ impl ValueKind {
             ValueKind::Float => {
                 r"\s*([-+]?(?:(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?|(?i:inf(?:inity)?|nan)))\s*"
             }
+            // printf() includes the "0x" prefix, but std::format() and fmt do not.
+            ValueKind::HexFloat => {
+                r"\s*([-+]?(?:(?:0[xX])?[0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?[pP][-+]?\d+|(?i:inf(?:inity)?|nan)))\s*"
+            }
             ValueKind::Char => r"\s*(.)\s*",
             ValueKind::Bool => r"\s*((?i:true|false))\s*",
             // Most C libraries print "0x" and lowercase hex digits, but MSVC prints zero-padded
@@ -86,6 +92,8 @@ impl ValueKind {
                 Some('x' | 'X') => ValueKind::Hex,
                 Some('o') => ValueKind::Octal,
                 Some('e' | 'E' | 'f' | 'F' | 'g' | 'G') => ValueKind::Float,
+                // In Python, `%a` is the ascii() of any value.
+                Some('a' | 'A') if language != SourceLanguage::Python => ValueKind::HexFloat,
                 Some('c') => ValueKind::Char,
                 Some('p') => ValueKind::Pointer,
                 _ => ValueKind::Any,
@@ -129,6 +137,7 @@ impl ValueKind {
             Some('o') => ValueKind::Octal,
             Some('b' | 'B') => ValueKind::Binary,
             Some('e' | 'E' | 'f' | 'F' | 'g' | 'G') => ValueKind::Float,
+            Some('a' | 'A') => ValueKind::HexFloat,
             Some('c') => ValueKind::Char,
             Some('p') => ValueKind::Pointer,
             _ => ValueKind::Any,
@@ -144,7 +153,7 @@ impl ValueKind {
             ValueKind::Float => "%f",
             ValueKind::Char => "%c",
             ValueKind::Pointer => "%p",
-            ValueKind::Any | ValueKind::Binary | ValueKind::Bool => "%s",
+            ValueKind::Any | ValueKind::Binary | ValueKind::HexFloat | ValueKind::Bool => "%s",
         }
     }
 
@@ -627,6 +636,11 @@ mod tests {
             (Cpp, "%g", Float),
             (Cpp, "%c", Char),
             (Cpp, "%s", Any),
+            (Cpp, "%a", HexFloat),
+            (Cpp, "%.2A", HexFloat),
+            (Cpp, "{:a}", HexFloat),
+            (Cpp, "{:>20A}", HexFloat),
+            (Python, "%a", Any),
             (Cpp, "%p", Pointer),
             (Cpp, "%-20p", Pointer),
             (Cpp, "{:p}", Pointer),
@@ -911,6 +925,22 @@ mod tests {
                 kind.value_range(text),
                 Some(0..text.len()),
                 "{kind:?} {text:?}"
+            );
+        }
+        for text in [
+            "0x1.921f9f01b866ep+1",
+            "-0X1.4P+1",
+            "0x2.p+1",
+            "0x0.0000000000001p-1022",
+            "1.921f9f01b866ep+1",
+            "1p-1074",
+            "inf",
+            "-NAN",
+        ] {
+            assert_eq!(
+                HexFloat.value_range(text),
+                Some(0..text.len()),
+                "HexFloat {text:?}"
             );
         }
         for text in ["0x7ffe2628436c", "0x0", "(nil)", "000000000061FE14", "0"] {
