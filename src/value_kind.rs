@@ -602,16 +602,33 @@ pub(crate) fn is_plausible(text: &str, values: &[Range<usize>], kinds: &[ValueKi
 /// The maximum number of candidate values to try before giving up on splitting a line.
 const MAX_CANDIDATES: usize = 10_000;
 
+/// Which values a split prefers when there is more than one valid split.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SplitOrder {
+    /// Longer values for earlier placeholders, like the greedy captures of the message matcher.
+    LongestFirst,
+    /// Shorter values for earlier placeholders, like lazy captures.
+    ShortestFirst,
+}
+
+/// Compile a matcher for the message with lazy captures, which finds the split with the
+/// shortest values for earlier placeholders.  If it finds the same split as the greedy message
+/// matcher, that is the only way to split the line.
+pub(crate) fn compile_lazy_matcher(segments: &[String]) -> Option<Regex> {
+    Regex::new(&format!("(?s)^{}$", segments.join("(.+?)"))).ok()
+}
+
 /// Split `text` into the values for each placeholder.
 ///
 /// `segments` are anchored regexes for the literal text before, between, and after the
-/// placeholders, so there must be one more segment than there are kinds.  The search prefers
-/// longer values for earlier placeholders, which is the same preference as the greedy captures
-/// in the message matcher.  Returns `None` if there is no valid split.
+/// placeholders, so there must be one more segment than there are kinds.  When there is more
+/// than one valid split, `order` says which one is returned.  Returns `None` if there is no
+/// valid split.
 pub(crate) fn split_values(
     text: &str,
     segments: &[Regex],
     kinds: &[ValueKind],
+    order: SplitOrder,
 ) -> Option<Vec<Range<usize>>> {
     if segments.len() != kinds.len() + 1 {
         return None;
@@ -621,6 +638,7 @@ pub(crate) fn split_values(
         text,
         segments,
         kinds,
+        order,
         values: Vec::with_capacity(kinds.len()),
         failed: HashSet::new(),
         budget: MAX_CANDIDATES,
@@ -636,6 +654,7 @@ struct SplitSearch<'a> {
     text: &'a str,
     segments: &'a [Regex],
     kinds: &'a [ValueKind],
+    order: SplitOrder,
     values: Vec<Range<usize>>,
     /// The (placeholder, offset) pairs that are known to not lead to a valid split.
     failed: HashSet<(usize, usize)>,
@@ -652,12 +671,13 @@ impl SplitSearch<'_> {
         }
         let kind = self.kinds[index];
         let rest = &self.text[pos..];
-        // Try longer values first, but defer the ends that are less likely.
-        let (strong, weak): (Vec<usize>, Vec<usize>) = kind
-            .candidate_ends(rest)
-            .into_iter()
-            .rev()
-            .partition(|&end| !is_weak_end(rest, end));
+        // Try the values in the preferred order, but defer the ends that are less likely.
+        let mut ends = kind.candidate_ends(rest);
+        if self.order == SplitOrder::LongestFirst {
+            ends.reverse();
+        }
+        let (strong, weak): (Vec<usize>, Vec<usize>) =
+            ends.into_iter().partition(|&end| !is_weak_end(rest, end));
         for end in strong.into_iter().chain(weak) {
             if self.budget == 0 {
                 return false;
@@ -909,7 +929,7 @@ mod tests {
                 Regex::new(&format!("(?s)^(?:{seg}){end}")).unwrap()
             })
             .collect();
-        split_values(text, &segments, kinds).map(|ranges| {
+        split_values(text, &segments, kinds, SplitOrder::LongestFirst).map(|ranges| {
             ranges
                 .into_iter()
                 .map(|range| text[range].to_string())
@@ -986,6 +1006,39 @@ mod tests {
             split("ab|", &["", "", r"\|"], &[Char, Any]),
             Some(vec!["a".into(), "b".into()])
         );
+    }
+
+    #[test]
+    fn test_split_shortest_first() {
+        use ValueKind::*;
+        let segments: Vec<Regex> = [
+            "(?s)^(?:foo bar: )",
+            "(?s)^(?: )",
+            "(?s)^(?: )",
+            "(?s)^(?:)$",
+        ]
+        .iter()
+        .map(|seg| Regex::new(seg).unwrap())
+        .collect();
+        let values = |text: &str, order| {
+            split_values(text, &segments, &[Any, Any, Any], order).map(|ranges| {
+                ranges
+                    .into_iter()
+                    .map(|range| text[range].to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            values("foo bar: 1 hello world 3", SplitOrder::ShortestFirst),
+            Some(vec!["1".into(), "hello".into(), "world 3".into()])
+        );
+        // Brackets leave only one valid split.
+        for order in [SplitOrder::LongestFirst, SplitOrder::ShortestFirst] {
+            assert_eq!(
+                values("foo bar: 1 2 [a, b]", order),
+                Some(vec!["1".into(), "2".into(), "[a, b]".into()])
+            );
+        }
     }
 
     #[test]

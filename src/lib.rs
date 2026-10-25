@@ -12,7 +12,7 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,6 +37,7 @@ use crate::prefilter::{Prefilter, StatementID};
 use crate::progress::{ProgressReader, WorkGuard};
 use crate::source_hier::{ScanEvent, SourceFileID, SourceHierContent, SourceHierTree};
 use crate::source_ref::{CallSite, FormatArgument};
+use crate::value_kind::SplitOrder;
 pub use code_source::CodeSource;
 pub use log_format::LogFormat;
 pub use progress::ProgressTracker;
@@ -1169,6 +1170,9 @@ impl SourceLanguage {
 pub struct VariablePair {
     pub expr: String,
     pub value: String,
+    /// The line could also be split so that this variable has a different value.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ambiguous: bool,
 }
 
 #[derive(Serialize)]
@@ -1432,40 +1436,86 @@ pub fn extract_variables<'a>(log_ref: &LogRef<'a>, src_ref: &'a SourceRef) -> Ve
     };
     if let Some(captures) = src_ref.captures(line) {
         let exprs = src_ref.arg_exprs();
-        // The greedy captures are ambiguous when placeholders are next to each other, so try to
-        // re-split the line using the kinds of values expected for each placeholder.
-        let mut ranges: Vec<std::ops::Range<usize>> = captures
+        let greedy = captures
             .iter()
             .skip(1)
             .map(|cap| cap.unwrap().range())
             .collect();
-        let kinds = src_ref.value_kinds();
-        if let ([range], [kind]) = (&mut ranges[..], kinds) {
-            // With one placeholder, there is only one way to split the line, but the value
-            // might be padded.
-            if let Some(value) = kind.value_range(&line[range.clone()]) {
-                *range = range.start + value.start..range.start + value.end;
-            }
-        } else if ranges.len() >= 2
-            && kinds.len() == ranges.len()
-            && !value_kind::is_plausible(line, &ranges, kinds)
-        {
-            if let Some(split) = src_ref
-                .segment_matchers()
-                .and_then(|segments| value_kind::split_values(line, segments, kinds))
-            {
-                ranges = split;
-            }
-        }
-        for (expr, range) in std::iter::zip(exprs, ranges) {
+        let (ranges, ambiguous) = find_values(line, src_ref, greedy);
+        for ((expr, range), ambiguous) in std::iter::zip(exprs, ranges).zip(ambiguous) {
             variables.push(VariablePair {
                 expr: expr.to_string(),
                 value: line[range].to_string(),
+                ambiguous,
             });
         }
     }
 
     variables
+}
+
+/// Find the values of the placeholders in a line, starting from the greedy captures of the
+/// statement's matcher, and whether each value is ambiguous.  The greedy captures give
+/// everything to the first placeholder when the placeholders are next to each other, so the line
+/// might be re-split using the kinds of values expected for each placeholder.
+fn find_values(
+    line: &str,
+    src_ref: &SourceRef,
+    greedy: Vec<Range<usize>>,
+) -> (Vec<Range<usize>>, Vec<bool>) {
+    let not_ambiguous = vec![false; greedy.len()];
+    let kinds = src_ref.value_kinds();
+    if let ([range], [kind]) = (&greedy[..], kinds) {
+        // With one placeholder, there is only one way to split the line, but the value might
+        // be padded.
+        let value = kind
+            .value_range(&line[range.clone()])
+            .map_or(range.clone(), |value| {
+                range.start + value.start..range.start + value.end
+            });
+        return (vec![value], not_ambiguous);
+    }
+    if greedy.len() < 2 || kinds.len() != greedy.len() {
+        return (greedy, not_ambiguous);
+    }
+    // The lazy captures find the split with the shortest values for the earlier placeholders.
+    // If that is the same as the greedy split, there is only one way to split the line.
+    let lazy: Option<Vec<Range<usize>>> = src_ref
+        .lazy_matcher()
+        .and_then(|matcher| matcher.captures(line))
+        .map(|caps| {
+            caps.iter()
+                .skip(1)
+                .map(|cap| cap.unwrap().range())
+                .collect()
+        });
+    let unique = lazy.as_ref().is_none_or(|lazy| *lazy == greedy);
+    if unique && value_kind::is_plausible(line, &greedy, kinds) {
+        return (greedy, not_ambiguous);
+    }
+    let differs = |lhs: &[Range<usize>], rhs: &[Range<usize>]| -> Vec<bool> {
+        std::iter::zip(lhs, rhs).map(|(l, r)| l != r).collect()
+    };
+    let split = |order| {
+        src_ref
+            .segment_matchers()
+            .and_then(|segments| value_kind::split_values(line, segments, kinds, order))
+    };
+    match split(SplitOrder::LongestFirst) {
+        Some(longest) if unique => (longest, not_ambiguous),
+        Some(longest) => {
+            // The values that are the same whether the split prefers longer or shorter values
+            // are not ambiguous.
+            let ambiguous = split(SplitOrder::ShortestFirst)
+                .map_or(not_ambiguous, |shortest| differs(&longest, &shortest));
+            (longest, ambiguous)
+        }
+        // No split has values that look like their kinds, so use the greedy captures.
+        None => {
+            let ambiguous = lazy.map_or(not_ambiguous, |lazy| differs(&greedy, &lazy));
+            (greedy, ambiguous)
+        }
+    }
 }
 
 pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec<StatementsInFile> {
@@ -1719,7 +1769,8 @@ fn main() {
             vars,
             [VariablePair {
                 expr: "adjective".to_string(),
-                value: "funky".to_string()
+                value: "funky".to_string(),
+                ambiguous: false,
             }]
         );
     }
@@ -1752,11 +1803,13 @@ fn main() {
             vec![
                 VariablePair {
                     expr: "i".to_string(),
-                    value: "1".to_string()
+                    value: "1".to_string(),
+                    ambiguous: false,
                 },
                 VariablePair {
                     expr: "j".to_string(),
-                    value: "2".to_string()
+                    value: "2".to_string(),
+                    ambiguous: false,
                 }
             ]
         );
@@ -1776,7 +1829,8 @@ fn main() {
             vars,
             vec![VariablePair {
                 expr: "name".to_string(),
-                value: "Tim".to_string()
+                value: "Tim".to_string(),
+                ambiguous: false,
             },]
         );
     }
@@ -1812,7 +1866,8 @@ fn main() {
             vars,
             vec![VariablePair {
                 expr: "this".to_string(),
-                value: "JvmPauseMonitor-n0".to_string()
+                value: "JvmPauseMonitor-n0".to_string(),
+                ambiguous: false,
             },]
         );
     }
@@ -1843,7 +1898,8 @@ fn main() {
             vars,
             vec![VariablePair {
                 expr: "cl".to_string(),
-                value: "jdk.internal.loader".to_string()
+                value: "jdk.internal.loader".to_string(),
+                ambiguous: false,
             },]
         );
         assert_eq!(src_refs[1].line_no, 4);
@@ -1886,11 +1942,13 @@ fn main() {
             vec![
                 VariablePair {
                     expr: "name".to_string(),
-                    value: "alice".to_string()
+                    value: "alice".to_string(),
+                    ambiguous: false,
                 },
                 VariablePair {
                     expr: "host".to_string(),
-                    value: "example.com".to_string()
+                    value: "example.com".to_string(),
+                    ambiguous: false,
                 },
             ]
         );
@@ -1901,7 +1959,8 @@ fn main() {
             extract_variables(&log_ref, &src_refs[2]),
             vec![VariablePair {
                 expr: "a + b".to_string(),
-                value: "42".to_string()
+                value: "42".to_string(),
+                ambiguous: false,
             }]
         );
         assert_eq!(
@@ -2620,7 +2679,8 @@ int other(int x) {
             vars,
             vec![VariablePair {
                 expr: "argv[1]".to_string(),
-                value: "Steve".to_string()
+                value: "Steve".to_string(),
+                ambiguous: false,
             },]
         );
     }
@@ -2663,11 +2723,13 @@ def main(name, count, x):
             vec![
                 VariablePair {
                     expr: "name".to_string(),
-                    value: "bob".to_string()
+                    value: "bob".to_string(),
+                    ambiguous: false,
                 },
                 VariablePair {
                     expr: "count".to_string(),
-                    value: "3".to_string()
+                    value: "3".to_string(),
+                    ambiguous: false,
                 },
             ]
         );
@@ -2698,7 +2760,8 @@ processing \started -- {args[0]}""")
             vars,
             vec![VariablePair {
                 expr: "test_var".to_string(),
-                value: "bar".to_string()
+                value: "bar".to_string(),
+                ambiguous: false,
             },]
         );
     }
@@ -3387,6 +3450,74 @@ fn adjacent(mask: u32, name: &str, point: Point) {
         assert_eq!(
             extract_pairs("in-mem.cc", source, 1, "values: -nan(ind) hello world"),
             pairs(&[("x", "-nan(ind) hello"), ("name", "world")])
+        );
+    }
+
+    /// Extract the variables and get the names of the ones that are ambiguous.
+    fn ambiguous_vars(path: &str, source: &str, index: usize, line: &str) -> Vec<String> {
+        let log_ref = LogRefBuilder::new().build(line);
+        let code = CodeSource::from_string(Path::new(path), source);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        extract_variables(&log_ref, &src_refs[index])
+            .into_iter()
+            .filter(|pair| pair.ambiguous)
+            .map(|pair| pair.expr)
+            .collect()
+    }
+
+    #[test]
+    fn test_ambiguous_variables() {
+        let java = |index, line| ambiguous_vars("in-mem.java", JAVA_ADJACENT_SOURCE, index, line);
+        // Every value could be different: "1 hello", "world", "3" or "1", "hello", "world 3".
+        assert_eq!(
+            java(0, "foo bar: 1 hello world 3"),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        // The brackets and the kinds of values leave only one valid split.
+        assert!(java(0, "foo bar: 1 2 [a, b]").is_empty());
+        assert!(java(1, "sizes: hello world 5 foo bar").is_empty());
+        // There is only one way to split the line.
+        assert!(java(0, "foo bar: 1 2 3").is_empty());
+
+        let source = r#"
+    int main() {
+        printf("pair: %s %s, count=%d", a, b, count);
+        printf("padded: %5d %5d|", x, y);
+        printf("values: %f %s", x, name);
+    }
+    "#;
+        let cpp = |index, line| ambiguous_vars("in-mem.cc", source, index, line);
+        // Only the values next to each other are ambiguous.
+        assert_eq!(
+            cpp(0, "pair: a b c, count=5"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // Padding is not ambiguity.
+        assert!(cpp(1, "padded:     1     2|").is_empty());
+        // No split has values that look like their kinds.
+        assert_eq!(
+            cpp(2, "values: -nan(ind) hello world"),
+            vec!["x".to_string(), "name".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_ambiguous_json() {
+        let pair = |ambiguous| VariablePair {
+            expr: "a".to_string(),
+            value: "1".to_string(),
+            ambiguous,
+        };
+        assert_eq!(
+            serde_json::to_string(&pair(false)).unwrap(),
+            r#"{"expr":"a","value":"1"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&pair(true)).unwrap(),
+            r#"{"expr":"a","value":"1","ambiguous":true}"#
         );
     }
 

@@ -125,6 +125,8 @@ pub struct SourceRef {
     value_kinds: OnceLock<Vec<ValueKind>>,
     #[serde(skip)]
     segment_matchers: OnceLock<Option<Vec<Regex>>>,
+    #[serde(skip)]
+    lazy_matcher: OnceLock<Option<Regex>>,
 }
 
 struct MessageMatcher {
@@ -190,6 +192,7 @@ impl SourceRef {
                 segments,
                 value_kinds: OnceLock::new(),
                 segment_matchers: OnceLock::new(),
+                lazy_matcher: OnceLock::new(),
             })
         } else {
             None
@@ -231,6 +234,7 @@ impl SourceRef {
             segments,
             value_kinds: OnceLock::new(),
             segment_matchers: OnceLock::new(),
+            lazy_matcher: OnceLock::new(),
         })
     }
 
@@ -294,6 +298,13 @@ impl SourceRef {
         self.segment_matchers
             .get_or_init(|| value_kind::compile_segments(&self.segments))
             .as_deref()
+    }
+
+    /// A matcher like `pattern`, but with lazy captures.
+    pub(crate) fn lazy_matcher(&self) -> Option<&Regex> {
+        self.lazy_matcher
+            .get_or_init(|| value_kind::compile_lazy_matcher(&self.segments))
+            .as_ref()
     }
 }
 
