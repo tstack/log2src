@@ -605,7 +605,7 @@ mod tests {
             ..
         } = build_matcher(false, "{}) {}, {} \\033", SourceLanguage::Cpp).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^(.+)\) (.+), (.+) \x1B$"#)
+            Regex::new(r#"(?s)^(.*)\) (.*), (.*) \x1B$"#)
                 .unwrap()
                 .as_str(),
             matcher.as_str()
@@ -617,7 +617,7 @@ mod tests {
         let MessageMatcher { matcher, .. } =
             build_matcher(false, "abc {main_path:?} def", SourceLanguage::Rust).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^abc (.+) def$"#).unwrap().as_str(),
+            Regex::new(r#"(?s)^abc (.*) def$"#).unwrap().as_str(),
             matcher.as_str()
         );
     }
@@ -627,7 +627,7 @@ mod tests {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "{}) {:?}, {foo.bar}", SourceLanguage::Rust).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^(.+)\) (.+), (.+)$"#).unwrap().as_str(),
+            Regex::new(r#"(?s)^(.*)\) (.*), (.*)$"#).unwrap().as_str(),
             matcher.as_str()
         );
         assert_eq!(args[2], FormatArgument::Named("foo.bar".to_string()));
@@ -638,7 +638,7 @@ mod tests {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "second={2}", SourceLanguage::Rust).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^second=(.+)$"#).unwrap().as_str(),
+            Regex::new(r#"(?s)^second=(.*)$"#).unwrap().as_str(),
             matcher.as_str()
         );
         assert_eq!(args[0], FormatArgument::Positional(2));
@@ -649,7 +649,7 @@ mod tests {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "they are %d years old", SourceLanguage::Cpp).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^they are (.+) years old$"#)
+            Regex::new(r#"(?s)^they are (.*) years old$"#)
                 .unwrap()
                 .as_str(),
             matcher.as_str()
@@ -662,7 +662,7 @@ mod tests {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "they are {0:d} years old", SourceLanguage::Cpp).unwrap();
         assert_eq!(
-            Regex::new(r#"(?s)^they are (.+) years old$"#)
+            Regex::new(r#"(?s)^they are (.*) years old$"#)
                 .unwrap()
                 .as_str(),
             matcher.as_str()
@@ -696,7 +696,7 @@ mod tests {
     fn test_build_matcher_trailing_whitespace() {
         let MessageMatcher { matcher, .. } =
             build_matcher(false, "Headers:\\n{}\\n \\t", SourceLanguage::Kotlin).unwrap();
-        assert_eq!(r#"(?s)^Headers:\n(.+?)\s*$"#, matcher.as_str());
+        assert_eq!(r#"(?s)^Headers:\n(.*?)\s*$"#, matcher.as_str());
         assert!(matcher.is_match("Headers:\nA: b\n"));
         assert!(matcher.is_match("Headers:\nA: b"));
 
@@ -800,8 +800,8 @@ mod tests {
         pattern.push_str(segments.last().unwrap());
         pattern.push('$');
         assert_eq!(
-            pattern.replace("(.+?)", "(.+)"),
-            matcher.as_str().replace("(.+?)", "(.+)")
+            pattern.replace("(.*?)", "(.*)"),
+            matcher.as_str().replace("(.*?)", "(.*)")
         );
         (segments, kinds)
     }
@@ -844,12 +844,12 @@ mod tests {
     fn test_build_matcher_percent() {
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "100%% done %d", SourceLanguage::Cpp).unwrap();
-        assert_eq!(matcher.as_str(), r"(?s)^100% done (.+)$");
+        assert_eq!(matcher.as_str(), r"(?s)^100% done (.*)$");
         assert_eq!(args, vec![FormatArgument::Placeholder]);
 
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "%s at 50%%", SourceLanguage::Python).unwrap();
-        assert_eq!(matcher.as_str(), r"(?s)^(.+) at 50%$");
+        assert_eq!(matcher.as_str(), r"(?s)^(.*) at 50%$");
         assert_eq!(args, vec![FormatArgument::Placeholder]);
     }
 
@@ -858,7 +858,7 @@ mod tests {
         // `%n` uses an argument but prints nothing.
         let MessageMatcher { matcher, args, .. } =
             build_matcher(false, "wrote%n %s", SourceLanguage::Cpp).unwrap();
-        assert_eq!(matcher.as_str(), r"(?s)^wrote (.+)$");
+        assert_eq!(matcher.as_str(), r"(?s)^wrote (.*)$");
         assert_eq!(args, vec![FormatArgument::Positional(1)]);
 
         // A `*` width uses an argument.

@@ -30,7 +30,7 @@ expression: src_refs
   blockId: 224
   text: "\"this won't match i={}; j={}\""
   quality: 19
-  pattern: "(?s)^this won't match i=(.+); j=(.+)$"
+  pattern: "(?s)^this won't match i=(.*); j=(.*)$"
   args:
     - Placeholder
     - Placeholder
@@ -60,7 +60,7 @@ expression: src_refs
   blockId: 326
   text: "\"{salutation}, {name}!\""
   quality: 2
-  pattern: "(?s)^(.+), (.+)!$"
+  pattern: "(?s)^(.*), (.*)!$"
   args:
     - Named: salutation
     - Named: name
@@ -86,7 +86,7 @@ expression: src_refs
   blockId: 427
   text: "\"Hello, {name}!\""
   quality: 7
-  pattern: "(?s)^Hello, (.+)!$"
+  pattern: "(?s)^Hello, (.*)!$"
   args:
     - Named: name
   argKinds:
@@ -108,7 +108,7 @@ expression: src_refs
   blockId: 548
   text: "\"{salutation}, {name}!\""
   quality: 2
-  pattern: "(?s)^(.+), (.+)!$"
+  pattern: "(?s)^(.*), (.*)!$"
   args:
     - Named: salutation
     - Named: name

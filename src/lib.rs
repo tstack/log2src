@@ -147,7 +147,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "23")]
+    #[serde(rename = "24")]
     Current,
 }
 
@@ -375,8 +375,9 @@ impl SourceTree {
 /// Order the candidate statements for a log message from best to worst.  Higher quality is
 /// better and, for the same quality, a statement closer to the line number in the log message.
 /// The line number is only a tie-breaker since it is not always the line of the log call, like
-/// for a message built in a lambda.  Any remaining tie goes to the earliest location in the
-/// source so that the choice does not depend on the order the candidates were found in.
+/// for a message built in a lambda.  Then, a statement with fewer placeholders is better.  Any
+/// remaining tie goes to the earliest location in the source so that the choice does not depend
+/// on the order the candidates were found in.
 fn compare_candidates(lhs: &SourceRef, rhs: &SourceRef, lineno: Option<usize>) -> Ordering {
     let distance = |src_ref: &SourceRef| {
         lineno.map_or(0, |lineno| {
@@ -390,6 +391,8 @@ fn compare_candidates(lhs: &SourceRef, rhs: &SourceRef, lineno: Option<usize>) -
     rhs.quality
         .cmp(&lhs.quality)
         .then_with(|| distance(lhs).cmp(&distance(rhs)))
+        // A placeholder can be empty, so a message like "Done" matches both "Done" and "Done{}".
+        .then_with(|| lhs.kinds.len().cmp(&rhs.kinds.len()))
         .then_with(|| {
             (&lhs.source_path, lhs.line_no, lhs.column).cmp(&(
                 &rhs.source_path,
@@ -1928,9 +1931,9 @@ fn main() {
             patterns,
             vec![
                 "(?s)^Can''t find our classloader for the Driver; attempting to use the thread context classloader$",
-                "(?s)^User (.+) logged in from (.+)$",
-                "(?s)^(.+) total$",
-                "(?s)^sum=(.+)!$",
+                "(?s)^User (.*) logged in from (.*)$",
+                "(?s)^(.*) total$",
+                "(?s)^sum=(.*)!$",
             ]
         );
         assert_eq!((src_refs[0].line_no, src_refs[0].end_line_no), (3, 4));
@@ -2531,11 +2534,11 @@ class Same {
         assert_eq!(src_refs.len(), 2);
         assert_eq!(
             src_refs[0].pattern().as_str(),
-            "(?s)^Opening href with external editor: (.+):(.+):(.+)$"
+            "(?s)^Opening href with external editor: (.*):(.*):(.*)$"
         );
         assert_eq!((src_refs[0].line_no, src_refs[0].end_line_no), (4, 8));
         assert_eq!(src_refs[0].vars, vec!["path", "line", "0"]);
-        assert_eq!(src_refs[1].pattern().as_str(), "(?s)^read (.+) bytes$");
+        assert_eq!(src_refs[1].pattern().as_str(), "(?s)^read (.*) bytes$");
         assert_eq!(src_refs[1].vars, vec!["size"]);
     }
 
@@ -2706,10 +2709,10 @@ def main(name, count, x):
         assert_eq!(
             patterns,
             vec![
-                r"(?s)^first part second part (.+)$",
-                r"(?s)^user (.+) has (.+) items$",
+                r"(?s)^first part second part (.*)$",
+                r"(?s)^user (.*) has (.*) items$",
                 r"(?s)^C:\\dir x\tz$",
-                r"(?s)^\{literal\} (.+)$",
+                r"(?s)^\{literal\} (.*)$",
                 r"(?s)^raw\\d \{x\}$",
             ]
         );
@@ -3521,6 +3524,114 @@ fn adjacent(mask: u32, name: &str, point: Point) {
         );
     }
 
+    #[test]
+    fn test_empty_values() {
+        let java = r#"
+public class Empty {
+    public void run() {
+        log.info("user={} logged in", name);
+        log.info("pair: [{}] [{}]", a, b);
+    }
+}
+"#;
+        assert_eq!(
+            extract_pairs("in-mem.java", java, 0, "user= logged in"),
+            pairs(&[("name", "")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.java", java, 1, "pair: [] [x y]"),
+            pairs(&[("a", ""), ("b", "x y")])
+        );
+        let rust = r#"
+fn f(a: &str, b: u32) {
+    debug!("a={} b={}", a, b);
+}
+"#;
+        assert_eq!(
+            extract_pairs("in-mem.rs", rust, 0, "a= b=2"),
+            pairs(&[("a", ""), ("b", "2")])
+        );
+        let cpp = r#"
+    int main() {
+        printf("name: '%s'", name);
+    }
+    "#;
+        assert_eq!(
+            extract_pairs("in-mem.cc", cpp, 0, "name: ''"),
+            pairs(&[("name", "")])
+        );
+        let python = r#"
+def main(name):
+    logger.info("name=%s.", name)
+    logger.info(f"name={name}.")
+"#;
+        for index in [0, 1] {
+            assert_eq!(
+                extract_pairs("in-mem.py", python, index, "name=."),
+                pairs(&[("name", "")])
+            );
+        }
+        let kotlin = r#"
+class Empty {
+    fun run(name: String) {
+        logger.info("name=$name.")
+    }
+}
+"#;
+        assert_eq!(
+            extract_pairs("in-mem.kt", kotlin, 0, "name=."),
+            pairs(&[("name", "")])
+        );
+    }
+
+    #[test]
+    fn test_empty_values_ambiguous() {
+        let source = r#"
+public class Empty {
+    public void run() {
+        log.info("joined: {}{}", a, b);
+        log.info("words: {} {}", a, b);
+    }
+}
+"#;
+        // Either value could be empty.
+        assert_eq!(
+            ambiguous_vars("in-mem.java", source, 0, "joined: ab"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // Neither value can be empty since the message does not have a space next to them.
+        assert!(ambiguous_vars("in-mem.java", source, 1, "words: a b").is_empty());
+        // The first value is empty.
+        assert!(ambiguous_vars("in-mem.java", source, 1, "words:  b").is_empty());
+    }
+
+    #[test]
+    fn test_prefer_fewer_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Done.java"),
+            r#"
+public class Done {
+    public void run() {
+        log.info("Done{}", suffix);
+        log.info("Done");
+    }
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(dir.path());
+        let line_of = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref.map(|src_ref| src_ref.line_no))
+        };
+        // Both statements match, but "Done{}" would need an empty value.
+        assert_eq!(line_of("Done"), Some(5));
+        assert_eq!(line_of("Done now"), Some(4));
+    }
+
     const PYTHON_ADJACENT_SOURCE: &str = r#"
 def main(args):
     logger.info(f"stats: {name} {count:d} {other}")
@@ -3662,9 +3773,9 @@ def main(x, t, pct):
             vec![
                 r"(?s)^100% done$",
                 r"(?s)^50% done$",
-                r"(?s)^(.+) is 50% done$",
-                r"(?s)^(.+) took (.+)$",
-                r"(?s)^(.+)% done$",
+                r"(?s)^(.*) is 50% done$",
+                r"(?s)^(.*) took (.*)$",
+                r"(?s)^(.*)% done$",
             ]
         );
         assert_eq!(

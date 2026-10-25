@@ -1,6 +1,6 @@
 //! Disambiguation of the values substituted into a log message.
 //!
-//! A log message matcher is built by replacing each placeholder with `(.+)`, which is fine for
+//! A log message matcher is built by replacing each placeholder with `(.*)`, which is fine for
 //! deciding whether a line came from a given statement.  However, when placeholders are only
 //! separated by whitespace (or nothing), the greedy captures give everything to the first
 //! placeholder.  This module re-splits the matched line using two sources of information:
@@ -34,7 +34,7 @@ pub enum ValueKind {
 }
 
 /// The capture group used in a message matcher for a placeholder whose value can be anything.
-pub const ANY_CAPTURE: &str = "(.+)";
+pub const ANY_CAPTURE: &str = "(.*)";
 
 /// Regexes that match a whole value of each kind, indexed by `ValueKind::index()`.
 static VALUE_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
@@ -404,7 +404,8 @@ impl ValueKind {
     /// in ascending order.
     fn candidate_ends(&self, text: &str) -> Vec<usize> {
         match self {
-            ValueKind::Any => balanced_ends(text),
+            // A value can be empty, like an empty string.
+            ValueKind::Any => std::iter::once(0).chain(balanced_ends(text)).collect(),
             ValueKind::Char => {
                 // The character may be padded with whitespace on either side, so the value
                 // cannot extend past the second non-whitespace character.
@@ -615,7 +616,7 @@ pub(crate) enum SplitOrder {
 /// shortest values for earlier placeholders.  If it finds the same split as the greedy message
 /// matcher, that is the only way to split the line.
 pub(crate) fn compile_lazy_matcher(segments: &[String]) -> Option<Regex> {
-    Regex::new(&format!("(?s)^{}$", segments.join("(.+?)"))).ok()
+    Regex::new(&format!("(?s)^{}$", segments.join("(.*?)"))).ok()
 }
 
 /// Split `text` into the values for each placeholder.

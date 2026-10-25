@@ -12,7 +12,7 @@ expression: src_refs
   blockId: 21
   text: "\"foo %s \\N{greek small letter pi}\""
   quality: 4
-  pattern: (?s)^foo (.+) .$
+  pattern: (?s)^foo (.*) .$
   args:
     - Placeholder
   argKinds:
@@ -36,7 +36,7 @@ expression: src_refs
   blockId: 21
   text: "f'Hello, {args[1]}!'"
   quality: 7
-  pattern: "(?s)^Hello, (.+)!$"
+  pattern: "(?s)^Hello, (.*)!$"
   args:
     - Named: "args[1]"
   argKinds:
@@ -76,7 +76,7 @@ expression: src_refs
   blockId: 21
   text: "rf\"\"\"info message:\nprocessing \\started -- {args[0]}\"\"\""
   quality: 35
-  pattern: "(?s)^info message:\\nprocessing \\\\started -- (.+)$"
+  pattern: "(?s)^info message:\\nprocessing \\\\started -- (.*)$"
   args:
     - Named: "args[0]"
   argKinds:
