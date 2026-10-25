@@ -612,11 +612,38 @@ pub(crate) enum SplitOrder {
     ShortestFirst,
 }
 
-/// Compile a matcher for the message with lazy captures, which finds the split with the
-/// shortest values for earlier placeholders.  If it finds the same split as the greedy message
-/// matcher, that is the only way to split the line.
-pub(crate) fn compile_lazy_matcher(segments: &[String]) -> Option<Regex> {
-    Regex::new(&format!("(?s)^{}$", segments.join("(.*?)"))).ok()
+/// Compile a matcher for the message that uses `capture` for every placeholder.
+pub(crate) fn compile_matcher(segments: &[String], capture: &str) -> Option<Regex> {
+    Regex::new(&format!("(?s)^{}$", segments.join(capture))).ok()
+}
+
+/// Compile unanchored regexes for the literal text after each placeholder, as needed by
+/// `may_be_ambiguous()`.
+pub(crate) fn compile_separators(segments: &[String]) -> Option<Vec<Regex>> {
+    let last = segments.len().checked_sub(1)?;
+    segments
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(index, segment)| {
+            // The text after the last placeholder has to be at the end.
+            let end = if index == last { "$" } else { "" };
+            Regex::new(&format!("(?s)(?:{segment}){end}")).ok()
+        })
+        .collect()
+}
+
+/// Check if there might be a split of `text` other than `values`, which are the values found by
+/// the greedy captures of the message matcher.  Another split would need a shorter value for
+/// some placeholder, so the text after that placeholder would have to also appear inside its
+/// value.  This is cheaper than finding the other split, and most lines can only be split one
+/// way.
+pub(crate) fn may_be_ambiguous(text: &str, values: &[Range<usize>], separators: &[Regex]) -> bool {
+    std::iter::zip(values, separators).any(|(range, separator)| {
+        separator
+            .find_at(text, range.start)
+            .is_some_and(|found| found.start() < range.end)
+    })
 }
 
 /// Split `text` into the values for each placeholder.
@@ -1040,6 +1067,33 @@ mod tests {
                 Some(vec!["1".into(), "2".into(), "[a, b]".into()])
             );
         }
+    }
+
+    #[test]
+    fn test_may_be_ambiguous() {
+        let segments = |segments: &[&str]| {
+            compile_separators(&segments.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let separators = segments(&["user ", " from ", ""]);
+        assert!(!may_be_ambiguous(
+            "user bob from host",
+            &[5..8, 14..18],
+            &separators
+        ));
+        // The separator appears inside the first value.
+        assert!(may_be_ambiguous(
+            "user bob from x from host",
+            &[5..15, 21..25],
+            &separators
+        ));
+        // Adjacent placeholders can split a non-empty value anywhere.
+        let separators = segments(&["joined: ", "", ""]);
+        assert!(may_be_ambiguous(
+            "joined: ab",
+            &[8..10, 10..10],
+            &separators
+        ));
+        assert!(!may_be_ambiguous("joined: ", &[8..8, 8..8], &separators));
     }
 
     #[test]

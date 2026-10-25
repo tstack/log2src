@@ -310,15 +310,15 @@ impl SourceTree {
             .line_cache
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        cache
+        let candidates = cache
             .get(filename)?
             .get(&lineno)?
             .iter()
             .filter_map(|(file_id, index)| {
                 self.files_with_statements.get(file_id)?.statement(*index)
             })
-            .filter(|src_ref| src_ref.pattern.is_match(body))
-            .min_by(|lhs, rhs| compare_candidates(lhs, rhs, Some(lineno)))
+            .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, Some(lineno)));
+        first_match(candidates, body, Some(lineno), |src_ref| src_ref)
     }
 
     /// Find the highest quality statement that matches the given log message, preferring the one
@@ -351,9 +351,7 @@ impl SourceTree {
         });
         let lineno = log_ref.details.as_ref().and_then(|details| details.lineno);
         candidates.sort_by(|lhs, rhs| compare_candidates(lhs.1, rhs.1, lineno));
-        let (stmt_id, src_ref) = candidates
-            .into_iter()
-            .find(|(_, src_ref)| src_ref.pattern.is_match(body))?;
+        let (stmt_id, src_ref) = first_match(candidates, body, lineno, |(_, src_ref)| src_ref)?;
         if let Some((filename, lineno)) = self.line_cache_key(log_ref) {
             let mut cache = self
                 .line_cache
@@ -378,16 +376,51 @@ impl SourceTree {
 /// for a message built in a lambda.  Then, a statement with fewer placeholders is better.  Any
 /// remaining tie goes to the earliest location in the source so that the choice does not depend
 /// on the order the candidates were found in.
+/// Find the first of the ordered candidates whose statement matches `body`.  A statement that
+/// only matches with an empty value for a placeholder is passed over for a later candidate that
+/// matches without one, even a lower quality one, since a missing value is less likely than the
+/// line coming from a different statement.  The exception is when the statement is closer to
+/// the line number in the log message, which is better evidence than the values.
+fn first_match<'a, T>(
+    candidates: impl IntoIterator<Item = T>,
+    body: &str,
+    lineno: Option<usize>,
+    src_ref: impl Fn(&T) -> &'a SourceRef,
+) -> Option<T> {
+    let mut with_empty_value: Option<T> = None;
+    for candidate in candidates {
+        let stmt = src_ref(&candidate);
+        if !stmt.pattern.is_match(body) {
+            continue;
+        }
+        if stmt.matches_without_empty_values(body) {
+            return match with_empty_value {
+                Some(prior)
+                    if line_distance(src_ref(&prior), lineno) < line_distance(stmt, lineno) =>
+                {
+                    Some(prior)
+                }
+                _ => Some(candidate),
+            };
+        }
+        with_empty_value.get_or_insert(candidate);
+    }
+    with_empty_value
+}
+
+/// How far a statement is from the line number in a log message, or zero if there is none.
+fn line_distance(src_ref: &SourceRef, lineno: Option<usize>) -> usize {
+    lineno.map_or(0, |lineno| {
+        if lineno < src_ref.line_no {
+            src_ref.line_no - lineno
+        } else {
+            lineno.saturating_sub(src_ref.end_line_no)
+        }
+    })
+}
+
 fn compare_candidates(lhs: &SourceRef, rhs: &SourceRef, lineno: Option<usize>) -> Ordering {
-    let distance = |src_ref: &SourceRef| {
-        lineno.map_or(0, |lineno| {
-            if lineno < src_ref.line_no {
-                src_ref.line_no - lineno
-            } else {
-                lineno.saturating_sub(src_ref.end_line_no)
-            }
-        })
-    };
+    let distance = |src_ref: &SourceRef| line_distance(src_ref, lineno);
     rhs.quality
         .cmp(&lhs.quality)
         .then_with(|| distance(lhs).cmp(&distance(rhs)))
@@ -1404,10 +1437,10 @@ impl<'a> LogRef<'a> {
 }
 
 pub fn link_to_source<'a>(log_ref: &LogRef, src_refs: &'a [SourceRef]) -> Option<&'a SourceRef> {
-    src_refs
+    let candidates = src_refs
         .iter()
-        .sorted_by(|lhs, rhs| rhs.quality.cmp(&lhs.quality))
-        .find(|&source_ref| source_ref.captures(log_ref.body()).is_some())
+        .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, None));
+    first_match(candidates, log_ref.body(), None, |src_ref| src_ref)
 }
 
 pub fn lookup_source<'a>(
@@ -1482,9 +1515,14 @@ fn find_values(
         return (greedy, not_ambiguous);
     }
     // The lazy captures find the split with the shortest values for the earlier placeholders.
-    // If that is the same as the greedy split, there is only one way to split the line.
+    // If that is the same as the greedy split, there is only one way to split the line.  The
+    // lazy captures are skipped when a cheaper check shows there is no other split.
+    let may_be_ambiguous = src_ref
+        .separators()
+        .is_none_or(|separators| value_kind::may_be_ambiguous(line, &greedy, separators));
     let lazy: Option<Vec<Range<usize>>> = src_ref
         .lazy_matcher()
+        .filter(|_| may_be_ambiguous)
         .and_then(|matcher| matcher.captures(line))
         .map(|caps| {
             caps.iter()
@@ -3628,6 +3666,78 @@ public class Done {
                 .and_then(|mapping| mapping.src_ref.map(|src_ref| src_ref.line_no))
         };
         // Both statements match, but "Done{}" would need an empty value.
+        assert_eq!(line_of("Done"), Some(5));
+        assert_eq!(line_of("Done now"), Some(4));
+    }
+
+    #[test]
+    fn test_prefer_non_empty_values() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Failed.java"),
+            r#"
+public class Failed {
+    public void run() {
+        log.info("Failed: {} at {}", what, where);
+        log.info("Failed: {}", what);
+        log.info("Stopped {} at {}", what, where);
+    }
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(dir.path());
+        let line_of = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref.map(|src_ref| src_ref.line_no))
+        };
+        // The higher quality statement would need an empty value.
+        assert_eq!(line_of("Failed: x at "), Some(5));
+        assert_eq!(line_of("Failed: x at y"), Some(4));
+        // An empty value is fine when no other statement matches.
+        assert_eq!(line_of("Stopped x at "), Some(6));
+
+        // A line number is better evidence than whether a value is empty.
+        let line_at = |msg: &str, lineno: usize| {
+            let log_ref = LogRefBuilder::new()
+                .with_file(Some("Failed.java"))
+                .with_lineno(Some(lineno))
+                .with_body(Some(msg))
+                .build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref.map(|src_ref| src_ref.line_no))
+        };
+        assert_eq!(line_at("Failed: x at ", 4), Some(4));
+        assert_eq!(line_at("Failed: x at ", 5), Some(5));
+        // The second time, the statement is found through the line number cache.
+        assert_eq!(line_at("Failed: x at ", 4), Some(4));
+        assert_eq!(line_at("Failed: x at ", 5), Some(5));
+    }
+
+    #[test]
+    fn test_link_to_source_prefers_non_empty_values() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.java"),
+            r#"
+public class Done {
+    public void run() {
+        log.info("Done{}", suffix);
+        log.info("Done");
+    }
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let line_of = |msg: &str| {
+            let log_ref = LogRefBuilder::new().build(msg);
+            link_to_source(&log_ref, &src_refs).map(|src_ref| src_ref.line_no)
+        };
         assert_eq!(line_of("Done"), Some(5));
         assert_eq!(line_of("Done now"), Some(4));
     }

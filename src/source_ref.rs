@@ -127,6 +127,10 @@ pub struct SourceRef {
     segment_matchers: OnceLock<Option<Vec<Regex>>>,
     #[serde(skip)]
     lazy_matcher: OnceLock<Option<Regex>>,
+    #[serde(skip)]
+    separators: OnceLock<Option<Vec<Regex>>>,
+    #[serde(skip)]
+    non_empty_matcher: OnceLock<Option<Regex>>,
 }
 
 struct MessageMatcher {
@@ -193,6 +197,8 @@ impl SourceRef {
                 value_kinds: OnceLock::new(),
                 segment_matchers: OnceLock::new(),
                 lazy_matcher: OnceLock::new(),
+                separators: OnceLock::new(),
+                non_empty_matcher: OnceLock::new(),
             })
         } else {
             None
@@ -235,6 +241,8 @@ impl SourceRef {
             value_kinds: OnceLock::new(),
             segment_matchers: OnceLock::new(),
             lazy_matcher: OnceLock::new(),
+            separators: OnceLock::new(),
+            non_empty_matcher: OnceLock::new(),
         })
     }
 
@@ -303,8 +311,26 @@ impl SourceRef {
     /// A matcher like `pattern`, but with lazy captures.
     pub(crate) fn lazy_matcher(&self) -> Option<&Regex> {
         self.lazy_matcher
-            .get_or_init(|| value_kind::compile_lazy_matcher(&self.segments))
+            .get_or_init(|| value_kind::compile_matcher(&self.segments, "(.*?)"))
             .as_ref()
+    }
+
+    /// Unanchored regexes for the literal text after each placeholder.
+    pub(crate) fn separators(&self) -> Option<&[Regex]> {
+        self.separators
+            .get_or_init(|| value_kind::compile_separators(&self.segments))
+            .as_deref()
+    }
+
+    /// Check if `body` matches this statement with a non-empty value for every placeholder.
+    pub(crate) fn matches_without_empty_values(&self, body: &str) -> bool {
+        if self.kinds.is_empty() {
+            return self.pattern.is_match(body);
+        }
+        self.non_empty_matcher
+            .get_or_init(|| value_kind::compile_matcher(&self.segments, "(.+)"))
+            .as_ref()
+            .is_some_and(|matcher| matcher.is_match(body))
     }
 }
 
