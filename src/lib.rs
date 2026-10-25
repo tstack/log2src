@@ -146,7 +146,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "16")]
+    #[serde(rename = "17")]
     Current,
 }
 
@@ -1439,14 +1439,13 @@ pub fn extract_variables<'a>(log_ref: &LogRef<'a>, src_ref: &'a SourceRef) -> Ve
             .skip(1)
             .map(|cap| cap.unwrap().range())
             .collect();
-        if let Some(kinds) = src_ref.value_kinds() {
-            if !value_kind::is_plausible(line, &ranges, kinds) {
-                if let Some(split) = src_ref
-                    .segment_matchers()
-                    .and_then(|segments| value_kind::split_values(line, segments, kinds))
-                {
-                    ranges = split;
-                }
+        let kinds = src_ref.value_kinds();
+        if kinds.len() == ranges.len() && !value_kind::is_plausible(line, &ranges, kinds) {
+            if let Some(split) = src_ref
+                .segment_matchers()
+                .and_then(|segments| value_kind::split_values(line, segments, kinds))
+            {
+                ranges = split;
             }
         }
         for (expr, range) in std::iter::zip(exprs, ranges) {

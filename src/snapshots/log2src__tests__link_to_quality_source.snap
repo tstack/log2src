@@ -16,3 +16,8 @@ pattern: "(?s)^Hello, (.+)!$"
 args:
   - Named: name
 vars: []
+kinds:
+  - Any
+segments:
+  - "Hello, "
+  - "!"

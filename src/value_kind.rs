@@ -11,12 +11,13 @@
 
 use crate::SourceLanguage;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::LazyLock;
 
 /// The kind of value that is expected to be substituted for a placeholder.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ValueKind {
     Any,
     Integer,
@@ -30,8 +31,6 @@ pub enum ValueKind {
 
 /// The capture group used in a message matcher for a placeholder whose value can be anything.
 pub const ANY_CAPTURE: &str = "(.+)";
-/// The capture group for a value at the end of a message where trailing whitespace is optional.
-pub const ANY_LAZY_CAPTURE: &str = "(.+?)";
 
 /// Regexes that match a whole value of each kind, indexed by `ValueKind::index()`.
 static VALUE_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
@@ -484,65 +483,18 @@ fn is_weak_end(text: &str, end: usize) -> bool {
         && (last.is_alphanumeric() || last == '_')
 }
 
-/// The literal segments and placeholder kinds of a message matcher regex.
-#[derive(Debug)]
-pub(crate) struct PatternParts<'a> {
-    /// The regexes for the literal text before, between, and after the placeholders.
-    pub segments: Vec<&'a str>,
-    pub kinds: Vec<ValueKind>,
-}
-
-impl PatternParts<'_> {
-    /// Recover the parts from a message matcher regex built by `build_matcher()`.  All of the
-    /// `(` characters in the literal text are escaped, so an unescaped `(` is always part of the
-    /// capture group for a placeholder.  Returns `None` if the pattern was not built that way.
-    pub(crate) fn parse(pattern: &str) -> Option<PatternParts<'_>> {
-        let body = pattern.strip_prefix("(?s)^")?.strip_suffix('$')?;
-        let mut segments = Vec::new();
-        let mut kinds = Vec::new();
-        let mut segment_start = 0;
-        let mut index = 0;
-        while let Some(c) = body[index..].chars().next() {
-            match c {
-                '\\' => {
-                    // Skip the escaped character.
-                    index += 1;
-                    index += body[index..].chars().next().map_or(0, char::len_utf8);
-                }
-                '(' => {
-                    let (kind, start, end) = ValueKind::ALL
-                        .iter()
-                        .map(|kind| (*kind, kind.capture_regex()))
-                        .chain([(ValueKind::Any, ANY_LAZY_CAPTURE)])
-                        .find_map(|(kind, capture)| {
-                            let start = index.checked_sub(capture.find('(').unwrap())?;
-                            (start >= segment_start && body[start..].starts_with(capture))
-                                .then(|| (kind, start, start + capture.len()))
-                        })?;
-                    segments.push(&body[segment_start..start]);
-                    kinds.push(kind);
-                    segment_start = end;
-                    index = end;
-                }
-                _ => index += c.len_utf8(),
-            }
-        }
-        segments.push(&body[segment_start..]);
-        Some(PatternParts { segments, kinds })
-    }
-
-    /// Compile anchored regexes for the segments, as needed by `split_values()`.
-    pub(crate) fn compile_segments(&self) -> Option<Vec<Regex>> {
-        let last = self.segments.len() - 1;
-        self.segments
-            .iter()
-            .enumerate()
-            .map(|(index, segment)| {
-                let end = if index == last { "$" } else { "" };
-                Regex::new(&format!("(?s)^(?:{segment}){end}")).ok()
-            })
-            .collect()
-    }
+/// Compile anchored regexes for the literal segments of a message, as needed by
+/// `split_values()`.
+pub(crate) fn compile_segments(segments: &[String]) -> Option<Vec<Regex>> {
+    let last = segments.len().checked_sub(1)?;
+    segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let end = if index == last { "$" } else { "" };
+            Regex::new(&format!("(?s)^(?:{segment}){end}")).ok()
+        })
+        .collect()
 }
 
 /// Check if the values found by the greedy captures of the message matcher are plausible for
@@ -882,58 +834,6 @@ mod tests {
             None
         );
         assert_eq!(split("count: abc", &["count: ", ""], &[Integer]), None);
-    }
-
-    fn parse_parts(pattern: &str) -> Option<(Vec<String>, Vec<ValueKind>)> {
-        PatternParts::parse(pattern).map(|parts| {
-            let segments = parts
-                .compile_segments()
-                .unwrap()
-                .iter()
-                .map(|segment| segment.as_str().to_string())
-                .collect();
-            (segments, parts.kinds)
-        })
-    }
-
-    #[test]
-    fn test_parse_pattern() {
-        use ValueKind::*;
-        assert_eq!(
-            parse_parts(r"(?s)^foo \(x\) (.+) \s*([-+]?\d+)\s*(.)$"),
-            Some((
-                vec![
-                    r"(?s)^(?:foo \(x\) )".to_string(),
-                    r"(?s)^(?: )".to_string(),
-                    r"(?s)^(?:)".to_string(),
-                    r"(?s)^(?:)$".to_string(),
-                ],
-                vec![Any, Integer, Char]
-            ))
-        );
-        // An escaped backslash right before a placeholder.
-        assert_eq!(
-            parse_parts(r"(?s)^C:\\(.+)$"),
-            Some((
-                vec![r"(?s)^(?:C:\\)".to_string(), r"(?s)^(?:)$".to_string()],
-                vec![Any]
-            ))
-        );
-        // Optional trailing whitespace after the last placeholder.
-        assert_eq!(
-            parse_parts(r"(?s)^a (.+?)\s*$"),
-            Some((
-                vec![r"(?s)^(?:a )".to_string(), r"(?s)^(?:\s*)$".to_string()],
-                vec![Any]
-            ))
-        );
-        assert_eq!(
-            parse_parts(r"(?s)^no placeholders$"),
-            Some((vec![r"(?s)^(?:no placeholders)$".to_string()], vec![]))
-        );
-        // Patterns that were not built by `build_matcher()`.
-        assert_eq!(parse_parts(r"(?s)^a (\w+)$"), None);
-        assert_eq!(parse_parts(r"^a (.+)$"), None);
     }
 
     #[test]

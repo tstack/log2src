@@ -17,6 +17,11 @@ expression: src_refs
     - Placeholder
   vars:
     - test_var
+  kinds:
+    - Any
+  segments:
+    - "foo "
+    - " ."
 - sourcePath: in-mem.py
   language: Python
   lineNumber: 4
@@ -31,6 +36,11 @@ expression: src_refs
   args:
     - Named: "args[1]"
   vars: []
+  kinds:
+    - Any
+  segments:
+    - "Hello, "
+    - "!"
 - sourcePath: in-mem.py
   language: Python
   lineNumber: 5
@@ -44,6 +54,9 @@ expression: src_refs
   pattern: "(?s)^warning message:\\nlow disk space$"
   args: []
   vars: []
+  kinds: []
+  segments:
+    - "warning message:\\nlow disk space"
 - sourcePath: in-mem.py
   language: Python
   lineNumber: 6
@@ -58,3 +71,8 @@ expression: src_refs
   args:
     - Named: "args[0]"
   vars: []
+  kinds:
+    - Any
+  segments:
+    - "info message:\\nprocessing \\\\started -- "
+    - ""

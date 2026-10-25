@@ -15,6 +15,9 @@ expression: src_refs
   pattern: "(?s)^you're only as funky as your last cut$"
   args: []
   vars: []
+  kinds: []
+  segments:
+    - "you're only as funky as your last cut"
 - sourcePath: in-mem.rs
   language: Rust
   lineNumber: 18
@@ -32,6 +35,13 @@ expression: src_refs
   vars:
     - i
     - j
+  kinds:
+    - Any
+    - Any
+  segments:
+    - "this won't match i="
+    - ; j=
+    - ""
 - sourcePath: in-mem.rs
   language: Rust
   lineNumber: 22
@@ -47,6 +57,13 @@ expression: src_refs
     - Named: salutation
     - Named: name
   vars: []
+  kinds:
+    - Any
+    - Any
+  segments:
+    - ""
+    - ", "
+    - "!"
 - sourcePath: in-mem.rs
   language: Rust
   lineNumber: 27
@@ -61,6 +78,11 @@ expression: src_refs
   args:
     - Named: name
   vars: []
+  kinds:
+    - Any
+  segments:
+    - "Hello, "
+    - "!"
 - sourcePath: in-mem.rs
   language: Rust
   lineNumber: 31
@@ -76,3 +98,10 @@ expression: src_refs
     - Named: salutation
     - Named: name
   vars: []
+  kinds:
+    - Any
+    - Any
+  segments:
+    - ""
+    - ", "
+    - "!"

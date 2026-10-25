@@ -19,6 +19,13 @@ expression: src_refs
   vars:
     - user.name
     - count
+  kinds:
+    - Any
+    - Any
+  segments:
+    - "Started "
+    - " with "
+    - " threads"
 - sourcePath: Server.kt
   language: Kotlin
   lineNumber: 6
@@ -34,6 +41,13 @@ expression: src_refs
     - Named: user
     - Named: user.messages.size
   vars: []
+  kinds:
+    - Any
+    - Any
+  segments:
+    - "Hello "
+    - ", you have "
+    - " messages"
 - sourcePath: Server.kt
   language: Kotlin
   lineNumber: 7
@@ -50,6 +64,13 @@ expression: src_refs
     - Named: count
   vars:
     - user
+  kinds:
+    - Any
+    - Any
+  segments:
+    - "Mixed "
+    - " and "
+    - " \\$5\\ttab"
 - sourcePath: Server.kt
   language: Kotlin
   lineNumber: 8
@@ -64,6 +85,11 @@ expression: src_refs
   args:
     - Named: user.id
   vars: []
+  kinds:
+    - Any
+  segments:
+    - "Lazy "
+    - ""
 - sourcePath: Server.kt
   language: Kotlin
   lineNumber: 9
@@ -78,6 +104,11 @@ expression: src_refs
   args:
     - Named: user
   vars: []
+  kinds:
+    - Any
+  segments:
+    - "Failed for "
+    - ""
 - sourcePath: Server.kt
   language: Kotlin
   lineNumber: 10
@@ -92,6 +123,11 @@ expression: src_refs
   args:
     - Named: count
   vars: []
+  kinds:
+    - Any
+  segments:
+    - "Concat "
+    - " items"
 - sourcePath: Server.kt
   language: Kotlin
   lineNumber: 12
@@ -108,3 +144,12 @@ expression: src_refs
     - Named: count / 1000.0
     - Named: count
   vars: []
+  kinds:
+    - Any
+    - Any
+    - Any
+  segments:
+    - "Failed \\[count="
+    - "\\] after "
+    - " sec, "
+    - " left"
