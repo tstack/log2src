@@ -1431,31 +1431,7 @@ pub fn extract_variables<'a>(log_ref: &LogRef<'a>, src_ref: &'a SourceRef) -> Ve
         None => log_ref.line,
     };
     if let Some(captures) = src_ref.captures(line) {
-        let mut placeholder_index = 0;
-        let exprs: Vec<String> = src_ref
-            .args
-            .iter()
-            .map(|placeholder| match placeholder {
-                FormatArgument::Named(name) => name.clone(),
-                FormatArgument::Positional(pos) => src_ref
-                    .vars
-                    .get(*pos)
-                    .map(|s| s.as_str())
-                    .unwrap_or("<unknown>")
-                    .to_string(),
-                FormatArgument::Placeholder => {
-                    let res = src_ref
-                        .vars
-                        .get(placeholder_index)
-                        .map(|s| s.as_str())
-                        .unwrap_or("<unknown>")
-                        .to_string();
-
-                    placeholder_index += 1;
-                    res
-                }
-            })
-            .collect();
+        let exprs = src_ref.arg_exprs();
         // The greedy captures are ambiguous when placeholders are next to each other, so try to
         // re-split the line using the kinds of values expected for each placeholder.
         let mut ranges: Vec<std::ops::Range<usize>> = captures
@@ -1463,7 +1439,7 @@ pub fn extract_variables<'a>(log_ref: &LogRef<'a>, src_ref: &'a SourceRef) -> Ve
             .skip(1)
             .map(|cap| cap.unwrap().range())
             .collect();
-        if let Some(kinds) = src_ref.value_kinds(&exprs) {
+        if let Some(kinds) = src_ref.value_kinds() {
             if !value_kind::is_plausible(line, &ranges, kinds) {
                 if let Some(split) = src_ref
                     .segment_matchers()
@@ -1475,7 +1451,7 @@ pub fn extract_variables<'a>(log_ref: &LogRef<'a>, src_ref: &'a SourceRef) -> Ve
         }
         for (expr, range) in std::iter::zip(exprs, ranges) {
             variables.push(VariablePair {
-                expr,
+                expr: expr.to_string(),
                 value: line[range].to_string(),
             });
         }

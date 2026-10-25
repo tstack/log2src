@@ -160,13 +160,37 @@ impl SourceRef {
         &self.pattern
     }
 
-    /// The kinds of values expected for the placeholders.  `exprs` are the argument
-    /// expressions for the placeholders, which are used when the format spec does not have a
-    /// kind.
-    pub(crate) fn value_kinds(&self, exprs: &[String]) -> Option<&[ValueKind]> {
+    /// The argument expressions for each placeholder, in the order the placeholders appear in
+    /// the message.
+    pub(crate) fn arg_exprs(&self) -> Vec<&str> {
+        let mut placeholder_index = 0;
+        self.args
+            .iter()
+            .map(|placeholder| match placeholder {
+                FormatArgument::Named(name) => name.as_str(),
+                FormatArgument::Positional(pos) => {
+                    self.vars.get(*pos).map_or("<unknown>", |s| s.as_str())
+                }
+                FormatArgument::Placeholder => {
+                    let res = self
+                        .vars
+                        .get(placeholder_index)
+                        .map_or("<unknown>", |s| s.as_str());
+                    placeholder_index += 1;
+                    res
+                }
+            })
+            .collect()
+    }
+
+    /// The kinds of values expected for the placeholders, based on the format spec and, when
+    /// the spec does not have a kind, the argument expression.  These are computed the first
+    /// time they are needed and then cached.
+    pub(crate) fn value_kinds(&self) -> Option<&[ValueKind]> {
         self.value_kinds
             .get_or_init(|| {
                 let parts = PatternParts::parse(self.pattern.as_str())?;
+                let exprs = self.arg_exprs();
                 (parts.kinds.len() == exprs.len()).then(|| {
                     std::iter::zip(parts.kinds, exprs)
                         .map(|(kind, expr)| match kind {
