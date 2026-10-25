@@ -3375,11 +3375,18 @@ fn adjacent(mask: u32, name: &str, point: Point) {
         let source = r#"
     int main() {
         printf("value: %f", x);
+        printf("values: %f %s", x, name);
     }
     "#;
         assert_eq!(
             extract_pairs("in-mem.cc", source, 0, "value: -nan(ind)"),
             pairs(&[("x", "-nan(ind)")])
+        );
+        // With more than one placeholder, there is no split where the values match their kinds,
+        // so the greedy split is used.
+        assert_eq!(
+            extract_pairs("in-mem.cc", source, 1, "values: -nan(ind) hello world"),
+            pairs(&[("x", "-nan(ind) hello"), ("name", "world")])
         );
     }
 
