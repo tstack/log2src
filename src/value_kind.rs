@@ -27,6 +27,7 @@ pub enum ValueKind {
     Float,
     Char,
     Bool,
+    Pointer,
 }
 
 /// The capture group used in a message matcher for a placeholder whose value can be anything.
@@ -41,7 +42,7 @@ static VALUE_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 impl ValueKind {
-    const ALL: [ValueKind; 8] = [
+    const ALL: [ValueKind; 9] = [
         ValueKind::Any,
         ValueKind::Integer,
         ValueKind::Hex,
@@ -50,6 +51,7 @@ impl ValueKind {
         ValueKind::Float,
         ValueKind::Char,
         ValueKind::Bool,
+        ValueKind::Pointer,
     ];
 
     fn index(&self) -> usize {
@@ -70,6 +72,9 @@ impl ValueKind {
             }
             ValueKind::Char => r"\s*(.)\s*",
             ValueKind::Bool => r"\s*((?i:true|false))\s*",
+            // Most C libraries print "0x" and lowercase hex digits, but MSVC prints zero-padded
+            // uppercase digits without the prefix, and glibc prints "(nil)" for null.
+            ValueKind::Pointer => r"\s*((?:0[xX])?[0-9a-fA-F]+|\((?:nil|null)\))\s*",
         }
     }
 
@@ -82,6 +87,7 @@ impl ValueKind {
                 Some('o') => ValueKind::Octal,
                 Some('e' | 'E' | 'f' | 'F' | 'g' | 'G') => ValueKind::Float,
                 Some('c') => ValueKind::Char,
+                Some('p') => ValueKind::Pointer,
                 _ => ValueKind::Any,
             };
         }
@@ -124,6 +130,7 @@ impl ValueKind {
             Some('b' | 'B') => ValueKind::Binary,
             Some('e' | 'E' | 'f' | 'F' | 'g' | 'G') => ValueKind::Float,
             Some('c') => ValueKind::Char,
+            Some('p') => ValueKind::Pointer,
             _ => ValueKind::Any,
         }
     }
@@ -136,6 +143,7 @@ impl ValueKind {
             ValueKind::Octal => "%o",
             ValueKind::Float => "%f",
             ValueKind::Char => "%c",
+            ValueKind::Pointer => "%p",
             ValueKind::Any | ValueKind::Binary | ValueKind::Bool => "%s",
         }
     }
@@ -619,7 +627,10 @@ mod tests {
             (Cpp, "%g", Float),
             (Cpp, "%c", Char),
             (Cpp, "%s", Any),
-            (Cpp, "%p", Any),
+            (Cpp, "%p", Pointer),
+            (Cpp, "%-20p", Pointer),
+            (Cpp, "{:p}", Pointer),
+            (Rust, "{:p}", Pointer),
             (Cpp, "{:d}", Integer),
             (Cpp, "{0:>8.3f}", Float),
             (Cpp, "{:Ld}", Any),
@@ -900,6 +911,13 @@ mod tests {
                 kind.value_range(text),
                 Some(0..text.len()),
                 "{kind:?} {text:?}"
+            );
+        }
+        for text in ["0x7ffe2628436c", "0x0", "(nil)", "000000000061FE14", "0"] {
+            assert_eq!(
+                Pointer.value_range(text),
+                Some(0..text.len()),
+                "Pointer {text:?}"
             );
         }
         // Padding is not part of the value.
