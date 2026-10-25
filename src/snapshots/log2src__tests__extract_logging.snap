@@ -9,6 +9,7 @@ expression: src_refs
   column: 11
   name: main
   text: "\"you're only as funky as your last cut\""
+  level: Debug
   quality: 30
   pattern: "(?s)^you're only as funky as your last cut$"
   args: []
@@ -20,6 +21,7 @@ expression: src_refs
   column: 16
   name: nope
   text: "\"this won't match i={}; j={}\""
+  level: Debug
   quality: 19
   pattern: "(?s)^this won't match i=(.+); j=(.+)$"
   args:
@@ -35,6 +37,7 @@ expression: src_refs
   column: 11
   name: namedarg0
   text: "\"{salutation}, {name}!\""
+  level: Debug
   quality: 2
   pattern: "(?s)^(.+), (.+)!$"
   args:
@@ -48,6 +51,7 @@ expression: src_refs
   column: 11
   name: namedarg
   text: "\"Hello, {name}!\""
+  level: Debug
   quality: 7
   pattern: "(?s)^Hello, (.+)!$"
   args:
@@ -60,6 +64,7 @@ expression: src_refs
   column: 11
   name: namedarg2
   text: "\"{salutation}, {name}!\""
+  level: Debug
   quality: 2
   pattern: "(?s)^(.+), (.+)!$"
   args:

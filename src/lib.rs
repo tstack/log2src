@@ -31,7 +31,7 @@ pub use progress::ProgressUpdate;
 pub use progress::WorkInfo;
 use source_query::QueryResult;
 pub use source_query::SourceQuery;
-pub use source_ref::SourceRef;
+pub use source_ref::{LogLevel, SourceRef};
 
 #[derive(Error, Debug, Diagnostic, Clone)]
 pub enum LogError {
@@ -1154,6 +1154,128 @@ processing \started -- {args[0]}""")
                 expr: "test_var".to_string(),
                 value: "bar".to_string()
             },]
+        );
+    }
+
+    fn extract_levels(path: &str, source: &str) -> Vec<(String, Option<LogLevel>)> {
+        let code = CodeSource::from_string(&Path::new(path), source);
+        extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements
+            .into_iter()
+            .map(|src_ref| (src_ref.text, src_ref.level))
+            .collect()
+    }
+
+    #[test]
+    fn test_levels_rust() {
+        let levels = extract_levels(
+            "in-mem.rs",
+            r#"
+fn main() {
+    trace!("trace message");
+    debug!("debug message");
+    info!("info message");
+    log::warn!("warn message");
+    tracing::error!("error message");
+    println!("plain message");
+}
+"#,
+        );
+        assert_eq!(
+            levels,
+            vec![
+                ("\"trace message\"".to_string(), Some(LogLevel::Trace)),
+                ("\"debug message\"".to_string(), Some(LogLevel::Debug)),
+                ("\"info message\"".to_string(), Some(LogLevel::Info)),
+                ("\"warn message\"".to_string(), Some(LogLevel::Warn)),
+                ("\"error message\"".to_string(), Some(LogLevel::Error)),
+                ("\"plain message\"".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_levels_java() {
+        let levels = extract_levels(
+            "in-mem.java",
+            r#"
+class Main {
+    void run() {
+        LOG.trace("trace message");
+        log.debug("debug message");
+        logger.info("info message");
+        LOGGER.warn("warn message");
+        LOG.error("error message");
+    }
+}
+"#,
+        );
+        assert_eq!(
+            levels,
+            vec![
+                ("\"trace message\"".to_string(), Some(LogLevel::Trace)),
+                ("\"debug message\"".to_string(), Some(LogLevel::Debug)),
+                ("\"info message\"".to_string(), Some(LogLevel::Info)),
+                ("\"warn message\"".to_string(), Some(LogLevel::Warn)),
+                ("\"error message\"".to_string(), Some(LogLevel::Error)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_levels_cpp() {
+        let levels = extract_levels(
+            "in-mem.cc",
+            r#"
+int main(int argc, char* argv[]) {
+    spdlog::info("info message");
+    logger->warn("warn message");
+    SPDLOG_ERROR("error message");
+    spdlog::critical("critical message");
+    printf("plain message");
+}
+"#,
+        );
+        assert_eq!(
+            levels,
+            vec![
+                ("\"info message\"".to_string(), Some(LogLevel::Info)),
+                ("\"warn message\"".to_string(), Some(LogLevel::Warn)),
+                ("\"error message\"".to_string(), Some(LogLevel::Error)),
+                ("\"critical message\"".to_string(), Some(LogLevel::Fatal)),
+                ("\"plain message\"".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_levels_python() {
+        let levels = extract_levels(
+            "in-mem.py",
+            r#"
+def main():
+    logger.debug("debug message")
+    logging.info("info message")
+    logger.warning("warn message")
+    self.log.error("error message")
+    logger.exception("exception message")
+    logger.critical("critical message")
+    print("plain message")
+"#,
+        );
+        assert_eq!(
+            levels,
+            vec![
+                ("\"debug message\"".to_string(), Some(LogLevel::Debug)),
+                ("\"info message\"".to_string(), Some(LogLevel::Info)),
+                ("\"warn message\"".to_string(), Some(LogLevel::Warn)),
+                ("\"error message\"".to_string(), Some(LogLevel::Error)),
+                ("\"exception message\"".to_string(), Some(LogLevel::Error)),
+                ("\"critical message\"".to_string(), Some(LogLevel::Fatal)),
+                ("\"plain message\"".to_string(), None),
+            ]
         );
     }
 

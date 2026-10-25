@@ -19,6 +19,9 @@ pub(crate) struct QueryResult {
     pub pattern: Option<String>,
     pub args: Vec<FormatArgument>,
     pub raw: bool,
+    /// The text of the last capture before the format string, which is the name of the logging
+    /// function/macro/method being called (e.g. `log::warn`, `logger.info`).
+    pub call_name: Option<String>,
 }
 
 impl<'a> SourceQuery<'a> {
@@ -46,6 +49,7 @@ impl<'a> SourceQuery<'a> {
         let matches = cursor.matches(&query, self.tree.root_node(), self.source.as_bytes());
         matches.for_each(|m| {
             let mut got_string_literal = false;
+            let mut call_name: Option<String> = None;
             for capture in m.captures {
                 let mut child = capture.node;
                 match child.kind() {
@@ -56,6 +60,10 @@ impl<'a> SourceQuery<'a> {
                     }
                     _ => {
                         if !got_string_literal {
+                            // remember the name of the logging call so the log level can be
+                            // derived from it.
+                            let range = capture.node.byte_range();
+                            call_name = Some(self.source[range].to_string());
                             continue;
                         }
                     }
@@ -71,6 +79,7 @@ impl<'a> SourceQuery<'a> {
                         pattern: None,
                         args: vec![],
                         raw: false,
+                        call_name: call_name.clone(),
                     });
                     let mut pattern = String::new();
                     if child.kind() == "string" {
@@ -118,6 +127,7 @@ impl<'a> SourceQuery<'a> {
                                         pattern: None,
                                         args: vec![],
                                         raw: false,
+                                        call_name: None,
                                     });
                                 }
                             }

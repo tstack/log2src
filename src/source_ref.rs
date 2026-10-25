@@ -11,6 +11,43 @@ pub enum FormatArgument {
     Placeholder,
 }
 
+/// The normalized level of a log statement, derived from the name of the logging call.
+#[derive(Copy, Clone, Debug, Serialize, Eq, PartialEq)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Fatal,
+}
+
+impl LogLevel {
+    /// Map the name of a logging function/macro/method, like `log::warn`, `logger.warning`,
+    /// `spdlog::info`, or `SPDLOG_ERROR`, to a level.  Returns `None` for calls that don't
+    /// indicate a level, like `println` or `printf`.
+    pub fn from_call_name(call_name: &str) -> Option<LogLevel> {
+        let name = call_name
+            .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .find(|s| !s.is_empty())?;
+        // Macros like `SPDLOG_INFO` or `LOG_ERROR` put the level at the end.
+        let name = if name.chars().all(|c| !c.is_lowercase()) {
+            name.rsplit('_').next().unwrap_or(name)
+        } else {
+            name
+        };
+        match name.to_lowercase().as_str() {
+            "trace" | "finer" | "finest" => Some(LogLevel::Trace),
+            "debug" | "fine" => Some(LogLevel::Debug),
+            "info" | "notice" => Some(LogLevel::Info),
+            "warn" | "warning" => Some(LogLevel::Warn),
+            "error" | "exception" | "severe" => Some(LogLevel::Error),
+            "fatal" | "critical" => Some(LogLevel::Fatal),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CallSite {
     pub name: String,
@@ -34,6 +71,8 @@ pub struct SourceRef {
     pub column: usize,
     pub name: String,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<LogLevel>,
     pub quality: usize,
     #[serde(skip_serializing)]
     pub(crate) matcher: Regex,
@@ -75,6 +114,10 @@ impl SourceRef {
         }) = build_matcher(result.raw, &unquoted, code.info.language)
         {
             let name = source[result.name_range].to_string();
+            let level = result
+                .call_name
+                .as_deref()
+                .and_then(LogLevel::from_call_name);
             if !result.args.is_empty() {
                 args = result.args;
             }
@@ -86,6 +129,7 @@ impl SourceRef {
                 column: col,
                 name,
                 text,
+                level,
                 quality,
                 matcher,
                 pattern,
@@ -230,6 +274,32 @@ fn escape_ignore_newlines(raw: bool, segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_log_level_from_call_name() {
+        let cases = [
+            ("debug", Some(LogLevel::Debug)),
+            ("log::warn", Some(LogLevel::Warn)),
+            ("tracing::trace", Some(LogLevel::Trace)),
+            ("error", Some(LogLevel::Error)),
+            ("info", Some(LogLevel::Info)),
+            ("spdlog::info", Some(LogLevel::Info)),
+            ("spdlog::critical", Some(LogLevel::Fatal)),
+            ("logger->warn", Some(LogLevel::Warn)),
+            ("SPDLOG_ERROR", Some(LogLevel::Error)),
+            ("logger.warning", Some(LogLevel::Warn)),
+            ("logging.exception", Some(LogLevel::Error)),
+            ("self.log.critical", Some(LogLevel::Fatal)),
+            ("fine", Some(LogLevel::Debug)),
+            ("println", None),
+            ("printf", None),
+            ("print", None),
+            ("report_error", None),
+        ];
+        for (call_name, expected) in cases {
+            assert_eq!(LogLevel::from_call_name(call_name), expected, "{call_name}");
+        }
+    }
 
     #[test]
     fn test_build_matcher_needs_escape() {
