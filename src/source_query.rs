@@ -1217,12 +1217,11 @@ impl<'a> SourceQuery<'a> {
         0
     }
 
-    /// Get the name of the function enclosing the given node, qualified by the namespaces,
-    /// classes, and modules that contain it, like `net::Server::handle` in C++ or
-    /// `com.example.Server.handle` in Java.
     /// Get the name of the function, or other item, that contains the given node, along with
-    /// its qualified name.  The name is the innermost component of the qualified name, except
-    /// for C++ functions, which are named by their whole declarator.
+    /// its name qualified by the namespaces, classes, and modules that contain it, like
+    /// `net::Server::handle` in C++ or `com.example.Server.handle` in Java.  The name is the
+    /// innermost component of the qualified name, except for C++ functions, which are named by
+    /// their whole declarator.
     fn names(&self, node: Node) -> (String, String) {
         let field = |node: Node, name: &str| {
             node.child_by_field_name(name)
