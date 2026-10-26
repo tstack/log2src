@@ -11,6 +11,7 @@ expression: src_refs
   qualifiedName: main
   blockId: 21
   text: "\"foo %s \\N{greek small letter pi}\""
+  level: Info
   quality: 4
   pattern: (?s)^foo (.*) .$
   args:
@@ -35,6 +36,7 @@ expression: src_refs
   qualifiedName: main
   blockId: 21
   text: "f'Hello, {args[1]}!'"
+  level: Info
   quality: 7
   pattern: "(?s)^Hello, (.*)!$"
   args:
@@ -57,6 +59,7 @@ expression: src_refs
   qualifiedName: main
   blockId: 21
   text: "f\"warning message:\\nlow disk space\""
+  level: Warn
   quality: 29
   pattern: "(?s)^warning message:\\nlow disk space$"
   args: []
@@ -75,6 +78,7 @@ expression: src_refs
   qualifiedName: main
   blockId: 21
   text: "rf\"\"\"info message:\nprocessing \\started -- {args[0]}\"\"\""
+  level: Info
   quality: 35
   pattern: "(?s)^info message:\\nprocessing \\\\started -- (.*)$"
   args:

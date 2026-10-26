@@ -4,7 +4,7 @@ use tree_sitter::{
     Language, Node, Parser, Point, Query, QueryCursor, Range as TSRange, StreamingIterator, Tree,
 };
 
-use crate::source_ref::{ArgCounter, FormatArgument, Substitution};
+use crate::source_ref::{ArgCounter, FormatArgument, LogLevel, Substitution};
 use crate::value_kind::ValueKind;
 use crate::{CodeSource, SourceLanguage};
 use regex::Regex;
@@ -32,6 +32,24 @@ pub(crate) struct QueryResult {
     pub raw: bool,
     /// For an argument of the log call, the kind of value it produces.
     pub value_kind: ValueKind,
+    /// The text of the last capture before the format string, which is the name of the logging
+    /// function/macro/method being called (e.g. `log::warn`, `logger.info`).
+    pub call_name: Option<String>,
+    /// The text of the arguments before the format string, which might include the log level,
+    /// as in `syslog(LOG_ERR, "...")`.
+    pub leading_args: Vec<String>,
+}
+
+impl QueryResult {
+    /// The level of the log call.  A level constant passed as an argument, like
+    /// `syslog(LOG_ERR, ...)`, takes precedence over the name of the call.
+    pub fn level(&self) -> LogLevel {
+        self.leading_args
+            .iter()
+            .find_map(|arg| LogLevel::from_level_arg(arg))
+            .or_else(|| self.call_name.as_deref().and_then(LogLevel::from_name))
+            .unwrap_or(LogLevel::Unknown)
+    }
 }
 
 impl<'a> SourceQuery<'a> {
@@ -145,7 +163,12 @@ impl<'a> SourceQuery<'a> {
         let matches = cursor.matches(&query, self.tree.root_node(), self.source.as_bytes());
         matches.for_each(|m| {
             let mut got_string_literal = false;
+            let mut call_name: Option<String> = None;
             for capture in m.captures {
+                // captures starting with an underscore are only used for predicates
+                if query.capture_names()[capture.index as usize].starts_with('_') {
+                    continue;
+                }
                 let mut child = capture.node;
                 let mut concat_pattern = None;
                 let mut concat_args = vec![];
@@ -208,6 +231,10 @@ impl<'a> SourceQuery<'a> {
                     }
                     _ => {
                         if !got_string_literal {
+                            // remember the name of the logging call so the log level can be
+                            // derived from it.
+                            let range = capture.node.byte_range();
+                            call_name = Some(self.source[range].to_string());
                             continue;
                         }
                     }
@@ -227,6 +254,8 @@ impl<'a> SourceQuery<'a> {
                         args: std::mem::take(&mut concat_args),
                         raw: false,
                         value_kind: ValueKind::Any,
+                        call_name: call_name.clone(),
+                        leading_args: self.leading_args(child),
                     });
                     if self.source_language == SourceLanguage::Python
                         && matches!(child.kind(), "string" | "concatenated_string")
@@ -277,6 +306,8 @@ impl<'a> SourceQuery<'a> {
                                         args: vec![],
                                         raw: false,
                                         value_kind,
+                                        call_name: None,
+                                        leading_args: vec![],
                                     });
                                 }
                             }
@@ -716,6 +747,50 @@ impl<'a> SourceQuery<'a> {
             curr = parent.parent();
         }
         false
+    }
+
+    /// Collect the arguments before the format string that might be a log level, like the
+    /// `LOG_ERR` in `syslog(LOG_ERR, "...")` or the `Level::Warn` in `log!(Level::Warn, "...")`.
+    fn leading_args(&self, node: Node) -> Vec<String> {
+        let mut args = Vec::new();
+        match node.parent().map(|p| p.kind()) {
+            Some("argument_list") => {
+                let mut prev = node.prev_named_sibling();
+                while let Some(arg) = prev {
+                    // Only names can be level constants, other arguments like string literals
+                    // could contain level words that aren't relevant.
+                    if matches!(
+                        arg.kind(),
+                        "identifier"
+                            | "qualified_identifier"
+                            | "field_expression"
+                            | "field_access"
+                            | "attribute"
+                    ) {
+                        args.push(self.source[arg.byte_range()].to_string());
+                    }
+                    prev = arg.prev_named_sibling();
+                }
+                args.reverse();
+            }
+            Some("token_tree") => {
+                // Macro arguments are a flat list of tokens, so split the text before the
+                // format string on commas.
+                let parent = node.parent().unwrap();
+                let start = parent.start_byte() + 1;
+                if start < node.start_byte() {
+                    args.extend(
+                        self.source[start..node.start_byte()]
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|arg| !arg.is_empty() && !arg.contains('"'))
+                            .map(str::to_string),
+                    );
+                }
+            }
+            _ => {}
+        }
+        args
     }
 
     fn find_fn_range(node: Node) -> Range<usize> {

@@ -11,6 +11,7 @@ expression: src_refs
   qualifiedName: in-mem.run
   blockId: 24
   text: "\"{}: Started\""
+  level: Info
   quality: 8
   pattern: "(?s)^(.*): Started$"
   args:
@@ -35,6 +36,7 @@ expression: src_refs
   qualifiedName: in-mem.run
   blockId: 69
   text: "\"{}: Stopped\""
+  level: Info
   quality: 8
   pattern: "(?s)^(.*): Stopped$"
   args:

@@ -11,6 +11,7 @@ expression: src_refs
   qualifiedName: main
   blockId: 43
   text: "\"you're only as funky as your last cut\""
+  level: Debug
   quality: 30
   pattern: "(?s)^you're only as funky as your last cut$"
   args: []
@@ -29,6 +30,7 @@ expression: src_refs
   qualifiedName: nope
   blockId: 224
   text: "\"this won't match i={}; j={}\""
+  level: Debug
   quality: 19
   pattern: "(?s)^this won't match i=(.*); j=(.*)$"
   args:
@@ -59,6 +61,7 @@ expression: src_refs
   qualifiedName: namedarg0
   blockId: 326
   text: "\"{salutation}, {name}!\""
+  level: Debug
   quality: 2
   pattern: "(?s)^(.*), (.*)!$"
   args:
@@ -85,6 +88,7 @@ expression: src_refs
   qualifiedName: namedarg
   blockId: 427
   text: "\"Hello, {name}!\""
+  level: Debug
   quality: 7
   pattern: "(?s)^Hello, (.*)!$"
   args:
@@ -107,6 +111,7 @@ expression: src_refs
   qualifiedName: namedarg2
   blockId: 548
   text: "\"{salutation}, {name}!\""
+  level: Debug
   quality: 2
   pattern: "(?s)^(.*), (.*)!$"
   args:
