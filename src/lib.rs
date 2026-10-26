@@ -523,7 +523,9 @@ impl SourceTree {
 /// only matches with an empty value for a placeholder is passed over for a later candidate that
 /// matches without one, even a lower quality one, since a missing value is less likely than the
 /// line coming from a different statement.  The exception is when the statement is closer to
-/// the line number in the log message, which is better evidence than the values.
+/// the line number in the log message, which is better evidence than the values.  The
+/// candidates are ordered by [`MessageCategory::match_priority`] first, and a later tier is only
+/// searched when nothing in an earlier tier matched, even with an empty value.
 fn first_match<'a, T>(
     candidates: impl IntoIterator<Item = T>,
     body: &str,
@@ -533,6 +535,11 @@ fn first_match<'a, T>(
     let mut with_empty_value: Option<T> = None;
     for candidate in candidates {
         let stmt = src_ref(&candidate);
+        if with_empty_value.as_ref().is_some_and(|prior| {
+            src_ref(prior).category.match_priority() < stmt.category.match_priority()
+        }) {
+            break;
+        }
         if !stmt.pattern.is_match(body) {
             continue;
         }
@@ -579,7 +586,8 @@ fn compare_candidates(
     let distance = |src_ref: &SourceRef| line_distance(src_ref, lineno);
     let level_matches = |src_ref: &SourceRef| level == Some(src_ref.level);
     lhs.category
-        .cmp(&rhs.category)
+        .match_priority()
+        .cmp(&rhs.category.match_priority())
         .then_with(|| rhs.quality.cmp(&lhs.quality))
         .then_with(|| level_matches(rhs).cmp(&level_matches(lhs)))
         .then_with(|| distance(lhs).cmp(&distance(rhs)))
@@ -5167,6 +5175,8 @@ int main(int argc, char *argv[]) {
     luaL_error(L, "cannot open file %s", argv[0]);
     log_warn("cannot open %s", argv[0]);
     luaL_error(L, "cannot parse %s", argv[0]);
+    log_warn("server ready%s", argv[0]);
+    luaL_error(L, "server ready");
 }
 "#,
         );
@@ -5196,6 +5206,9 @@ int main(int argc, char *argv[]) {
         );
         // The other categories are still matched when no log statement does.
         assert_eq!(best("cannot parse foo"), Some((5, MessageCategory::Other)));
+        // A log statement is used even if it only matches with an empty value and the other
+        // statement matches without one.
+        assert_eq!(best("server ready"), Some((6, MessageCategory::Log)));
     }
 
     #[test]

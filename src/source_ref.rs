@@ -328,15 +328,28 @@ impl ArgCounter {
 
 /// What a statement's message is used for.  Statements are found by their shape, like a call
 /// that takes a format string, so this is decided after extraction, and log messages are only
-/// matched against other kinds of statements when no `Log` statement matches.
-#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+/// matched against other kinds of statements when no `Log` statement matches.  The order in
+/// which the categories are tried is given by [`MessageCategory::match_priority`], not by the
+/// order of the variants.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
 pub enum MessageCategory {
     /// A logging call, whose level is in `SourceRef::level`.
-    #[default]
     Log,
     /// Some other use of a message, like a call in a family that `prune_log_calls()` decided
     /// does not look like logging.
     Other,
+}
+
+impl MessageCategory {
+    /// The tier that statements in this category are matched in when looking for the source of
+    /// a log message, lowest first.  A statement in a later tier is only used when none in an
+    /// earlier tier matches.
+    pub fn match_priority(&self) -> u8 {
+        match self {
+            MessageCategory::Log => 0,
+            MessageCategory::Other => 1,
+        }
+    }
 }
 
 // TODO: get rid of this clone?
