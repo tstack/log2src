@@ -1427,6 +1427,12 @@ impl<'a> LogRefBuilder<'a> {
         self.details.level = level.and_then(LogLevel::from_log_text);
         self
     }
+    /// Like [`LogRefBuilder::with_level`], for a level that is already known instead of the
+    /// text from the log message.  An `Unknown` level is the same as none.
+    pub fn with_log_level(mut self, level: Option<LogLevel>) -> Self {
+        self.details.level = level.filter(|level| *level != LogLevel::Unknown);
+        self
+    }
 
     pub fn with_body(mut self, body: Option<&'a str>) -> Self {
         let (body, trace) = if let Some(body) = body {
@@ -4198,6 +4204,36 @@ fn main() {
             let result = link_to_source(&log_ref, &src_refs).unwrap();
             assert_eq!(result.level, expected, "{line}");
         }
+    }
+
+    #[test]
+    fn test_with_log_level() {
+        let code = CodeSource::from_string(
+            &Path::new("in-mem.rs"),
+            r#"
+fn main() {
+    debug!("retry");
+    warn!("retry");
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        for level in [LogLevel::Debug, LogLevel::Warn] {
+            let log_ref = LogRefBuilder::new()
+                .with_log_level(Some(level))
+                .with_body(Some("retry"))
+                .build("retry");
+            assert_eq!(log_ref.level(), Some(level));
+            let result = link_to_source(&log_ref, &src_refs).unwrap();
+            assert_eq!(result.level, level);
+        }
+        let log_ref = LogRefBuilder::new()
+            .with_log_level(Some(LogLevel::Unknown))
+            .build("retry");
+        assert_eq!(log_ref.level(), None);
     }
 
     const TRACE: &str = r#"JvmPauseMonitor-n0: Started

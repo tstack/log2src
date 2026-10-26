@@ -13,8 +13,8 @@
 //! constants it defines and, for each log call, the fully-qualified names the constant might
 //! have.  After all the files are extracted, the references are resolved across the whole tree.
 
-use crate::source_ref::LogLevel;
 use crate::source_query::SourceQuery;
+use crate::source_ref::LogLevel;
 use crate::value_kind::ValueKind;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
