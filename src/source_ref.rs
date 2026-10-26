@@ -121,7 +121,8 @@ impl LogLevel {
         let word = word.trim_end_matches(|c: char| c.is_ascii_digit());
         match word {
             "trace" | "finer" | "finest" => Some(LogLevel::Trace),
-            "debug" | "dbg" | "fine" => Some(LogLevel::Debug),
+            // `verbose` is below the default level in OpenSSH and Redis, like debug.
+            "debug" | "dbg" | "fine" | "verbose" => Some(LogLevel::Debug),
             "info" | "notice" => Some(LogLevel::Info),
             // The BSD `err.h` functions and OpenBSD's `fatalx` do not append `errno`.
             "warn" | "warning" | "warnx" => Some(LogLevel::Warn),
@@ -861,6 +862,8 @@ mod tests {
             ("error_f", Some(LogLevel::Error)),
             ("fatalx", Some(LogLevel::Fatal)),
             ("warnx", Some(LogLevel::Warn)),
+            ("verbose_f", Some(LogLevel::Debug)),
+            ("set_verbose", None),
             ("error_message", None),
             ("info_get", None),
         ];
@@ -884,6 +887,8 @@ mod tests {
             ("errors.error", None),
             ("LL_WARNING", Some(LogLevel::Warn)),
             ("LL_DEBUG", Some(LogLevel::Debug)),
+            ("LL_VERBOSE", Some(LogLevel::Debug)),
+            ("SYSLOG_LEVEL_VERBOSE", Some(LogLevel::Debug)),
             ("NGX_LOG_ERR", Some(LogLevel::Error)),
         ];
         for (name, expected) in cases {
