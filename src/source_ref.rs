@@ -14,6 +14,120 @@ pub enum FormatArgument {
     Placeholder,
 }
 
+/// The normalized level of a log statement, derived from the name of the logging call.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Fatal,
+    /// The level could not be determined, which also means the statement might not be logging
+    /// at all, like a `printf()` or a call that just happens to take a string.
+    Unknown,
+}
+
+impl LogLevel {
+    /// Map the name of a logging function/macro/method, like `log::warn`, `logger.warning`,
+    /// `spdlog::info`, `log_debug`, `logInfo`, or `SPDLOG_ERROR`, to a level.  Returns `None`
+    /// for names that don't indicate a level, like `println`, `printf`, or `parser.error`.
+    pub fn from_name(name: &str) -> Option<LogLevel> {
+        Self::classify(name, false)
+    }
+
+    /// Map an argument that is passed to a logging call, like `LOG_ERR`, `logging.WARNING`, or
+    /// `spdlog::level::warn`, to a level.  Unlike [`LogLevel::from_name`], the argument has to
+    /// be qualified by something logging related, so that a variable like `err` is ignored.
+    pub fn from_level_arg(arg: &str) -> Option<LogLevel> {
+        Self::classify(arg, true)
+    }
+
+    /// Map the level text from a log message, like `WARN` or `error`, to a level.
+    pub fn from_log_text(text: &str) -> Option<LogLevel> {
+        Self::from_word(&text.trim().to_lowercase())
+    }
+
+    fn classify(name: &str, require_qualifier: bool) -> Option<LogLevel> {
+        let mut segments: Vec<&str> = name
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut words = split_words(segments.pop()?);
+        let last = words.pop()?;
+        // For names like `log_debug`, `SPDLOG_INFO`, or `LOG_ERR`, the level is at the end and
+        // one of the other words needs to look logging related so that something like
+        // `report_error` is not treated as a log statement.
+        if !words.is_empty() {
+            return if words.iter().any(|w| is_logging_word(w)) {
+                Self::from_word(&last)
+            } else {
+                None
+            };
+        }
+        // For a qualified name, like `logger.warn` or `spdlog::level::info`, the qualifier
+        // needs to look logging related so that something like `warnings.warn` or
+        // `parser.error` is not treated as a log statement.
+        let qualified = segments
+            .iter()
+            .flat_map(|seg| split_words(seg))
+            .any(|w| is_logging_word(&w));
+        if qualified || (segments.is_empty() && !require_qualifier) {
+            Self::from_word(&last)
+        } else {
+            None
+        }
+    }
+
+    fn from_word(word: &str) -> Option<LogLevel> {
+        match word {
+            "trace" | "finer" | "finest" => Some(LogLevel::Trace),
+            "debug" | "dbg" | "fine" => Some(LogLevel::Debug),
+            "info" | "notice" => Some(LogLevel::Info),
+            "warn" | "warning" => Some(LogLevel::Warn),
+            "error" | "err" | "exception" | "severe" => Some(LogLevel::Error),
+            "fatal" | "critical" | "crit" | "alert" | "emerg" => Some(LogLevel::Fatal),
+            _ => None,
+        }
+    }
+}
+
+fn is_logging_word(word: &str) -> bool {
+    word.contains("log") || matches!(word, "level" | "lvl" | "tracing")
+}
+
+/// Split an identifier into lowercase words on underscores and case changes, so `log_debug`,
+/// `logDebug`, `LogDebug`, and `LOG_DEBUG` all become `["log", "debug"]`.
+fn split_words(ident: &str) -> Vec<String> {
+    let chars: Vec<char> = ident.chars().collect();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '_' {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            continue;
+        }
+        if c.is_uppercase() && !word.is_empty() {
+            let prev = chars[i - 1];
+            let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            // Split `logDebug` before the `D` and `LOGDebug` before the `D`, but not `SPDLOG`.
+            if prev.is_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_uppercase() && next_is_lower)
+            {
+                words.push(std::mem::take(&mut word));
+            }
+        }
+        word.extend(c.to_lowercase());
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CallSite {
     pub name: String,
@@ -105,6 +219,7 @@ pub struct SourceRef {
     #[serde(rename(serialize = "blockId"))]
     pub block_id: u32,
     pub text: String,
+    pub level: LogLevel,
     pub quality: usize,
     #[serde(with = "serde_regex")]
     pub(crate) pattern: Regex,
@@ -149,6 +264,7 @@ struct MessageMatcher {
 impl SourceRef {
     pub(crate) fn new(code: &CodeSource, result: QueryResult) -> Option<SourceRef> {
         let range = result.range;
+        let level = result.level();
         let source = code.buffer.as_str();
         let text = source[range.start_byte..range.end_byte].to_string();
         let line_no = range.start_point.row + 1;
@@ -190,6 +306,7 @@ impl SourceRef {
                 qualified_name: result.qualified_name,
                 block_id: result.block_id,
                 text,
+                level,
                 quality,
                 pattern_str: matcher.as_str().to_string(),
                 pattern: matcher,
@@ -234,6 +351,7 @@ impl SourceRef {
             qualified_name: message_ref.qualified_name.clone(),
             block_id: message_ref.block_id,
             text: message_ref.text.clone(),
+            level: message_ref.level,
             quality,
             pattern_str: matcher.as_str().to_string(),
             pattern: matcher,
@@ -627,6 +745,81 @@ fn literal_to_regex(raw: bool, language: SourceLanguage, segment: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_log_level_from_name() {
+        let cases = [
+            ("debug", Some(LogLevel::Debug)),
+            ("log::warn", Some(LogLevel::Warn)),
+            ("tracing::trace", Some(LogLevel::Trace)),
+            ("error", Some(LogLevel::Error)),
+            ("info", Some(LogLevel::Info)),
+            ("spdlog::info", Some(LogLevel::Info)),
+            ("spdlog::critical", Some(LogLevel::Fatal)),
+            ("logger->warn", Some(LogLevel::Warn)),
+            ("SPDLOG_ERROR", Some(LogLevel::Error)),
+            ("logger.warning", Some(LogLevel::Warn)),
+            ("logging.exception", Some(LogLevel::Error)),
+            ("self.log.critical", Some(LogLevel::Fatal)),
+            ("fine", Some(LogLevel::Debug)),
+            ("log_debug", Some(LogLevel::Debug)),
+            ("log_warning", Some(LogLevel::Warn)),
+            ("LOG_ERR", Some(LogLevel::Error)),
+            ("LOG_CRIT", Some(LogLevel::Fatal)),
+            ("APLOG_MARK", None),
+            ("spdlog::level::warn", Some(LogLevel::Warn)),
+            ("LEVEL_INFO", Some(LogLevel::Info)),
+            ("println", None),
+            ("printf", None),
+            ("print", None),
+            ("report_error", None),
+            ("logInfo", Some(LogLevel::Info)),
+            ("LogWarning", Some(LogLevel::Warn)),
+            ("m_logger->logError", Some(LogLevel::Error)),
+            ("LOGError", Some(LogLevel::Error)),
+            ("reportError", None),
+            ("tracing::error", Some(LogLevel::Error)),
+            ("spdlog::get(\"app\")->warn", Some(LogLevel::Warn)),
+            ("warnings.warn", None),
+            ("parser.error", None),
+            ("errors.error", None),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(LogLevel::from_name(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_log_level_from_level_arg() {
+        let cases = [
+            ("LOG_ERR", Some(LogLevel::Error)),
+            ("spdlog::level::trace", Some(LogLevel::Trace)),
+            ("logging.WARNING", Some(LogLevel::Warn)),
+            ("Level::Warn", Some(LogLevel::Warn)),
+            ("tracing::Level::INFO", Some(LogLevel::Info)),
+            ("Level.SEVERE", Some(LogLevel::Error)),
+            ("err", None),
+            ("info", None),
+            ("level", None),
+            ("errors.error", None),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(LogLevel::from_level_arg(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_log_level_from_log_text() {
+        let cases = [
+            ("WARN", Some(LogLevel::Warn)),
+            ("warning", Some(LogLevel::Warn)),
+            (" ERROR ", Some(LogLevel::Error)),
+            ("W", None),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(LogLevel::from_name(name), expected, "{name}");
+        }
+    }
 
     #[test]
     fn test_build_matcher_needs_escape() {

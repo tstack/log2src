@@ -13,6 +13,7 @@
 //! constants it defines and, for each log call, the fully-qualified names the constant might
 //! have.  After all the files are extracted, the references are resolved across the whole tree.
 
+use crate::source_ref::LogLevel;
 use crate::source_query::SourceQuery;
 use crate::value_kind::ValueKind;
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,7 @@ pub(crate) struct MessageRef {
     pub block_id: u32,
     /// The reference as written in the source, like `Messages.LOG_STARTING`.
     pub text: String,
+    pub level: LogLevel,
     pub vars: Vec<String>,
     /// The kind of value produced by each expression in `vars`.
     pub var_kinds: Vec<ValueKind>,

@@ -45,7 +45,7 @@ pub use progress::ProgressUpdate;
 pub use progress::WorkInfo;
 use source_query::QueryResult;
 pub use source_query::SourceQuery;
-pub use source_ref::SourceRef;
+pub use source_ref::{LogLevel, SourceRef};
 
 #[derive(Error, Debug, Diagnostic, Clone, Default)]
 pub enum LogError {
@@ -147,7 +147,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "25")]
+    #[serde(rename = "26")]
     Current,
 }
 
@@ -317,7 +317,7 @@ impl SourceTree {
             .filter_map(|(file_id, index)| {
                 self.files_with_statements.get(file_id)?.statement(*index)
             })
-            .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, Some(lineno)));
+            .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, Some(lineno), log_ref.level()));
         first_match(candidates, body, Some(lineno), |src_ref| src_ref)
     }
 
@@ -350,7 +350,8 @@ impl SourceTree {
             }
         });
         let lineno = log_ref.details.as_ref().and_then(|details| details.lineno);
-        candidates.sort_by(|lhs, rhs| compare_candidates(lhs.1, rhs.1, lineno));
+        let level = log_ref.level();
+        candidates.sort_by(|lhs, rhs| compare_candidates(lhs.1, rhs.1, lineno, level));
         let (stmt_id, src_ref) = first_match(candidates, body, lineno, |(_, src_ref)| src_ref)?;
         if let Some((filename, lineno)) = self.line_cache_key(log_ref) {
             let mut cache = self
@@ -414,15 +415,23 @@ fn line_distance(src_ref: &SourceRef, lineno: Option<usize>) -> usize {
 }
 
 /// Order the candidate statements for a log message from best to worst.  Higher quality is
-/// better and, for the same quality, a statement closer to the line number in the log message.
-/// The line number is only a tie-breaker since it is not always the line of the log call, like
-/// for a message built in a lambda.  Then, a statement with fewer placeholders is better.  Any
-/// remaining tie goes to the earliest location in the source so that the choice does not depend
-/// on the order the candidates were found in.
-fn compare_candidates(lhs: &SourceRef, rhs: &SourceRef, lineno: Option<usize>) -> Ordering {
+/// better and, for the same quality, a statement with the same level as the log message, and
+/// then one closer to the line number in the log message.  The line number is only a
+/// tie-breaker since it is not always the line of the log call, like for a message built in a
+/// lambda.  Then, a statement with fewer placeholders is better.  Any remaining tie goes to the
+/// earliest location in the source so that the choice does not depend on the order the
+/// candidates were found in.
+fn compare_candidates(
+    lhs: &SourceRef,
+    rhs: &SourceRef,
+    lineno: Option<usize>,
+    level: Option<LogLevel>,
+) -> Ordering {
     let distance = |src_ref: &SourceRef| line_distance(src_ref, lineno);
+    let level_matches = |src_ref: &SourceRef| level == Some(src_ref.level);
     rhs.quality
         .cmp(&lhs.quality)
+        .then_with(|| level_matches(rhs).cmp(&level_matches(lhs)))
         .then_with(|| distance(lhs).cmp(&distance(rhs)))
         // A placeholder can be empty, so a message like "Done" matches both "Done" and "Done{}".
         .then_with(|| lhs.kinds.len().cmp(&rhs.kinds.len()))
@@ -1066,6 +1075,27 @@ impl SourceLanguage {
                         )
                         (#not-any-of? @macro-name "format" "vec")
                     )
+                    ; macros that take the level before the format string, like
+                    ; `log!(Level::Warn, "...")` or `tracing::event!(Level::INFO, "...")`
+                    (macro_invocation macro: (_) @macro-name
+                        (token_tree .
+                            (identifier) @_level . (string_literal) @log
+                        )
+                        (#match? @macro-name "(^|::)(log|event)$")
+                        (#not-eq? @_level "target")
+                    )
+                    (macro_invocation macro: (_) @macro-name
+                        (token_tree .
+                            (identifier) . (identifier) . (string_literal) @log
+                        )
+                        (#match? @macro-name "(^|::)(log|event)$")
+                    )
+                    (macro_invocation macro: (_) @macro-name
+                        (token_tree .
+                            (identifier) . (identifier) . (identifier) . (string_literal) @log
+                        )
+                        (#match? @macro-name "(^|::)(log|event)$")
+                    )
                 "#
             }
             SourceLanguage::Java => {
@@ -1082,7 +1112,7 @@ impl SourceLanguage {
                                 [(string_literal) (binary_expression)] @arguments)
                         ]
                         (#match? @object-name "log(ger)?|LOG(GER)?")
-                        (#match? @method-name "^log$|fine|debug|info|warn|trace|error")
+                        (#match? @method-name "^log$|fine|debug|info|warn|trace|error|severe|fatal")
                     )
                     ; A message that is a constant, like log.info(Messages.LOG_STARTING, name)
                     (method_invocation
@@ -1090,7 +1120,7 @@ impl SourceLanguage {
                         name: (identifier) @method-name
                         arguments: (argument_list . [(identifier) (field_access)] @message-ref)
                         (#match? @object-name "log(ger)?|LOG(GER)?")
-                        (#match? @method-name "fine|debug|info|warn|trace|error")
+                        (#match? @method-name "fine|debug|info|warn|trace|error|severe|fatal")
                     )
                     ; java.util.logging's log(Level, String, ...) with a constant message
                     (method_invocation
@@ -1127,6 +1157,18 @@ impl SourceLanguage {
                         )
                       )
                     )
+                )
+                ; `logger.log(logging.WARNING, "...")`
+                (
+                    (expression_statement
+                      (call
+                        function: (_) @func
+                        arguments: (argument_list .
+                          (_) . [(string) (concatenated_string)] @args
+                        )
+                      )
+                    )
+                    (#match? @func "(^|\\.)log$")
                 )
                 "#
             }
@@ -1327,6 +1369,8 @@ pub struct LogDetails<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lineno: Option<usize>,
     #[serde(skip_serializing)]
+    pub level: Option<LogLevel>,
+    #[serde(skip_serializing)]
     pub body: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace: Option<StackTrace<'a>>,
@@ -1337,6 +1381,7 @@ impl<'a> LogDetails<'a> {
         self.thread.is_none()
             && self.file.is_none()
             && self.lineno.is_none()
+            && self.level.is_none()
             && self.body.is_none()
             && self.trace.is_none()
     }
@@ -1361,6 +1406,7 @@ impl<'a> LogRefBuilder<'a> {
                     .map(|m| m.as_str().parse::<usize>().unwrap_or_default()),
             )
             .with_thread(captures.name("thread").map(|m| m.as_str()))
+            .with_level(captures.name("level").map(|m| m.as_str()))
             .with_body(captures.name("body").map(|m| m.as_str()))
             .build(content)
     }
@@ -1375,6 +1421,10 @@ impl<'a> LogRefBuilder<'a> {
     }
     pub fn with_lineno(mut self, lineno: Option<usize>) -> Self {
         self.details.lineno = lineno;
+        self
+    }
+    pub fn with_level(mut self, level: Option<&'a str>) -> Self {
+        self.details.level = level.and_then(LogLevel::from_log_text);
         self
     }
 
@@ -1437,12 +1487,16 @@ impl<'a> LogRef<'a> {
             self.line
         }
     }
+
+    pub fn level(&self) -> Option<LogLevel> {
+        self.details.and_then(|details| details.level)
+    }
 }
 
 pub fn link_to_source<'a>(log_ref: &LogRef, src_refs: &'a [SourceRef]) -> Option<&'a SourceRef> {
     let candidates = src_refs
         .iter()
-        .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, None));
+        .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, None, log_ref.level()));
     first_match(candidates, log_ref.body(), None, |src_ref| src_ref)
 }
 
@@ -1596,6 +1650,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                     "message_ref" => {
                         let range = result.range;
                         let text = &code.buffer[range.start_byte..range.end_byte];
+                        let level = result.level();
                         message_refs.push(MessageRef {
                             line_no: range.start_point.row + 1,
                             end_line_no: range.end_point.row + 1,
@@ -1604,6 +1659,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                             qualified_name: result.qualified_name,
                             block_id: result.block_id,
                             text: text.to_string(),
+                            level,
                             vars: vec![],
                             var_kinds: vec![],
                             candidates: symbols.candidates(text, range.start_byte),
@@ -1690,6 +1746,7 @@ mod tests {
             thread: None,
             file: Some("JvmPauseMonitor"),
             lineno: Some(146),
+            level: Some(LogLevel::Info),
             body: Some("JvmPauseMonitor-n0: Started"),
             trace: None,
         });
@@ -3947,6 +4004,200 @@ def main(x, t, pct):
             extract_pairs("in-mem.py", PYTHON_PERCENT_SOURCE, 4, "75% done"),
             pairs(&[("pct", "75")])
         );
+    }
+
+    fn extract_levels(path: &str, source: &str) -> Vec<(String, LogLevel)> {
+        let code = CodeSource::from_string(&Path::new(path), source);
+        extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements
+            .into_iter()
+            .map(|src_ref| (src_ref.text, src_ref.level))
+            .collect()
+    }
+
+    #[test]
+    fn test_levels_rust() {
+        let levels = extract_levels(
+            "in-mem.rs",
+            r#"
+fn main() {
+    trace!("trace message");
+    debug!("debug message");
+    info!("info message");
+    log::warn!("warn message");
+    tracing::error!("error message");
+    println!("plain message");
+    log::log!(Level::Warn, "log macro message");
+    tracing::event!(tracing::Level::INFO, "event macro message");
+    log!(lvl, "level variable message");
+    log!(target: "app", "target message");
+}
+"#,
+        );
+        assert_eq!(
+            levels,
+            vec![
+                ("\"trace message\"".to_string(), LogLevel::Trace),
+                ("\"debug message\"".to_string(), LogLevel::Debug),
+                ("\"info message\"".to_string(), LogLevel::Info),
+                ("\"warn message\"".to_string(), LogLevel::Warn),
+                ("\"error message\"".to_string(), LogLevel::Error),
+                ("\"plain message\"".to_string(), LogLevel::Unknown),
+                ("\"log macro message\"".to_string(), LogLevel::Warn),
+                ("\"event macro message\"".to_string(), LogLevel::Info),
+                ("\"level variable message\"".to_string(), LogLevel::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_levels_java() {
+        let levels = extract_levels(
+            "in-mem.java",
+            r#"
+class Main {
+    void run() {
+        LOG.trace("trace message");
+        log.debug("debug message");
+        logger.info("info message");
+        LOGGER.warn("warn message");
+        LOG.error("error message");
+        log.severe("severe message");
+        LOG.fatal("fatal message");
+        log.finest("finest message");
+        log.log(Level.WARNING, "level arg message");
+    }
+}
+"#,
+        );
+        assert_eq!(
+            levels,
+            vec![
+                ("\"trace message\"".to_string(), LogLevel::Trace),
+                ("\"debug message\"".to_string(), LogLevel::Debug),
+                ("\"info message\"".to_string(), LogLevel::Info),
+                ("\"warn message\"".to_string(), LogLevel::Warn),
+                ("\"error message\"".to_string(), LogLevel::Error),
+                ("\"severe message\"".to_string(), LogLevel::Error),
+                ("\"fatal message\"".to_string(), LogLevel::Fatal),
+                ("\"finest message\"".to_string(), LogLevel::Trace),
+                ("\"level arg message\"".to_string(), LogLevel::Warn),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_levels_cpp() {
+        let levels = extract_levels(
+            "in-mem.cc",
+            r#"
+int main(int argc, char* argv[]) {
+    spdlog::info("info message");
+    logger->warn("warn message");
+    SPDLOG_ERROR("error message");
+    spdlog::critical("critical message");
+    log_debug("lnav debug message");
+    log_warning("lnav warn message");
+    syslog(LOG_ERR, "syslog error message");
+    spdlog::log(spdlog::level::trace, "spdlog trace message");
+    report_error("not a log message");
+    printf("plain message");
+    log_info("conn error", "second message");
+    logger->info(err, "variable arg message");
+    logInfo("camel message");
+    errors.error("not a log message either");
+}
+"#,
+        );
+        assert_eq!(
+            levels,
+            vec![
+                ("\"info message\"".to_string(), LogLevel::Info),
+                ("\"warn message\"".to_string(), LogLevel::Warn),
+                ("\"error message\"".to_string(), LogLevel::Error),
+                ("\"critical message\"".to_string(), LogLevel::Fatal),
+                ("\"lnav debug message\"".to_string(), LogLevel::Debug),
+                ("\"lnav warn message\"".to_string(), LogLevel::Warn),
+                ("\"syslog error message\"".to_string(), LogLevel::Error),
+                ("\"spdlog trace message\"".to_string(), LogLevel::Trace),
+                ("\"not a log message\"".to_string(), LogLevel::Unknown),
+                ("\"plain message\"".to_string(), LogLevel::Unknown),
+                ("\"conn error\"".to_string(), LogLevel::Info),
+                ("\"second message\"".to_string(), LogLevel::Info),
+                ("\"variable arg message\"".to_string(), LogLevel::Info),
+                ("\"camel message\"".to_string(), LogLevel::Info),
+                (
+                    "\"not a log message either\"".to_string(),
+                    LogLevel::Unknown
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_levels_python() {
+        let levels = extract_levels(
+            "in-mem.py",
+            r#"
+def main():
+    logger.debug("debug message")
+    logging.info("info message")
+    logger.warning("warn message")
+    self.log.error("error message")
+    logger.exception("exception message")
+    logger.critical("critical message")
+    print("plain message")
+    warnings.warn("deprecated message")
+    parser.error("bad arg message")
+    logger.log(logging.WARNING, "level arg message")
+    logging.log(level, "level variable message")
+"#,
+        );
+        assert_eq!(
+            levels,
+            vec![
+                ("\"debug message\"".to_string(), LogLevel::Debug),
+                ("\"info message\"".to_string(), LogLevel::Info),
+                ("\"warn message\"".to_string(), LogLevel::Warn),
+                ("\"error message\"".to_string(), LogLevel::Error),
+                ("\"exception message\"".to_string(), LogLevel::Error),
+                ("\"critical message\"".to_string(), LogLevel::Fatal),
+                ("\"plain message\"".to_string(), LogLevel::Unknown),
+                ("\"deprecated message\"".to_string(), LogLevel::Unknown),
+                ("\"bad arg message\"".to_string(), LogLevel::Unknown),
+                ("\"level arg message\"".to_string(), LogLevel::Warn),
+                ("\"level variable message\"".to_string(), LogLevel::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_link_to_source_by_level() {
+        let code = CodeSource::from_string(
+            &Path::new("in-mem.rs"),
+            r#"
+fn main() {
+    debug!("retry");
+    warn!("retry");
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let log_format: LogFormat = r"^(?<level>\w+) (?<body>.*)$".try_into().unwrap();
+        for (line, expected) in [
+            ("DEBUG retry", LogLevel::Debug),
+            ("WARN retry", LogLevel::Warn),
+        ] {
+            let log_ref =
+                LogRefBuilder::new().build_from_captures(log_format.captures(line).unwrap(), line);
+            let result = link_to_source(&log_ref, &src_refs).unwrap();
+            assert_eq!(result.level, expected, "{line}");
+        }
     }
 
     const TRACE: &str = r#"JvmPauseMonitor-n0: Started
