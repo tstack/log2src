@@ -45,7 +45,8 @@ impl LogLevel {
 
     /// Map the level text from a log message, like `WARN` or `error`, to a level.
     pub fn from_log_text(text: &str) -> Option<LogLevel> {
-        Self::from_word(&text.trim().to_lowercase())
+        let word = text.trim().to_lowercase();
+        Self::from_word(&word).or_else(|| Self::from_jul_word(&word))
     }
 
     fn classify(name: &str, require_qualifier: bool) -> Option<LogLevel> {
@@ -68,8 +69,24 @@ impl LogLevel {
                     _ => Self::from_word(&last),
                 };
             }
-            return if words.iter().any(|w| is_logging_word(w)) {
-                Self::from_word(&last)
+            // The level is usually at the end, but there can be a suffix after it, like the
+            // `once` in `log_warn_once`, the `if` in `LOG_INFO_IF`, or the `hand` in
+            // `tr_logAddTraceHand`.  In that case, the level has to come after a logging word.
+            // If the logging word is only in the qualifier, like `logger.warning_once`, the
+            // level has to be the first word so that `logger.isDebugEnabled` is not a level.
+            words.push(last);
+            if let Some(pos) = words.iter().position(|w| is_logging_word(w)) {
+                return words[pos + 1..]
+                    .iter()
+                    .rev()
+                    .find_map(|w| Self::from_word(w));
+            }
+            let qualified = segments
+                .iter()
+                .flat_map(|seg| split_words(seg))
+                .any(|w| is_logging_word(&w));
+            return if qualified {
+                Self::from_word(&words[0])
             } else {
                 None
             };
@@ -82,7 +99,9 @@ impl LogLevel {
             .flat_map(|seg| split_words(seg))
             .any(|w| is_logging_word(&w));
         if qualified || (segments.is_empty() && !require_qualifier) {
-            Self::from_word(&last)
+            // A java.util.logging level can also be a whole name, like the `config` method or
+            // `Level.CONFIG`.
+            Self::from_word(&last).or_else(|| Self::from_jul_word(&last))
         } else {
             None
         }
@@ -99,10 +118,35 @@ impl LogLevel {
             _ => None,
         }
     }
+
+    /// Levels that are only words on their own when they are clearly from java.util.logging.
+    /// `config` is a level between `info` and `fine`, but it is also part of many names that
+    /// have nothing to do with logging, like `log_config`.
+    fn from_jul_word(word: &str) -> Option<LogLevel> {
+        (word == "config").then_some(LogLevel::Info)
+    }
 }
 
 fn is_logging_word(word: &str) -> bool {
-    word.contains("log") || matches!(word, "level" | "lvl" | "tracing")
+    // Words that contain "log" but have nothing to do with logging.
+    const NOT_LOGGING: &[&str] = &[
+        "analog",
+        "backlog",
+        "blog",
+        "catalog",
+        "changelog",
+        "dialog",
+        "epilog",
+        "logic",
+        "logical",
+        "login",
+        "logo",
+        "logon",
+        "logout",
+        "prolog",
+    ];
+    (word.contains("log") && !word.contains("ology") && !NOT_LOGGING.contains(&word))
+        || matches!(word, "level" | "lvl" | "tracing")
 }
 
 /// Split an identifier into lowercase words on underscores and case changes, so `log_debug`,
