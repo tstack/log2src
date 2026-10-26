@@ -173,6 +173,8 @@ impl<'a> SourceQuery<'a> {
                 let mut child = capture.node;
                 let mut concat_pattern = None;
                 let mut concat_args = vec![];
+                // Computed on demand since only some captures need them.
+                let mut leading_args: Option<Vec<String>> = None;
                 let mut kind = child.kind();
                 if query.capture_names()[capture.index as usize] == "message-ref" {
                     // A log message that is a constant defined elsewhere, like
@@ -184,6 +186,12 @@ impl<'a> SourceQuery<'a> {
                 }
                 let mut raw = false;
                 if self.source_language == SourceLanguage::Cpp && kind == "raw_string_literal" {
+                    // Raw strings are used for all sorts of things, like JSON and usage text,
+                    // so only keep the ones passed to a logging call.
+                    let leading = leading_args.get_or_insert_with(|| self.leading_args(child));
+                    if !Self::has_level(call_name.as_deref(), leading) {
+                        break;
+                    }
                     // The contents of a raw string, like `R"(...)"`, are used as-is.
                     let mut cursor = child.walk();
                     let content = child
@@ -201,7 +209,8 @@ impl<'a> SourceQuery<'a> {
                     // A message that is formatted before it is logged, like `"..." % args`.
                     // Strings are built like this for all sorts of calls, so only keep the
                     // ones passed to a logging call.
-                    if !self.has_level(call_name.as_deref(), child) {
+                    let leading = leading_args.get_or_insert_with(|| self.leading_args(child));
+                    if !Self::has_level(call_name.as_deref(), leading) {
                         break;
                     }
                     match self.python_expr_pattern(child, Self::has_python_format_args(child)) {
@@ -246,7 +255,10 @@ impl<'a> SourceQuery<'a> {
                         }
                         if child.kind() == "binary_expression"
                             && self.source_language == SourceLanguage::Cpp
-                            && !self.has_level(call_name.as_deref(), child)
+                            && !Self::has_level(
+                                call_name.as_deref(),
+                                leading_args.get_or_insert_with(|| self.leading_args(child)),
+                            )
                         {
                             // C++ strings are concatenated for all sorts of calls, like paths
                             // and option names, so only keep the ones passed to a logging call.
@@ -295,7 +307,9 @@ impl<'a> SourceQuery<'a> {
                         raw,
                         value_kind: ValueKind::Any,
                         call_name: call_name.clone(),
-                        leading_args: self.leading_args(child),
+                        leading_args: leading_args
+                            .take()
+                            .unwrap_or_else(|| self.leading_args(child)),
                     });
                     if self.source_language == SourceLanguage::Python
                         && matches!(child.kind(), "string" | "concatenated_string")
@@ -565,7 +579,7 @@ impl<'a> SourceQuery<'a> {
     fn python_expr_pattern(&self, node: Node, format_args: bool) -> Option<(String, Vec<Arg>)> {
         match node.kind() {
             "binary_operator" => match node.child_by_field_name("operator")?.kind() {
-                "%" => self.python_percent_pattern(node),
+                "%" => self.python_percent_pattern(node, format_args),
                 "+" => self.python_concat_pattern(node, format_args),
                 _ => None,
             },
@@ -578,12 +592,18 @@ impl<'a> SourceQuery<'a> {
         matches!(node.kind(), "string" | "concatenated_string")
     }
 
-    /// Convert `"user %s has %d items" % (name, count)` into a pattern.
-    fn python_percent_pattern(&self, node: Node) -> Option<(String, Vec<Arg>)> {
+    /// Convert `"user %s has %d items" % (name, count)` into a pattern.  If the logging call
+    /// has its own `format_args`, the result is formatted again, so a `%%` would become a
+    /// placeholder.  That is not supported.
+    fn python_percent_pattern(&self, node: Node, format_args: bool) -> Option<(String, Vec<Arg>)> {
         let left = node.child_by_field_name("left")?;
-        let right = node.child_by_field_name("right")?;
+        let right = Self::python_unparenthesize(node.child_by_field_name("right")?);
+        let left_text = &self.source[left.byte_range()];
         // Mapping keys, like `%(name)s`, are not supported.
-        if !Self::is_python_string(left) || self.source[left.byte_range()].contains("%(") {
+        if !Self::is_python_string(left)
+            || left_text.contains("%(")
+            || (format_args && left_text.contains("%%"))
+        {
             return None;
         }
         let (pattern, placeholders, interpolated) = self.python_template(left, true);
@@ -661,6 +681,12 @@ impl<'a> SourceQuery<'a> {
                 pattern.push_str(&piece);
                 args.extend(piece_args);
                 interpolated |= piece_interpolated;
+            } else if let Some((piece, piece_args)) = self.python_expr_pattern(operand, format_args)
+            {
+                // A formatted operand, like the `"b %s" % x` in `"a " + "b %s" % x`.
+                pattern.push_str(&piece);
+                args.extend(piece_args);
+                interpolated = true;
             } else {
                 pattern.push_str("%s");
                 args.push((self.python_arg(operand), self.value_kind(operand)));
@@ -675,11 +701,15 @@ impl<'a> SourceQuery<'a> {
 
     /// Convert `"user {} has {count} items".format(name, count=n)` into a pattern.
     fn python_format_pattern(&self, node: Node, format_args: bool) -> Option<(String, Vec<Arg>)> {
+        // Backslash escapes are skipped so the braces in a `\N{NAME}` are not a field.
         static FIELD_REGEX: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\{\{|\}\}|\{([^{}]*)\}|[{}]").unwrap());
-        let string = node
-            .child_by_field_name("function")?
-            .child_by_field_name("object")?;
+            LazyLock::new(|| Regex::new(r"\\N\{[^{}]*\}|\\.|\{\{|\}\}|\{([^{}]*)\}|[{}]").unwrap());
+        let function = node.child_by_field_name("function")?;
+        let string = function.child_by_field_name("object")?;
+        let method = function.child_by_field_name("attribute")?;
+        if !Self::is_python_string(string) || &self.source[method.byte_range()] != "format" {
+            return None;
+        }
         let (text, placeholders, interpolated) = self.python_template(string, format_args);
         if interpolated || (format_args && !placeholders.is_empty()) {
             return None;
@@ -715,12 +745,17 @@ impl<'a> SourceQuery<'a> {
                     "{{" => pattern.push('{'),
                     "}}" => pattern.push('}'),
                     // A lone brace is a nested format spec or an error.
-                    _ => return None,
+                    "{" | "}" => return None,
+                    escape => pattern.push_str(escape),
                 }
                 continue;
             };
-            // Drop the conversion and format spec, like the `!r` and `:>10` in `{0!r:>10}`.
-            let field = field.as_str().split(['!', ':']).next().unwrap_or("");
+            // Split off the conversion and format spec, like the `!r` and `:>10` in `{0!r:>10}`.
+            let field = field.as_str();
+            let (field, spec) = field.split_once(':').unwrap_or((field, ""));
+            let (field, conversion) = field
+                .split_once('!')
+                .map_or((field, false), |(f, _)| (f, true));
             let split = field.find(['.', '[']).unwrap_or(field.len());
             let (name, rest) = field.split_at(split);
             let value = if name.is_empty() {
@@ -732,11 +767,20 @@ impl<'a> SourceQuery<'a> {
                 keywords.iter().find(|(kw, _)| *kw == name).map(|(_, v)| *v)
             }?;
             pattern.push_str("%s");
-            let expr = format!("{}{}", self.source[value.byte_range()].trim(), rest);
-            let kind = if rest.is_empty() {
-                self.value_kind(value)
-            } else {
+            let FormatArgument::Named(base) = self.python_arg(value) else {
+                unreachable!()
+            };
+            let expr = format!("{base}{}", Self::python_field_accessors(rest));
+            // The spec decides how the value is printed, like `{:x}` for an integer, and a
+            // conversion like `!r` prints its repr().
+            let kind = if conversion {
                 ValueKind::Any
+            } else if !spec.is_empty() {
+                ValueKind::from_format_spec(spec)
+            } else if !rest.is_empty() {
+                ValueKind::Any
+            } else {
+                self.value_kind(value)
             };
             args.push((FormatArgument::Named(expr), kind));
         }
@@ -745,7 +789,46 @@ impl<'a> SourceQuery<'a> {
     }
 
     fn python_arg(&self, node: Node) -> FormatArgument {
+        let node = Self::python_unparenthesize(node);
         FormatArgument::Named(self.source[node.byte_range()].trim().to_string())
+    }
+
+    /// Strip the parentheses around an expression, like `(x)`.
+    fn python_unparenthesize(mut node: Node) -> Node {
+        while node.kind() == "parenthesized_expression" {
+            let mut cursor = node.walk();
+            let Some(inner) = node
+                .named_children(&mut cursor)
+                .find(|n| n.kind() != "comment")
+            else {
+                break;
+            };
+            node = inner;
+        }
+        node
+    }
+
+    /// Convert the accessors of a `str.format()` field, like the `.name[key][0]` in
+    /// `{0.name[key][0]}`, into Python.  An index that is not a number is a string key.
+    fn python_field_accessors(accessors: &str) -> String {
+        let mut retval = String::new();
+        let mut rest = accessors;
+        while let Some(start) = rest.find('[') {
+            let Some(len) = rest[start..].find(']') else {
+                break;
+            };
+            let key = &rest[start + 1..start + len];
+            retval.push_str(&rest[..=start]);
+            if key.parse::<usize>().is_ok() {
+                retval.push_str(key);
+            } else {
+                retval.push_str(&format!("'{key}'"));
+            }
+            retval.push(']');
+            rest = &rest[start + len + 1..];
+        }
+        retval.push_str(rest);
+        retval
     }
 
     /// Convert a Kotlin string-literal, like `"Hello $name, {}"`, into the contents of a single
@@ -991,10 +1074,10 @@ impl<'a> SourceQuery<'a> {
         }
     }
 
-    /// Check if the call that `message` is passed to has a log level, either from the name of
-    /// the call or from an argument before the message.
-    fn has_level(&self, call_name: Option<&str>, message: Node) -> bool {
-        self.leading_args(message)
+    /// Check if a call has a log level, either from the name of the call or from one of the
+    /// `leading_args` before the message.
+    fn has_level(call_name: Option<&str>, leading_args: &[String]) -> bool {
+        leading_args
             .iter()
             .any(|arg| LogLevel::from_level_arg(arg).is_some())
             || call_name.and_then(LogLevel::from_name).is_some()

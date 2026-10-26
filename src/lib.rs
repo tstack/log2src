@@ -1186,6 +1186,23 @@ impl SourceLanguage {
                     )
                     (#eq? @_format "format")
                 )
+                ; `logging.log(logging.INFO, "{} done".format(name))`
+                (
+                    (expression_statement
+                      (call
+                        function: (_) @func
+                        arguments: (argument_list .
+                          (_) .
+                          (call
+                            function: (attribute
+                              object: [(string) (concatenated_string)]
+                              attribute: (identifier) @_format)) @args
+                        )
+                      )
+                    )
+                    (#eq? @_format "format")
+                    (#match? @func "(^|\\.)log$")
+                )
                 "#
             }
             SourceLanguage::Kotlin => {
@@ -2779,6 +2796,73 @@ def main(name, count, err, user, d, a, b, off, old_id):
             extract_pairs("in-mem.py", PYTHON_FORMATTED_SOURCE, 5, "job took 5s"),
             pairs(&[("name", "job"), ("count", "5s")])
         );
+    }
+
+    const PYTHON_FORMATTED_EDGE_SOURCE: &str = r#"
+def main(name, value, d, x):
+    logger.info("hex {:x} done".format(255))
+    logger.info("%s: %%d" % name, value)
+    logger.info("\N{BULLET} item {}".format(x))
+    logging.log(logging.WARNING, "lost {}".format(x))
+    logger.info("key {0[k]} {0[1]} end".format(d))
+    logger.info("val %s end" % (x))
+    logger.info("A " + "b %s" % x + " c")
+    logger.info("repr {!r} spaced {:,}".format(x, 1000))
+"#;
+
+    #[test]
+    fn test_python_formatted_edge_cases() {
+        let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_FORMATTED_EDGE_SOURCE);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
+        assert_eq!(
+            patterns,
+            vec![
+                r"(?s)^hex (.*) done$",
+                r"(?s)^. item (.*)$",
+                r"(?s)^lost (.*)$",
+                r"(?s)^key (.*) (.*) end$",
+                r"(?s)^val (.*) end$",
+                r"(?s)^A b (.*) c$",
+                r"(?s)^repr (.*) spaced (.*)$",
+            ]
+        );
+        assert_eq!(src_refs[2].level, LogLevel::Warn);
+        let pairs_at =
+            |index, line| extract_pairs("in-mem.py", PYTHON_FORMATTED_EDGE_SOURCE, index, line);
+        assert_eq!(pairs_at(0, "hex ff done"), pairs(&[("255", "ff")]));
+        assert_eq!(pairs_at(1, "• item a1"), pairs(&[("x", "a1")]));
+        assert_eq!(
+            pairs_at(3, "key v1 v2 end"),
+            pairs(&[("d['k']", "v1"), ("d[1]", "v2")])
+        );
+        assert_eq!(pairs_at(4, "val 5 end"), pairs(&[("x", "5")]));
+        assert_eq!(pairs_at(5, "A b 5 c"), pairs(&[("x", "5")]));
+        assert_eq!(
+            pairs_at(6, "repr 'a' spaced 1,000"),
+            pairs(&[("x", "'a'"), ("1000", "1,000")])
+        );
+    }
+
+    #[test]
+    fn test_cpp_raw_string_not_logged() {
+        let code = CodeSource::from_string(
+            &PathBuf::from("in-mem.cc"),
+            r#"
+void load() {
+    auto doc = json::parse(R"({"a": 1})");
+    puts(R"(usage: tool [options])");
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .map(|stmts| stmts.log_statements)
+            .unwrap_or_default();
+        assert!(src_refs.is_empty());
     }
 
     #[test]
