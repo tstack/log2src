@@ -181,32 +181,36 @@ impl<'a> SourceQuery<'a> {
                 // The node whose following siblings are the arguments for the placeholders.
                 let mut args_anchor = None;
                 let mut printf = false;
+                if let Some(lambda) = outer.parent().filter(|p| p.kind() == "lambda_expression") {
+                    // A Java supplier, like `log.fine(() -> "...")`.
+                    outer = lambda;
+                }
                 if query.capture_names()[capture.index as usize] == "message-call" {
                     // A message built by another call, like `fmt::format("...", x)`.
                     let Some(wrapped) = self.unwrap_message_call(child) else {
                         break;
                     };
                     // Only the first message of a call is used, like other captures.
-                    let mut prev = child.prev_named_sibling();
-                    while let Some(arg) = prev {
-                        if self.is_message_like(arg) {
-                            break;
-                        }
-                        prev = arg.prev_named_sibling();
-                    }
-                    if prev.is_some() {
+                    if self.follows_message(outer, |_| true) {
                         break;
                     }
                     child = wrapped.literal;
                     args_anchor = Some(wrapped.args_anchor);
                     printf = wrapped.printf;
                     kind = child.kind();
+                } else if self.source_language == SourceLanguage::Cpp
+                    && self.follows_message(outer, |arg| self.unwrap_message_call(arg).is_some())
+                {
+                    // An argument for a wrapped message, like the `"file.txt"` in
+                    // `log(fmt::runtime(_("Loaded {}")), "file.txt")`.
+                    break;
                 }
-                if let Some(lambda) = outer.parent().filter(|p| p.kind() == "lambda_expression") {
-                    // A Java supplier, like `log.fine(() -> "...")`.
-                    outer = lambda;
-                }
-                if outer != capture.node || child != capture.node {
+                // The Java query already requires a logger, but C++ strings and calls are
+                // wrapped like this for all sorts of reasons, so only keep the ones passed to a
+                // logging call.
+                if self.source_language != SourceLanguage::Java
+                    && (outer != capture.node || child != capture.node)
+                {
                     // Strings and calls are wrapped like this for all sorts of reasons, so
                     // only keep the ones passed to a logging call.
                     let leading = leading_args.get_or_insert_with(|| self.leading_args(outer));
@@ -340,8 +344,9 @@ impl<'a> SourceQuery<'a> {
                             else {
                                 break;
                             };
-                            concat_pattern = Some(printf_to_placeholders(&text));
-                            concat_args.clear();
+                            let (pattern, args) = printf_to_placeholders(&text);
+                            concat_pattern = Some(pattern);
+                            concat_args = args;
                         }
                         // only return results after the format string literal, other captures
                         // are not relevant.
@@ -468,12 +473,7 @@ impl<'a> SourceQuery<'a> {
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
         let next_is_literal = node
             .next_named_sibling()
-            .is_some_and(|next| match next.kind() {
-                "string_literal" => true,
-                // Only a concatenation with a string, not arithmetic like `MAX - count`.
-                "binary_expression" => self.concat_pattern(next).is_some(),
-                _ => false,
-            });
+            .is_some_and(|next| self.is_message_like(next));
         is_constant_name && !next_is_literal
     }
 
@@ -1147,12 +1147,24 @@ impl<'a> SourceQuery<'a> {
 
     /// Check if an argument of a log call looks like a message, so that only the first one is
     /// used.
-    fn is_message_like(&self, node: Node) -> bool {
+    fn is_message_like(&self, node: Node<'a>) -> bool {
         matches!(
             node.kind(),
             "string_literal" | "concatenated_string" | "raw_string_literal"
         ) || (node.kind() == "binary_expression" && self.concat_pattern(node).is_some())
             || self.unwrap_message_call(node).is_some()
+    }
+
+    /// Check if an argument before `arg` is a message that matches `predicate`.
+    fn follows_message(&self, arg: Node<'a>, predicate: impl Fn(Node<'a>) -> bool) -> bool {
+        let mut prev = arg.prev_named_sibling();
+        while let Some(node) = prev {
+            if self.is_message_like(node) && predicate(node) {
+                return true;
+            }
+            prev = node.prev_named_sibling();
+        }
+        false
     }
 
     /// Find the string-literal in a message that is built by another call, like
@@ -1191,8 +1203,12 @@ impl<'a> SourceQuery<'a> {
                 first.kind(),
                 "identifier" | "field_access" | "method_invocation"
             )
+            && self.source[first.byte_range()]
+                .to_ascii_lowercase()
+                .contains("locale")
         {
-            // The Locale, like `String.format(Locale.ROOT, "...", x)`.
+            // The Locale, like `String.format(Locale.ROOT, "...", x)`.  Otherwise, the format
+            // string is not a literal, like `String.format(FORMAT, x)`.
             first = named.next()?;
         }
         let literal_kinds: &[&str] = match self.source_language {
@@ -1658,18 +1674,46 @@ struct WrappedMessage<'a> {
 }
 
 /// Convert the printf-style conversions in a Java `String.format()` message, like `%s` or
-/// `%.2f`, into the `{}` placeholders that are used for the other Java messages.
-fn printf_to_placeholders(text: &str) -> String {
+/// `%.2f`, into the `{}` placeholders that are used for the other Java messages.  The returned
+/// arguments give the index of the value for each placeholder, since conversions can refer to
+/// them out of order, like `%2$s` or `%<s`.
+fn printf_to_placeholders(text: &str) -> (String, Vec<Arg>) {
     static CONVERSION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"%(?:\d+\$)?[-#+ 0,(<]*\d*(?:\.\d+)?(?:[tT][a-zA-Z]|[a-zA-Z%])").unwrap()
+        Regex::new(r"%(?:(\d+)\$)?([-#+ 0,(<]*)\d*(?:\.\d+)?(?:[tT][a-zA-Z]|[a-zA-Z%])|[{}]")
+            .unwrap()
     });
-    CONVERSION_REGEX
-        .replace_all(text, |caps: &regex::Captures| match &caps[0] {
-            "%%" => "%".to_string(),
-            "%n" => "\\n".to_string(),
-            _ => "{}".to_string(),
-        })
-        .into_owned()
+    let mut args = Vec::new();
+    // The index of the next ordinary conversion and of the last value used.
+    let mut next = 0;
+    let mut last = None;
+    let pattern = CONVERSION_REGEX.replace_all(text, |caps: &regex::Captures| {
+        let index = match &caps[0] {
+            "%%" => return "%".to_string(),
+            "%n" => return "\\n".to_string(),
+            // A literal brace would otherwise look like a placeholder, so use an escape.
+            "{" => return "\\u007b".to_string(),
+            "}" => return "\\u007d".to_string(),
+            _ if caps[2].contains('<') => last,
+            _ => match caps.get(1) {
+                Some(index) => index
+                    .as_str()
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| i.checked_sub(1)),
+                None => {
+                    next += 1;
+                    Some(next - 1)
+                }
+            },
+        };
+        last = index;
+        args.push((
+            index.map_or(FormatArgument::Placeholder, FormatArgument::Positional),
+            ValueKind::Any,
+        ));
+        "{}".to_string()
+    });
+    (pattern.into_owned(), args)
 }
 
 enum ConcatPiece<'a> {

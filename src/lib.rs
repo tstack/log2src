@@ -962,6 +962,82 @@ static RUST_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Other braces in an SLF4J message are literal, so a placeholder cannot contain a `{`.
+/// The names of Java loggers and of their methods that log at a level.  `config` is anchored
+/// since it is part of so many other names, like `loadConfig`.
+const JAVA_LOGGER_OBJECT: &str = "log(ger)?|LOG(GER)?";
+const JAVA_LEVEL_METHODS: &str = "fine|^config$|debug|info|warn|trace|error|severe|fatal";
+
+static JAVA_QUERY: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"
+                    (method_invocation
+                        object: (identifier) @object-name
+                        name: (identifier) @method-name
+                        arguments: [
+                            (argument_list (template_expression
+                                template_argument: (string_literal) @arguments))
+                            (argument_list . [(string_literal) (binary_expression)] @arguments)
+                            ; java.util.logging's log(Level, String, ...) or a SLF4J Marker
+                            (argument_list . [(field_access) (identifier)] .
+                                [(string_literal) (binary_expression)] @arguments)
+                        ]
+                        (#match? @object-name "{JAVA_LOGGER_OBJECT}")
+                        (#match? @method-name "^log$|{JAVA_LEVEL_METHODS}")
+                    )
+                    ; A message that is built by another call, like String.format("...", x)
+                    (method_invocation
+                        object: (identifier) @object-name
+                        name: (identifier) @method-name
+                        arguments: [
+                            (argument_list . (method_invocation) @message-call)
+                            (argument_list . [(field_access) (identifier)] .
+                                (method_invocation) @message-call)
+                        ]
+                        (#match? @object-name "{JAVA_LOGGER_OBJECT}")
+                        (#match? @method-name "^log$|{JAVA_LEVEL_METHODS}")
+                    )
+                    ; A Supplier for the message, like log.fine(() -> "...") or
+                    ; log.log(Level.WARNING, e, () -> "...")
+                    (method_invocation
+                        object: (identifier) @object-name
+                        name: (identifier) @method-name
+                        arguments: [
+                            (argument_list . (lambda_expression
+                                body: [(string_literal) (binary_expression)] @arguments))
+                            (argument_list . (_) . (lambda_expression
+                                body: [(string_literal) (binary_expression)] @arguments))
+                            (argument_list . (_) . (_) . (lambda_expression
+                                body: [(string_literal) (binary_expression)] @arguments))
+                            (argument_list . (lambda_expression
+                                body: (method_invocation) @message-call))
+                            (argument_list . (_) . (lambda_expression
+                                body: (method_invocation) @message-call))
+                            (argument_list . (_) . (_) . (lambda_expression
+                                body: (method_invocation) @message-call))
+                        ]
+                        (#match? @object-name "{JAVA_LOGGER_OBJECT}")
+                        (#match? @method-name "^log$|{JAVA_LEVEL_METHODS}")
+                    )
+                    ; A message that is a constant, like log.info(Messages.LOG_STARTING, name)
+                    (method_invocation
+                        object: (identifier) @object-name
+                        name: (identifier) @method-name
+                        arguments: (argument_list . [(identifier) (field_access)] @message-ref)
+                        (#match? @object-name "{JAVA_LOGGER_OBJECT}")
+                        (#match? @method-name "{JAVA_LEVEL_METHODS}")
+                    )
+                    ; java.util.logging's log(Level, String, ...) with a constant message
+                    (method_invocation
+                        object: (identifier) @object-name
+                        name: (identifier) @method-name
+                        arguments: (argument_list . (_) . [(identifier) (field_access)] @message-ref)
+                        (#match? @object-name "{JAVA_LOGGER_OBJECT}")
+                        (#eq? @method-name "log")
+                    )
+                "#
+    )
+});
+
 static JAVA_PLACEHOLDER_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"\{[^{}]*}|\\\{([^}]*)}"#).unwrap());
 
@@ -1112,74 +1188,7 @@ impl SourceLanguage {
                     )
                 "#
             }
-            SourceLanguage::Java => {
-                r#"
-                    (method_invocation
-                        object: (identifier) @object-name
-                        name: (identifier) @method-name
-                        arguments: [
-                            (argument_list (template_expression
-                                template_argument: (string_literal) @arguments))
-                            (argument_list . [(string_literal) (binary_expression)] @arguments)
-                            ; java.util.logging's log(Level, String, ...) or a SLF4J Marker
-                            (argument_list . [(field_access) (identifier)] .
-                                [(string_literal) (binary_expression)] @arguments)
-                        ]
-                        (#match? @object-name "log(ger)?|LOG(GER)?")
-                        (#match? @method-name "^log$|fine|config|debug|info|warn|trace|error|severe|fatal")
-                    )
-                    ; A message that is built by another call, like String.format("...", x)
-                    (method_invocation
-                        object: (identifier) @object-name
-                        name: (identifier) @method-name
-                        arguments: [
-                            (argument_list . (method_invocation) @message-call)
-                            (argument_list . [(field_access) (identifier)] .
-                                (method_invocation) @message-call)
-                        ]
-                        (#match? @object-name "log(ger)?|LOG(GER)?")
-                        (#match? @method-name "^log$|fine|config|debug|info|warn|trace|error|severe|fatal")
-                    )
-                    ; A Supplier for the message, like log.fine(() -> "...") or
-                    ; log.log(Level.WARNING, e, () -> "...")
-                    (method_invocation
-                        object: (identifier) @object-name
-                        name: (identifier) @method-name
-                        arguments: [
-                            (argument_list . (lambda_expression
-                                body: [(string_literal) (binary_expression)] @arguments))
-                            (argument_list . (_) . (lambda_expression
-                                body: [(string_literal) (binary_expression)] @arguments))
-                            (argument_list . (_) . (_) . (lambda_expression
-                                body: [(string_literal) (binary_expression)] @arguments))
-                            (argument_list . (lambda_expression
-                                body: (method_invocation) @message-call))
-                            (argument_list . (_) . (lambda_expression
-                                body: (method_invocation) @message-call))
-                            (argument_list . (_) . (_) . (lambda_expression
-                                body: (method_invocation) @message-call))
-                        ]
-                        (#match? @object-name "log(ger)?|LOG(GER)?")
-                        (#match? @method-name "^log$|fine|config|debug|info|warn|trace|error|severe|fatal")
-                    )
-                    ; A message that is a constant, like log.info(Messages.LOG_STARTING, name)
-                    (method_invocation
-                        object: (identifier) @object-name
-                        name: (identifier) @method-name
-                        arguments: (argument_list . [(identifier) (field_access)] @message-ref)
-                        (#match? @object-name "log(ger)?|LOG(GER)?")
-                        (#match? @method-name "fine|config|debug|info|warn|trace|error|severe|fatal")
-                    )
-                    ; java.util.logging's log(Level, String, ...) with a constant message
-                    (method_invocation
-                        object: (identifier) @object-name
-                        name: (identifier) @method-name
-                        arguments: (argument_list . (_) . [(identifier) (field_access)] @message-ref)
-                        (#match? @object-name "log(ger)?|LOG(GER)?")
-                        (#eq? @method-name "log")
-                    )
-                "#
-            }
+            SourceLanguage::Java => JAVA_QUERY.as_str(),
             SourceLanguage::Cpp => {
                 r#"
                     (
@@ -3030,6 +3039,87 @@ void connect() {
     }
 
     #[test]
+    fn test_extract_java_wrapped_message_edge_cases() {
+        let code = CodeSource::from_string(
+            &PathBuf::from("in-mem.java"),
+            r#"
+class Main {
+  void run(String name, int count, Level level, Exception e) {
+    LOG.info(String.format(FORMAT, "literal arg"));
+    LOG.info(String.format("%2$s then %1$s, again %<s", name, count));
+    LOG.info(String.format("{id} is %s", name));
+    LOGGER.log(level, () -> "supplier with var level " + name);
+    LOG.info(AUDIT_MARKER, String.format("audit %s", name));
+    LOG.loadConfig(CONFIG_PATH);
+    LOGGER.config("config message");
+  }
+}
+"#,
+        );
+        let stmts = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        // Neither `AUDIT_MARKER` nor `CONFIG_PATH` is a message.
+        assert!(stmts.message_refs.is_empty());
+        let src_refs = stmts.log_statements;
+        let found: Vec<(&str, LogLevel)> = src_refs
+            .iter()
+            .map(|s| (s.pattern().as_str(), s.level))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("(?s)^(.*) then (.*), again (.*)$", LogLevel::Info),
+                (r"(?s)^\{id\} is (.*)$", LogLevel::Info),
+                ("(?s)^supplier with var level (.*)$", LogLevel::Unknown),
+                ("(?s)^audit (.*)$", LogLevel::Info),
+                ("(?s)^config message$", LogLevel::Info),
+            ]
+        );
+        assert_eq!(src_refs[0].arg_exprs(), vec!["count", "name", "name"]);
+        assert_eq!(src_refs[1].arg_exprs(), vec!["name"]);
+
+        let line = "5 then bob, again bob";
+        let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+        let pairs: Vec<(String, String)> = extract_variables(&log_ref, &src_refs[0])
+            .into_iter()
+            .map(|pair| (pair.expr, pair.value))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("count".to_string(), "5".to_string()),
+                ("name".to_string(), "bob".to_string()),
+                ("name".to_string(), "bob".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_level_from_name_not_logging() {
+        for name in [
+            "dialog->setErrorText",
+            "dialog.show_warning",
+            "catalog.add_info_entry",
+            "logger.isDebugEnabled",
+            "log_config",
+        ] {
+            assert_eq!(LogLevel::from_name(name), None, "{name}");
+        }
+        assert_eq!(
+            LogLevel::from_name("logger.warning_once"),
+            Some(LogLevel::Warn)
+        );
+        assert_eq!(LogLevel::from_name("log_warn_once"), Some(LogLevel::Warn));
+        assert_eq!(LogLevel::from_name("config"), Some(LogLevel::Info));
+        assert_eq!(
+            LogLevel::from_level_arg("Level.CONFIG"),
+            Some(LogLevel::Info)
+        );
+        assert_eq!(LogLevel::from_log_text("CONFIG"), Some(LogLevel::Info));
+    }
+
+    #[test]
     fn test_cpp_wrapped_message() {
         let code = CodeSource::from_string(
             &PathBuf::from("in-mem.cc"),
@@ -3043,6 +3133,8 @@ void connect() {
     label->setText(tr("not a log message"));
     auto msg = fmt::format("not logged {}", count);
     report(fmt::format("not a log message {}", count));
+    m_dialog->setErrorText(fmt::format("Bad value {}", count));
+    logger->info(fmt::runtime(_("Loaded {}")), "file.txt");
 }
 "#,
         );
@@ -3062,8 +3154,10 @@ void connect() {
                 ("(?s)^Couldn't read '(.*)'$", LogLevel::Warn),
                 ("(?s)^Verifying (.*) pieces$", LogLevel::Debug),
                 ("(?s)^sending vc$", LogLevel::Trace),
+                ("(?s)^Loaded (.*)$", LogLevel::Info),
             ]
         );
+        assert_eq!(src_refs[5].vars, vec!["\"file.txt\""]);
         assert_eq!(src_refs[0].vars, vec!["family", "addr"]);
         assert_eq!(src_refs[3].vars, vec!["count"]);
     }
