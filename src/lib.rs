@@ -1443,9 +1443,13 @@ impl SourceLanguage {
                     (call_expression
                         function: (field_expression field: (field_identifier) @macro-name)
                         arguments: (arguments .
-                            (closure_expression body:
+                            (closure_expression body: [
                                 (macro_invocation macro: (identifier) @_fmt
-                                    (token_tree . (string_literal) @log))))
+                                    (token_tree . (string_literal) @log))
+                                (block .
+                                    (macro_invocation macro: (identifier) @_fmt
+                                        (token_tree . (string_literal) @log)) .)
+                            ]))
                         (#eq? @_fmt "format")
                         (#match? @macro-name "^(with_context|map_err|ok_or_else|unwrap_or_else)$")
                     )

@@ -21,7 +21,7 @@ fn is_source(s: &SourceRef) -> bool {
     if matches!(call, "write" | "writeln") && s.name != "fmt" {
         return false;
     }
-    !is_test(s)
+    s.quality >= 5 && !is_test(s)
 }
 
 fn is_test(s: &SourceRef) -> bool {
@@ -80,6 +80,8 @@ struct Resolver<'a> {
 #[derive(Debug)]
 struct Cause<'a> {
     candidates: Vec<&'a SourceRef>,
+    /// A captured value that no source matched, like an error from a library.
+    unresolved: Option<String>,
     /// The causes of the values captured by the best candidate's placeholders.
     nested: Vec<Cause<'a>>,
 }
@@ -117,10 +119,24 @@ impl<'a> Resolver<'a> {
                 for m in caps.iter().skip(1).flatten() {
                     let (s, c) = self.resolve_scored(m.as_str(), depth + 1);
                     score += s;
+                    if c.is_empty() && m.as_str().len() >= 4 {
+                        nested.push(Cause {
+                            candidates: vec![],
+                            unresolved: Some(m.as_str().to_string()),
+                            nested: vec![],
+                        });
+                    }
                     nested.extend(c);
                 }
             }
-            best = (score, vec![Cause { candidates, nested }]);
+            best = (
+                score,
+                vec![Cause {
+                    candidates,
+                    unresolved: None,
+                    nested,
+                }],
+            );
         }
         for (pos, _) in value.match_indices(": ") {
             let head_candidates = self.candidates(&value[..pos]);
@@ -132,6 +148,7 @@ impl<'a> Resolver<'a> {
             if score > best.0 {
                 let mut causes = vec![Cause {
                     candidates: head_candidates,
+                    unresolved: None,
                     nested: vec![],
                 }];
                 causes.extend(tail);
@@ -139,6 +156,28 @@ impl<'a> Resolver<'a> {
             }
         }
         best
+    }
+}
+
+fn print_causes(causes: &[Cause], depth: usize) {
+    if causes.is_empty() && depth == 1 {
+        println!("{}(no source found)", "  ".repeat(depth));
+    }
+    for c in causes {
+        if let Some(value) = &c.unresolved {
+            println!("{}<- (no source) {value:?}", "  ".repeat(depth));
+            continue;
+        }
+        let best = c.candidates[0];
+        let others = c.candidates.len() - 1;
+        println!(
+            "{}<- {} {}{}",
+            "  ".repeat(depth),
+            id(best),
+            best.text,
+            if others > 0 { format!("  (+{others} other candidates)") } else { String::new() }
+        );
+        print_causes(&c.nested, depth + 1);
     }
 }
 
@@ -182,6 +221,38 @@ fn main() {
     let mut by_call: BTreeMap<&str, usize> = BTreeMap::new();
     for s in &resolver.sources {
         *by_call.entry(s.call_name.as_deref().unwrap()).or_default() += 1;
+    }
+    if std::env::args().any(|a| a == "--match") {
+        // Each input line is the body of a log message: match it to a log statement, then
+        // resolve each variable that it captured.
+        let opts = LogMatchOptions::default();
+        for line in std::io::stdin().lines() {
+            let line = line.unwrap().replace("\\n", "\n");
+            println!("{line}");
+            let lr = LogRefBuilder::new().with_body(Some(&line)).build(&line);
+            let Some(mapping) = lm.match_log_statement(&lr, &opts) else {
+                println!("  (no log statement)");
+                continue;
+            };
+            let Some(src_ref) = mapping.src_ref else { continue };
+            println!("  log {} {}", id(src_ref), src_ref.text);
+            for var in &mapping.variables {
+                println!("    {} = {:?}", var.expr, var.value);
+                let causes = resolver.resolve(&var.value, 0);
+                if !causes.is_empty() {
+                    print_causes(&causes, 3);
+                }
+            }
+        }
+        return;
+    }
+    if std::env::args().any(|a| a == "--resolve") {
+        for line in std::io::stdin().lines() {
+            let line = line.unwrap().replace("\\n", "\n");
+            println!("{line}");
+            print_causes(&resolver.resolve(&line, 0), 1);
+        }
+        return;
     }
     println!("== {root}");
     println!("error-message sources: {} {:?}", resolver.sources.len(), by_call);
