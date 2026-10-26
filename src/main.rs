@@ -230,14 +230,14 @@ impl MessageAccumulator {
     fn consume_line(&mut self, line: &str) {
         match &self.log_format {
             Some(format) => {
-                if format.is_match(&line) {
-                    self.new_msg(&line);
+                if format.is_match(line) {
+                    self.new_msg(line);
                 } else {
-                    self.continued_line(&line);
+                    self.continued_line(line);
                 }
             }
             None => {
-                self.process_bare_msg(&line);
+                self.process_bare_msg(line);
             }
         }
     }
@@ -368,7 +368,7 @@ fn build_log_matcher(
         .filter(|_| cache_mode != CacheMode::Disabled);
 
     if let Some(cache) = cache.as_ref().filter(|_| cache_mode != CacheMode::Rebuild) {
-        let res = log_matcher.load_from_cache(&cache, tracker);
+        let res = log_matcher.load_from_cache(cache, tracker);
         for err in res {
             let report = Report::new(err);
             if verbose
@@ -396,7 +396,7 @@ fn build_log_matcher(
         || matches!(cache_mode, CacheMode::ForceWrite | CacheMode::Rebuild)
     {
         if let Some(cache) = &cache {
-            let res = log_matcher.cache_to(&cache, tracker);
+            let res = log_matcher.cache_to(cache, tracker);
             if let Err(err) = res {
                 eprintln!("{:?}", Report::new(err));
             }

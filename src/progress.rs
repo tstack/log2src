@@ -82,6 +82,12 @@ impl Drop for WorkGuard {
     }
 }
 
+impl Default for ProgressTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProgressTracker {
     /// Create an empty tracker.
     pub fn new() -> ProgressTracker {

@@ -494,6 +494,12 @@ impl ExtractLogSummary {
     }
 }
 
+impl Default for LogMatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogMatcher {
     /// Create an empty LogMatcher
     pub fn new() -> Self {
@@ -672,7 +678,7 @@ impl LogMatcher {
         let mut total_size: u64 = 0;
         let work_guard = tracker.doing_work(self.roots.len() as u64, "root".to_string());
         for (root_path, root) in &self.roots {
-            let cached_name = to_cached_name(&root_path);
+            let cached_name = to_cached_name(root_path);
             let tmp_path = {
                 fs::create_dir_all(&cache.location).map_err(to_write_cache_error)?;
                 let mut file =
@@ -746,8 +752,7 @@ impl LogMatcher {
     pub fn match_path(&self, path: &Path) -> Option<(&PathBuf, &SourceTree)> {
         self.roots
             .iter()
-            .filter(|(existing_path, _coll)| path.starts_with(existing_path))
-            .next()
+            .find(|(existing_path, _coll)| path.starts_with(existing_path))
     }
 
     pub fn find_source_file_statements(&self, path: &Path) -> Vec<&StatementsInFile> {
@@ -918,7 +923,7 @@ impl LogMatcher {
             Vec::new()
         };
         LogMapping {
-            log_ref: log_ref.clone(),
+            log_ref: *log_ref,
             src_ref: Some(src_ref),
             variables,
             exception_trace,
@@ -1365,7 +1370,7 @@ pub struct StackTrace<'a> {
 }
 
 impl<'a> StackTrace<'a> {
-    fn to_exception_trace(&self, log_matcher: &LogMatcher) -> Vec<CallSite> {
+    fn to_exception_trace(self, log_matcher: &LogMatcher) -> Vec<CallSite> {
         let mut retval = Vec::new();
         match self.language {
             SourceLanguage::Rust => {}
@@ -1440,6 +1445,12 @@ pub struct LogRefBuilder<'a> {
     details: LogDetails<'a>,
 }
 
+impl<'a> Default for LogRefBuilder<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> LogRefBuilder<'a> {
     pub fn new() -> Self {
         Self {
@@ -1495,7 +1506,7 @@ impl<'a> LogRefBuilder<'a> {
                 };
                 let cap0 = trace.get(0).unwrap();
                 (
-                    Some(*&body[0..cap0.range().start].trim_end()),
+                    Some(body[0..cap0.range().start].trim_end()),
                     Some(StackTrace {
                         language,
                         content: cap0.as_str(),
@@ -1687,9 +1698,11 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
             let mut message_refs: Vec<MessageRef> = vec![];
             let mut args_target = ArgsTarget::None;
             let src_query = SourceQuery::new(code);
-            let symbols = (code.info.language == SourceLanguage::Java)
-                .then(|| JavaSymbols::extract(&src_query))
-                .unwrap_or_default();
+            let symbols = if code.info.language == SourceLanguage::Java {
+                JavaSymbols::extract(&src_query)
+            } else {
+                Default::default()
+            };
             let query = code.info.language.get_query();
             let results = src_query.query(query, None);
             for result in results {
@@ -1721,33 +1734,31 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                         });
                         args_target = ArgsTarget::MessageRef;
                     }
-                    "args" | "this" => {
-                        if !matches!(args_target, ArgsTarget::None) {
-                            let range = result.range;
-                            let source = code.buffer.as_str();
-                            let text = source[range.start_byte..range.end_byte].to_string();
-                            // eprintln!("text={} matched.len()={}", text, matched.len());
-                            // check the text doesn't match any of the logging related identifiers
-                            if code
-                                .info
-                                .language
-                                .get_identifiers()
-                                .iter()
-                                .all(|&s| s != text.to_lowercase())
-                            {
-                                let end_line_no = result.range.end_point.row + 1;
-                                let var = text.trim().to_string();
-                                if let ArgsTarget::MessageRef = args_target {
-                                    let prior = message_refs.last_mut().unwrap();
-                                    prior.end_line_no = end_line_no;
-                                    prior.vars.push(var);
-                                    prior.var_kinds.push(result.value_kind);
-                                } else {
-                                    let prior = matched.last_mut().unwrap();
-                                    prior.end_line_no = end_line_no;
-                                    prior.vars.push(var);
-                                    prior.var_kinds.push(result.value_kind);
-                                }
+                    "args" | "this" if !matches!(args_target, ArgsTarget::None) => {
+                        let range = result.range;
+                        let source = code.buffer.as_str();
+                        let text = source[range.start_byte..range.end_byte].to_string();
+                        // eprintln!("text={} matched.len()={}", text, matched.len());
+                        // check the text doesn't match any of the logging related identifiers
+                        if code
+                            .info
+                            .language
+                            .get_identifiers()
+                            .iter()
+                            .all(|&s| s != text.to_lowercase())
+                        {
+                            let end_line_no = result.range.end_point.row + 1;
+                            let var = text.trim().to_string();
+                            if let ArgsTarget::MessageRef = args_target {
+                                let prior = message_refs.last_mut().unwrap();
+                                prior.end_line_no = end_line_no;
+                                prior.vars.push(var);
+                                prior.var_kinds.push(result.value_kind);
+                            } else {
+                                let prior = matched.last_mut().unwrap();
+                                prior.end_line_no = end_line_no;
+                                prior.vars.push(var);
+                                prior.var_kinds.push(result.value_kind);
                             }
                         }
                     }
@@ -1784,8 +1795,8 @@ mod tests {
     use std::ptr;
 
     fn from_log_format_and_line<'a>(buffer: &'a str, log_format: LogFormat) -> LogRef<'a> {
-        let captures = log_format.captures(&buffer).unwrap();
-        LogRefBuilder::new().build_from_captures(captures, &buffer)
+        let captures = log_format.captures(buffer).unwrap();
+        LogRefBuilder::new().build_from_captures(captures, buffer)
     }
 
     #[test]
@@ -1850,7 +1861,7 @@ fn namedarg2(salutation: &str, name: &str) {
 
     #[test]
     fn test_extract_logging() {
-        let code = CodeSource::from_string(&Path::new("in-mem.rs"), TEST_SOURCE);
+        let code = CodeSource::from_string(Path::new("in-mem.rs"), TEST_SOURCE);
         let src_refs = extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
@@ -1867,7 +1878,7 @@ fn namedarg2(salutation: &str, name: &str) {
             "[2024-05-09T19:58:53Z DEBUG main] you're only as funky as your last cut",
             lf,
         );
-        let code = CodeSource::from_string(&Path::new("in-mem.rs"), TEST_SOURCE);
+        let code = CodeSource::from_string(Path::new("in-mem.rs"), TEST_SOURCE);
         let src_refs = extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
@@ -1884,7 +1895,7 @@ fn namedarg2(salutation: &str, name: &str) {
             .unwrap();
         let log_ref =
             from_log_format_and_line("[2024-05-09T19:58:53Z DEBUG main] Hello, Leander!", lf);
-        let code = CodeSource::from_string(&Path::new("in-mem.rs"), TEST_SOURCE);
+        let code = CodeSource::from_string(Path::new("in-mem.rs"), TEST_SOURCE);
         let src_refs = extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
@@ -1912,7 +1923,7 @@ fn main() {
             "[2024-05-09T19:58:53Z DEBUG main] you're only as funky\n as your last cut",
             lf,
         );
-        let code = CodeSource::from_string(&Path::new("in-mem.rs"), MULTILINE_SOURCE);
+        let code = CodeSource::from_string(Path::new("in-mem.rs"), MULTILINE_SOURCE);
         let src_refs = extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
@@ -1934,7 +1945,7 @@ fn main() {
     #[test]
     fn test_link_to_source_no_matches() {
         let log_ref = LogRefBuilder::new().build("nope!");
-        let code = CodeSource::from_string(&Path::new("in-mem.rs"), TEST_SOURCE);
+        let code = CodeSource::from_string(Path::new("in-mem.rs"), TEST_SOURCE);
         let src_refs = extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
@@ -1947,7 +1958,7 @@ fn main() {
     #[test]
     fn test_extract_variables() {
         let log_ref = LogRefBuilder::new().build("this won't match i=1; j=2");
-        let code = CodeSource::from_string(&Path::new("in-mem.rs"), TEST_SOURCE);
+        let code = CodeSource::from_string(Path::new("in-mem.rs"), TEST_SOURCE);
         let src_refs = extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
@@ -1974,7 +1985,7 @@ fn main() {
     #[test]
     fn test_extract_named() {
         let log_ref = LogRefBuilder::new().build("Hello, Tim!");
-        let code = CodeSource::from_string(&Path::new("in-mem.rs"), TEST_SOURCE);
+        let code = CodeSource::from_string(Path::new("in-mem.rs"), TEST_SOURCE);
         let src_refs = extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
@@ -3047,7 +3058,7 @@ int other(int x) {
     #[test]
     fn test_basic_cpp() {
         let log_ref = LogRefBuilder::new().build("Hello, Steve!");
-        let code = CodeSource::from_string(&Path::new("in-mem.cc"), CPP_SOURCE);
+        let code = CodeSource::from_string(Path::new("in-mem.cc"), CPP_SOURCE);
         let src_refs = extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
@@ -3076,7 +3087,7 @@ def main(name, count, x):
 
     #[test]
     fn test_python_concatenation() {
-        let code = CodeSource::from_string(&Path::new("in-mem.py"), PYTHON_CONCAT_SOURCE);
+        let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_CONCAT_SOURCE);
         let src_refs = extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
@@ -3128,7 +3139,7 @@ processing \started -- {args[0]}""")
     #[test]
     fn test_basic_python() {
         let log_ref = LogRefBuilder::new().build("foo bar π");
-        let code = CodeSource::from_string(&Path::new("in-mem.py"), PYTHON_SOURCE);
+        let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_SOURCE);
         let src_refs = extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
@@ -4358,7 +4369,7 @@ def main(x, t, pct):
     }
 
     fn extract_levels(path: &str, source: &str) -> Vec<(String, LogLevel)> {
-        let code = CodeSource::from_string(&Path::new(path), source);
+        let code = CodeSource::from_string(Path::new(path), source);
         extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
@@ -4547,7 +4558,7 @@ def main():
     #[test]
     fn test_link_to_source_by_level() {
         let code = CodeSource::from_string(
-            &Path::new("in-mem.rs"),
+            Path::new("in-mem.rs"),
             r#"
 fn main() {
     debug!("retry");
@@ -4574,7 +4585,7 @@ fn main() {
     #[test]
     fn test_with_log_level() {
         let code = CodeSource::from_string(
-            &Path::new("in-mem.rs"),
+            Path::new("in-mem.rs"),
             r#"
 fn main() {
     debug!("retry");
