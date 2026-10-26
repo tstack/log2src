@@ -9,7 +9,7 @@ mod common_settings;
 
 #[test]
 fn invalid_log_path() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let basic_source = Path::new("tests").join("java").join("Basic.java");
     let basic_log = Path::new("badname.log");
     cmd.arg("-d")
@@ -25,7 +25,7 @@ fn invalid_log_path() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn invalid_log_format() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let basic_source = Path::new("tests").join("java").join("Basic.java");
     let basic_log = Path::new("tests")
         .join("resources")
@@ -44,7 +44,7 @@ fn invalid_log_format() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn basic() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let basic_source = Path::new("tests").join("java").join("Basic.java");
     let basic_log = Path::new("tests")
         .join("resources")
@@ -63,7 +63,7 @@ fn basic() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn basic_range() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let basic_source = Path::new("tests").join("java").join("Basic.java");
     let basic_log = Path::new("tests")
         .join("resources")
@@ -86,7 +86,7 @@ fn basic_range() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn basic_invalid_utf() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let basic_source = Path::new("tests").join("java").join("Basic.java");
     let basic_log = Path::new("tests")
         .join("resources")
@@ -105,7 +105,7 @@ fn basic_invalid_utf() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn basic_with_log() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let basic_source = Path::new("tests").join("java").join("BasicWithLog.java");
     let basic_log = Path::new("tests")
         .join("resources")
@@ -124,7 +124,7 @@ fn basic_with_log() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn basic_with_upper() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let basic_source = Path::new("tests").join("java").join("BasicWithUpper.java");
     let basic_log = Path::new("tests")
         .join("resources")
@@ -143,7 +143,7 @@ fn basic_with_upper() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn basic_with_log_format() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let source = Path::new("tests").join("java").join("BasicWithCustom.java");
     let log = Path::new("tests")
         .join("resources")
@@ -165,7 +165,7 @@ fn basic_with_log_format() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 #[cfg(not(windows))]
 fn basic_slf4j() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let source = Path::new("tests").join("java").join("BasicSlf4j.java");
     let log = Path::new("tests")
         .join("resources")

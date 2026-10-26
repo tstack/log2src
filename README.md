@@ -32,6 +32,28 @@ The current version is still an early prototype that only works with simple prog
 
 You must compile the command line tool using Rust. The log2src command line tool has several options and the API is still quite experimental, so expect changes. See `-h` for the up to date documentation.
 
+The command is split into sub-commands, and `-d`/`--source` can be given to any of them:
+
+```
+# Map log messages to the statements that produced them
+log2src match -d ~/src/app -l app.log -f '^\S+ \w+ (?<body>.*)'
+log2src match -d ~/src/app --message 'Connected to db after 3 retries'
+
+# List the log statements that were found, optionally filtered
+log2src statements -d ~/src/app --level warn,error --lang java -o tsv
+log2src statements -d ~/src/app --file Database.java
+log2src statements -d ~/src/app --summary
+
+# Find the source file for a path, like one in a stack trace
+log2src locate -d ~/src/app 'C:\build\App\Program.cs'
+
+# Manage the cache of log statements
+log2src cache path
+log2src cache list
+log2src cache update -d ~/src/app
+log2src cache clear [-d ~/src/app]
+```
+
 You can also build and run the VS Code extension by building the log2src binary and copying it into `editors/code/bin`. The easiest way to run the extension at the moment is from VS Code using the standard run configuration.
 
 ```

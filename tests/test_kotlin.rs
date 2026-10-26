@@ -5,7 +5,7 @@ mod common_settings;
 
 #[test]
 fn basic() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let source = Path::new("tests").join("kotlin");
     let log = Path::new("tests")
         .join("resources")

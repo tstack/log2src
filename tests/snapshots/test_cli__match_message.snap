@@ -1,0 +1,24 @@
+---
+source: tests/test_cli.rs
+info:
+  program: log2src
+  args:
+    - match
+    - "-d"
+    - examples/basic.rs
+    - "--message"
+    - Hello from foo i=42
+  env:
+    APPDATA: /tmp/.tmp6FPZLM
+    COLS: "1000"
+    HOME: /tmp/.tmp6FPZLM
+    LOCALAPPDATA: /tmp/.tmp6FPZLM
+    USERPROFILE: /tmp/.tmp6FPZLM
+    XDG_CONFIG_HOME: /tmp/.tmp6FPZLM
+---
+success: true
+exit_code: 0
+----- stdout -----
+{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"foo","qualifiedName":"foo","blockId":186,"text":"\"Hello from foo i={}\"","level":"Debug","quality":14,"pattern":"(?s)^Hello from foo i=(.*)$","args":["Placeholder"],"argKinds":["Any"],"vars":["i"],"varKinds":["Any"],"kinds":["Any"],"segments":["Hello from foo i=",""]},"variables":[{"expr":"i","value":"42"}]}
+
+----- stderr -----

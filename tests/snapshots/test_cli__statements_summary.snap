@@ -1,0 +1,23 @@
+---
+source: tests/test_cli.rs
+info:
+  program: log2src
+  args:
+    - statements
+    - "-d"
+    - tests/java
+    - "--summary"
+  env:
+    APPDATA: /tmp/.tmpUY0A6s
+    COLS: "1000"
+    HOME: /tmp/.tmpUY0A6s
+    LOCALAPPDATA: /tmp/.tmpUY0A6s
+    USERPROFILE: /tmp/.tmpUY0A6s
+    XDG_CONFIG_HOME: /tmp/.tmpUY0A6s
+---
+success: true
+exit_code: 0
+----- stdout -----
+{"byLanguage":{"Java":{"Debug":9,"Info":1}},"files":5,"statements":10}
+
+----- stderr -----

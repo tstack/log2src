@@ -1,0 +1,24 @@
+---
+source: tests/test_cli.rs
+info:
+  program: log2src
+  args:
+    - statements
+  env:
+    APPDATA: /tmp/.tmpmTvTKq
+    COLS: "1000"
+    HOME: /tmp/.tmpmTvTKq
+    LOCALAPPDATA: /tmp/.tmpmTvTKq
+    USERPROFILE: /tmp/.tmpmTvTKq
+    XDG_CONFIG_HOME: /tmp/.tmpmTvTKq
+---
+success: false
+exit_code: 2
+----- stdout -----
+
+----- stderr -----
+error: at least one source directory must be given with '--source <SOURCE>'
+
+Usage: log2src [OPTIONS] <COMMAND>
+
+For more information, try '--help'.

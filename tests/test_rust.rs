@@ -5,7 +5,7 @@ mod common_settings;
 
 #[test]
 fn basic() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let source = Path::new("examples").join("basic.rs");
     let log = Path::new("tests")
         .join("resources")
@@ -24,7 +24,7 @@ fn basic() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn stack() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let source = Path::new("examples").join("stack.rs");
     let log = Path::new("tests")
         .join("resources")
@@ -45,7 +45,7 @@ fn stack() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn invalid_source_path() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = common_settings::CommandGuard::new()?;
+    let mut cmd = common_settings::CommandGuard::new("match")?;
     let source = Path::new("examples").join("stack.r");
     let log = Path::new("tests")
         .join("resources")

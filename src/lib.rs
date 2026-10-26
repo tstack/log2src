@@ -134,6 +134,12 @@ impl Cache {
         let location = project_dirs.cache_dir().to_path_buf();
         Ok(Cache { location })
     }
+
+    /// The path of the entry that holds the log statements for the given source root.
+    pub fn entry_path(&self, root: &Path) -> PathBuf {
+        let root = root.canonicalize().unwrap_or(root.to_owned());
+        self.location.join(to_cached_name(&root))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]

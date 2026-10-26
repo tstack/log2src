@@ -48,10 +48,12 @@ pub struct CommandGuard {
 }
 
 impl CommandGuard {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    /// Create a command that runs the given log2src sub-command.
+    pub fn new(subcommand: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let home_guard = TempHome::new();
         let _filter_guard = enable_filters(home_guard.location.path());
         let mut cmd = Command::cargo_bin("log2src")?;
+        cmd.arg(subcommand);
         cmd.env("COLS", "1000");
         home_guard.set_vars_in(&mut cmd);
         Ok(Self {

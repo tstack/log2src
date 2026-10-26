@@ -283,7 +283,7 @@ export class DebugSession extends LoggingDebugSession {
             this.focusEditor(editors[0]);
         }
 
-        let l2sArgs = ['-d', this._launchArgs.source,
+        let l2sArgs = ['match', '-d', this._launchArgs.source,
             '--log', this._launchArgs.log,
             '--start', start,
             '--count', 1]

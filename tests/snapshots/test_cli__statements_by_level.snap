@@ -1,0 +1,24 @@
+---
+source: tests/test_cli.rs
+info:
+  program: log2src
+  args:
+    - statements
+    - "-d"
+    - tests/java
+    - "--level"
+    - info
+  env:
+    APPDATA: /tmp/.tmp3NEdtW
+    COLS: "1000"
+    HOME: /tmp/.tmp3NEdtW
+    LOCALAPPDATA: /tmp/.tmp3NEdtW
+    USERPROFILE: /tmp/.tmp3NEdtW
+    XDG_CONFIG_HOME: /tmp/.tmp3NEdtW
+---
+success: true
+exit_code: 0
+----- stdout -----
+{"sourcePath":"{java_dir}/BasicSlf4j.java","language":"Java","lineNumber":10,"endLineNumber":10,"column":20,"name":"main","qualifiedName":"org.example.Main.main","blockId":250,"text":"\"Application starting\"","level":"Info","quality":19,"pattern":"(?s)^Application starting$","args":[],"argKinds":[],"vars":[],"varKinds":[],"kinds":[],"segments":["Application starting"]}
+
+----- stderr -----

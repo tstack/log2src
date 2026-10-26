@@ -1,15 +1,20 @@
-use clap::Parser as ClapParser;
+use clap::error::ErrorKind;
+use clap::{Args, CommandFactory, Parser as ClapParser, Subcommand, ValueEnum};
 use colored_json::{ColoredFormatter, CompactFormatter, Styler};
 use indicatif::{ProgressBar, ProgressStyle};
 use log2src::{
-    Cache, LogError, LogFormat, LogMapping, LogMatchOptions, LogMatcher, LogRef, LogRefBuilder,
-    ProgressTracker, ProgressUpdate,
+    Cache, LogError, LogFormat, LogLevel, LogMapping, LogMatchOptions, LogMatcher, LogRef,
+    LogRefBuilder, ProgressTracker, ProgressUpdate, Revision, SourceLanguage, SourceRef,
 };
-use miette::{IntoDiagnostic, MietteHandlerOpts, Report};
+use miette::{miette, IntoDiagnostic, MietteHandlerOpts, Report};
 use serde::Serialize;
-use std::io::{stdout, BufRead, BufReader};
+use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{stdout, BufRead, BufReader, Write};
+use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::thread::sleep;
+use std::sync::Arc;
+use std::thread::{sleep, JoinHandle};
 use std::time::Duration;
 use std::{env, fs, io, path::PathBuf};
 
@@ -35,12 +40,43 @@ fn get_footer() -> String {
 #[command(after_help = get_footer())]
 struct Cli {
     /// The source directories to map logs onto
-    #[arg(short = 'd', long, value_name = "SOURCES")]
+    #[arg(short = 'd', long = "source", value_name = "SOURCE", global = true)]
     sources: Vec<String>,
 
+    /// Print progress information to standard error
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
+    /// Do not read or write the cache of log statements
+    #[arg(long, global = true)]
+    no_cache: bool,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Map log messages to the source code that emitted them
+    Match(MatchArgs),
+    /// Print the log statements found in the source directories
+    Statements(StatementsArgs),
+    /// Find the source file for a path, like one from a stack trace
+    Locate(LocateArgs),
+    /// Manage the cache of log statements
+    #[command(subcommand)]
+    Cache(CacheCommand),
+}
+
+#[derive(Args)]
+struct MatchArgs {
     /// A log file to use, if not from stdin
-    #[arg(short, long, value_name = "LOG")]
+    #[arg(short, long, value_name = "LOG", conflicts_with = "message")]
     log: Option<PathBuf>,
+
+    /// A single log message to match, instead of reading a log
+    #[arg(short, long, value_name = "MESSAGE")]
+    message: Option<String>,
 
     /// The regex of a log format being used
     #[arg(short, long, value_name = "FORMAT")]
@@ -54,9 +90,103 @@ struct Cli {
     #[arg(short, long, value_name = "COUNT")]
     count: Option<usize>,
 
-    /// Print progress information to standard error
-    #[arg(short, long)]
-    verbose: bool,
+    /// Do not extract the values of variables from the messages
+    #[arg(long)]
+    no_vars: bool,
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum StatementsOutput {
+    /// One JSON object per statement
+    Json,
+    /// Tab-separated path, line, level, name, and message
+    Tsv,
+}
+
+#[derive(Args)]
+struct StatementsArgs {
+    /// Only print statements with these levels
+    #[arg(long, value_name = "LEVEL", value_delimiter = ',', value_parser = parse_level)]
+    level: Vec<LogLevel>,
+
+    /// Only print statements in these languages
+    #[arg(long, value_name = "LANG", value_delimiter = ',', value_parser = parse_language)]
+    lang: Vec<SourceLanguage>,
+
+    /// Only print statements in this source file
+    #[arg(long, value_name = "FILE")]
+    file: Option<PathBuf>,
+
+    /// The output format
+    #[arg(short, long, value_enum, default_value_t = StatementsOutput::Json)]
+    output: StatementsOutput,
+
+    /// Print the number of statements by language and level instead of the statements
+    #[arg(long, conflicts_with = "output")]
+    summary: bool,
+}
+
+#[derive(Args)]
+struct LocateArgs {
+    /// The paths to find
+    #[arg(required = true, value_name = "PATH")]
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Print the location of the cache directory
+    Path,
+    /// List the entries in the cache, or only the ones for the given sources
+    List,
+    /// Find the log statements in the given sources and save them to the cache
+    Update,
+    /// Remove all of the entries in the cache, or only the ones for the given sources
+    Clear,
+}
+
+const LEVELS: [LogLevel; 7] = [
+    LogLevel::Trace,
+    LogLevel::Debug,
+    LogLevel::Info,
+    LogLevel::Warn,
+    LogLevel::Error,
+    LogLevel::Fatal,
+    LogLevel::Unknown,
+];
+
+const LANGUAGES: [SourceLanguage; 5] = [
+    SourceLanguage::Rust,
+    SourceLanguage::Java,
+    SourceLanguage::Cpp,
+    SourceLanguage::Python,
+    SourceLanguage::Kotlin,
+];
+
+fn parse_level(arg: &str) -> Result<LogLevel, String> {
+    LEVELS
+        .into_iter()
+        .find(|level| format!("{:?}", level).eq_ignore_ascii_case(arg))
+        .ok_or_else(|| {
+            let names: Vec<_> = LEVELS
+                .iter()
+                .map(|level| format!("{:?}", level).to_lowercase())
+                .collect();
+            format!("expected one of: {}", names.join(", "))
+        })
+}
+
+fn parse_language(arg: &str) -> Result<SourceLanguage, String> {
+    LANGUAGES
+        .into_iter()
+        .find(|lang| lang.as_str().eq_ignore_ascii_case(arg))
+        .ok_or_else(|| {
+            let names: Vec<_> = LANGUAGES
+                .iter()
+                .map(|lang| lang.as_str().to_lowercase())
+                .collect();
+            format!("expected one of: {}", names.join(", "))
+        })
 }
 
 fn get_colored_formatter() -> ColoredFormatter<CompactFormatter> {
@@ -69,16 +199,23 @@ fn get_colored_formatter() -> ColoredFormatter<CompactFormatter> {
 struct MessageAccumulator {
     log_matcher: LogMatcher,
     log_format: Option<LogFormat>,
+    match_options: LogMatchOptions,
     content: String,
     message_count: usize,
     limit: usize,
 }
 
 impl MessageAccumulator {
-    fn new(log_matcher: LogMatcher, log_format: Option<LogFormat>, limit: usize) -> Self {
+    fn new(
+        log_matcher: LogMatcher,
+        log_format: Option<LogFormat>,
+        match_options: LogMatchOptions,
+        limit: usize,
+    ) -> Self {
         Self {
             log_matcher,
             log_format,
+            match_options,
             content: String::new(),
             message_count: 0,
             limit,
@@ -87,7 +224,7 @@ impl MessageAccumulator {
 
     fn get_log_mapping<'a>(&self, log_ref: LogRef<'a>) -> LogMapping<'a, '_> {
         self.log_matcher
-            .match_log_statement(&log_ref, &LogMatchOptions::default())
+            .match_log_statement(&log_ref, &self.match_options)
             .unwrap_or_else(move || LogMapping {
                 log_ref,
                 src_ref: None,
@@ -200,10 +337,61 @@ struct ErrorWrapper {
     error: SerializableDiagnostic,
 }
 
+/// Print the progress updates from the tracker to stderr until it is dropped.
+fn spawn_progress_listener(tracker: &mut ProgressTracker) -> JoinHandle<()> {
+    let listener = tracker.subscribe();
+    std::thread::spawn(move || {
+        let mut prefix = String::new();
+        for update in listener {
+            match update {
+                ProgressUpdate::Step(msg) => eprintln!("{}", msg),
+                ProgressUpdate::BeginStep(msg) => {
+                    prefix = msg;
+                }
+                ProgressUpdate::EndStep(msg) => {
+                    eprintln!("{}... {}", prefix, msg);
+                    prefix.clear();
+                }
+                ProgressUpdate::Work(info) => {
+                    // XXX Take the stdout lock so that the actual output does not interfere
+                    // with the progress bar updates on stderr.
+                    let _stdout_lock = stdout().lock();
+                    let template = if info.units == "bytes" {
+                        "{prefix}... {bar} {bytes:>10}/{total_bytes:10}"
+                    } else {
+                        "{prefix}... {bar} {pos:>7}/{len:7}"
+                    };
+                    let bar = ProgressBar::new(info.total)
+                        .with_prefix(prefix.clone())
+                        .with_style(ProgressStyle::with_template(template).unwrap());
+                    while info.is_in_progress() {
+                        bar.set_position(info.completed.load(Ordering::Relaxed));
+                        sleep(Duration::from_millis(33));
+                    }
+                    bar.finish_and_clear();
+                }
+            }
+        }
+    })
+}
+
+/// How the cache is used when building a LogMatcher.
+#[derive(Copy, Clone, PartialEq)]
+enum CacheMode {
+    /// Load the statements from the cache and save them if anything changed.
+    ReadWrite,
+    /// Load the statements from the cache and always save them.
+    ForceWrite,
+    /// Do not touch the cache.
+    Disabled,
+}
+
 /// Find the log statements in the source trees, using the cache when possible.
 fn build_log_matcher(
     sources: &[String],
     verbose: bool,
+    cache_mode: CacheMode,
+    require_statements: bool,
     tracker: &ProgressTracker,
 ) -> miette::Result<LogMatcher> {
     let mut log_matcher = LogMatcher::new();
@@ -214,11 +402,14 @@ fn build_log_matcher(
     }
 
     let cache_open_res = Cache::open();
-    if verbose && cache_open_res.is_err() {
+    if verbose && cache_mode != CacheMode::Disabled && cache_open_res.is_err() {
         eprintln!("Could not find cache directory, will not cache source trees");
     }
+    let cache = cache_open_res
+        .ok()
+        .filter(|_| cache_mode != CacheMode::Disabled);
 
-    if let Ok(cache) = &cache_open_res {
+    if let Some(cache) = &cache {
         let res = log_matcher.load_from_cache(&cache, tracker);
         for err in res {
             let report = Report::new(err);
@@ -239,12 +430,12 @@ fn build_log_matcher(
         .errors
         .drain(..)
         .for_each(|err| eprintln!("{:?}", Report::new(err)));
-    if log_matcher.is_empty() {
+    if require_statements && log_matcher.is_empty() {
         return Err(LogError::NoLogStatements.into());
     }
 
-    if extract_summary.changes() > 0 {
-        if let Ok(cache) = &cache_open_res {
+    if extract_summary.changes() > 0 || cache_mode == CacheMode::ForceWrite {
+        if let Some(cache) = &cache {
             let res = log_matcher.cache_to(&cache, tracker);
             if let Err(err) = res {
                 eprintln!("{:?}", Report::new(err));
@@ -255,65 +446,58 @@ fn build_log_matcher(
     Ok(log_matcher)
 }
 
-fn main() -> miette::Result<()> {
-    let _ = miette::set_hook(Box::new(move |_| {
-        Box::new(
-            MietteHandlerOpts::new()
-                .width(env::var("COLS").unwrap_or_default().parse().unwrap_or(80))
-                .break_words(false)
-                .build(),
-        )
-    }));
+/// Build a LogMatcher for the sources given on the command line, printing progress if asked.
+fn load_log_matcher(
+    cli: &Cli,
+    cache_mode: CacheMode,
+    require_statements: bool,
+) -> miette::Result<LogMatcher> {
+    if cli.sources.is_empty() {
+        Cli::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "at least one source directory must be given with '--source <SOURCE>'",
+            )
+            .exit();
+    }
+
     let mut tracker = ProgressTracker::new();
+    let listener_thread = cli.verbose.then(|| spawn_progress_listener(&mut tracker));
+    let cache_mode = if cli.no_cache {
+        match cache_mode {
+            CacheMode::ForceWrite => CacheMode::ForceWrite,
+            _ => CacheMode::Disabled,
+        }
+    } else {
+        cache_mode
+    };
+    let matcher_res = build_log_matcher(
+        &cli.sources,
+        cli.verbose,
+        cache_mode,
+        require_statements,
+        &tracker,
+    );
+    // Nothing else reports progress, so close the channel and wait for the listener to print
+    // the remaining updates.  Otherwise, they are lost if the program exits early.
+    drop(tracker);
+    if let Some(handle) = listener_thread {
+        let _ = handle.join();
+    }
+    matcher_res
+}
 
-    let args = Cli::parse();
-
-    let listener_thread = args.verbose.then(|| {
-        let listener = tracker.subscribe();
-        std::thread::spawn(move || {
-            let mut prefix = String::new();
-            for update in listener {
-                match update {
-                    ProgressUpdate::Step(msg) => eprintln!("{}", msg),
-                    ProgressUpdate::BeginStep(msg) => {
-                        prefix = msg;
-                    }
-                    ProgressUpdate::EndStep(msg) => {
-                        eprintln!("{}... {}", prefix, msg);
-                        prefix.clear();
-                    }
-                    ProgressUpdate::Work(info) => {
-                        // XXX Take the stdout lock so that the actual output does not interfere
-                        // with the progress bar updates on stderr.
-                        let _stdout_lock = stdout().lock();
-                        let template = if info.units == "bytes" {
-                            "{prefix}... {bar} {bytes:>10}/{total_bytes:10}"
-                        } else {
-                            "{prefix}... {bar} {pos:>7}/{len:7}"
-                        };
-                        let bar = ProgressBar::new(info.total)
-                            .with_prefix(prefix.clone())
-                            .with_style(ProgressStyle::with_template(template).unwrap());
-                        while info.is_in_progress() {
-                            bar.set_position(info.completed.load(Ordering::Relaxed));
-                            sleep(Duration::from_millis(33));
-                        }
-                        bar.finish_and_clear();
-                    }
-                }
-            }
-        })
-    });
-
-    let log_format: Option<LogFormat> = if let Some(format) = args.format {
+fn run_match(cli: &Cli, args: &MatchArgs) -> miette::Result<()> {
+    let log_format: Option<LogFormat> = if let Some(format) = &args.format {
         Some(format.as_str().try_into()?)
     } else {
         None
     };
 
-    let reader: Box<dyn io::Read> = match args.log {
-        None => Box::new(io::stdin()),
-        Some(filename) => {
+    let reader: Box<dyn io::Read> = match (&args.log, &args.message) {
+        (_, Some(message)) => Box::new(io::Cursor::new(message.clone().into_bytes())),
+        (None, None) => Box::new(io::stdin()),
+        (Some(filename), None) => {
             let path = PathBuf::from(filename);
             match fs::File::open(&path) {
                 Ok(file) => Box::new(file),
@@ -328,18 +512,14 @@ fn main() -> miette::Result<()> {
         }
     };
 
-    let matcher_res = build_log_matcher(&args.sources, args.verbose, &tracker);
-    // Nothing else reports progress, so close the channel and wait for the listener to print
-    // the remaining updates.  Otherwise, they are lost if the program exits early.
-    drop(tracker);
-    if let Some(handle) = listener_thread {
-        let _ = handle.join();
-    }
-    let log_matcher = matcher_res?;
+    let log_matcher = load_log_matcher(cli, CacheMode::ReadWrite, true)?;
 
     let start = args.start.unwrap_or(0);
     let count = args.count.unwrap_or(usize::MAX);
-    let mut accumulator = MessageAccumulator::new(log_matcher, log_format, count);
+    let match_options = LogMatchOptions {
+        extract_variables: !args.no_vars,
+    };
+    let mut accumulator = MessageAccumulator::new(log_matcher, log_format, match_options, count);
 
     let reader = BufReader::new(reader);
     for (lineno, line_res) in reader.lines().skip(start).enumerate() {
@@ -369,4 +549,217 @@ fn main() -> miette::Result<()> {
     }
 
     accumulator.eof()
+}
+
+/// Escape the characters that would break up a TSV row.
+fn escape_tsv(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
+    let log_matcher = load_log_matcher(cli, CacheMode::ReadWrite, true)?;
+
+    let mut statements: Vec<&SourceRef> = match &args.file {
+        Some(path) => {
+            let Some(found) = log_matcher.find_file(path) else {
+                return Err(miette!("cannot find source file \"{}\"", path.display()));
+            };
+            log_matcher
+                .find_source_file_statements(&found)
+                .into_iter()
+                .flat_map(|sif| sif.statements())
+                .collect()
+        }
+        None => log_matcher.statements().collect(),
+    };
+    statements.retain(|stmt| {
+        (args.level.is_empty() || args.level.contains(&stmt.level))
+            && (args.lang.is_empty() || args.lang.contains(&stmt.language))
+    });
+    statements.sort_by(|lhs, rhs| {
+        (&lhs.source_path, lhs.line_no, lhs.column).cmp(&(
+            &rhs.source_path,
+            rhs.line_no,
+            rhs.column,
+        ))
+    });
+
+    if args.summary {
+        let mut by_language: BTreeMap<&str, BTreeMap<String, usize>> = BTreeMap::new();
+        for stmt in &statements {
+            *by_language
+                .entry(stmt.language.as_str())
+                .or_default()
+                .entry(format!("{:?}", stmt.level))
+                .or_default() += 1;
+        }
+        let files: BTreeSet<&str> = statements
+            .iter()
+            .map(|stmt| stmt.source_path.as_str())
+            .collect();
+        let summary = json!({
+            "statements": statements.len(),
+            "files": files.len(),
+            "byLanguage": by_language,
+        });
+        println!(
+            "{}",
+            get_colored_formatter()
+                .to_colored_json_auto(&summary)
+                .unwrap()
+        );
+        return Ok(());
+    }
+
+    let mut out = stdout().lock();
+    for stmt in statements {
+        let line = match args.output {
+            StatementsOutput::Json => get_colored_formatter().to_colored_json_auto(stmt).unwrap(),
+            StatementsOutput::Tsv => format!(
+                "{}\t{}\t{:?}\t{}\t{}",
+                escape_tsv(&stmt.source_path),
+                stmt.line_no,
+                stmt.level,
+                escape_tsv(&stmt.name),
+                escape_tsv(&stmt.text)
+            ),
+        };
+        if writeln!(out, "{}", line).is_err() {
+            // The reader went away, like when piping to `head`.
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_locate(cli: &Cli, args: &LocateArgs) -> miette::Result<()> {
+    let log_matcher = load_log_matcher(cli, CacheMode::ReadWrite, false)?;
+
+    for path in &args.paths {
+        let found = log_matcher.find_file(path);
+        let result = json!({
+            "path": path.to_string_lossy(),
+            "file": found.map(|found| found.to_string_lossy().to_string()),
+        });
+        println!(
+            "{}",
+            get_colored_formatter()
+                .to_colored_json_auto(&result)
+                .unwrap()
+        );
+    }
+
+    Ok(())
+}
+
+/// The paths of the entries in the cache, or only the ones for the given sources.
+fn cache_entries(cache: &Cache, sources: &[String]) -> Vec<PathBuf> {
+    if !sources.is_empty() {
+        return sources
+            .iter()
+            .map(|source| cache.entry_path(Path::new(source)))
+            .filter(|path| path.is_file())
+            .collect();
+    }
+
+    let Ok(dir) = fs::read_dir(&cache.location) else {
+        return vec![];
+    };
+    let mut retval: Vec<PathBuf> = dir
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("cache."))
+        })
+        .collect();
+    retval.sort();
+    retval
+}
+
+/// Print the header of each cache entry.
+fn list_cache_entries(cache: &Cache, sources: &[String]) -> miette::Result<()> {
+    let current_revision = serde_json::to_value(Revision::Current).into_diagnostic()?;
+    for entry_path in cache_entries(cache, sources) {
+        let header = fs::File::open(&entry_path)
+            .ok()
+            .and_then(|file| BufReader::new(file).lines().next())
+            .and_then(|line| line.ok())
+            .and_then(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+            .unwrap_or_default();
+        let size = fs::metadata(&entry_path).map_or(0, |meta| meta.len());
+        let revision = header.get("revision").cloned().unwrap_or_default();
+        let result = json!({
+            "entry": entry_path.to_string_lossy(),
+            "root": header.get("path"),
+            "revision": revision,
+            "timestamp": header.get("timestamp"),
+            "size": size,
+            "stale": revision != current_revision,
+        });
+        println!(
+            "{}",
+            get_colored_formatter()
+                .to_colored_json_auto(&result)
+                .unwrap()
+        );
+    }
+
+    Ok(())
+}
+
+fn run_cache(cli: &Cli, command: &CacheCommand) -> miette::Result<()> {
+    let cache = Cache::open()?;
+    match command {
+        CacheCommand::Path => {
+            println!("{}", cache.location.display());
+        }
+        CacheCommand::List => {
+            list_cache_entries(&cache, &cli.sources)?;
+        }
+        CacheCommand::Update => {
+            load_log_matcher(cli, CacheMode::ForceWrite, false)?;
+            list_cache_entries(&cache, &cli.sources)?;
+        }
+        CacheCommand::Clear => {
+            for entry_path in cache_entries(&cache, &cli.sources) {
+                fs::remove_file(&entry_path).map_err(|err| LogError::FailedToWriteCache {
+                    source: Arc::new(err),
+                })?;
+                if cli.verbose {
+                    eprintln!("Removed {}", entry_path.display());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn main() -> miette::Result<()> {
+    let _ = miette::set_hook(Box::new(move |_| {
+        Box::new(
+            MietteHandlerOpts::new()
+                .width(env::var("COLS").unwrap_or_default().parse().unwrap_or(80))
+                .break_words(false)
+                .build(),
+        )
+    }));
+
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Command::Match(args) => run_match(&cli, args),
+        Command::Statements(args) => run_statements(&cli, args),
+        Command::Locate(args) => run_locate(&cli, args),
+        Command::Cache(command) => run_cache(&cli, command),
+    }
 }

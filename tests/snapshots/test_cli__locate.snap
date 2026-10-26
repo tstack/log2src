@@ -1,0 +1,25 @@
+---
+source: tests/test_cli.rs
+info:
+  program: log2src
+  args:
+    - locate
+    - "-d"
+    - tests/java
+    - "C:\\build\\src\\BasicWithLog.java"
+    - other/BasicWithLog.java
+  env:
+    APPDATA: /tmp/.tmp3aNhRF
+    COLS: "1000"
+    HOME: /tmp/.tmp3aNhRF
+    LOCALAPPDATA: /tmp/.tmp3aNhRF
+    USERPROFILE: /tmp/.tmp3aNhRF
+    XDG_CONFIG_HOME: /tmp/.tmp3aNhRF
+---
+success: true
+exit_code: 0
+----- stdout -----
+{"file":"{java_dir}/BasicWithLog.java","path":"C:\\build\\src\\BasicWithLog.java"}
+{"file":null,"path":"other/BasicWithLog.java"}
+
+----- stderr -----
