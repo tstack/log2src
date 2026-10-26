@@ -17,6 +17,6 @@ info:
 success: true
 exit_code: 0
 ----- stdout -----
-{"levels":{"Debug":19},"name":"debug","root":"{example_dir}","statements":19}
+{"family":null,"levels":{"Debug":19},"name":"debug","pruned":false,"root":"{example_dir}","statements":19}
 
 ----- stderr -----

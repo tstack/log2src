@@ -1251,7 +1251,7 @@ impl<'a> SourceQuery<'a> {
         leading_args
             .iter()
             .any(|arg| LogLevel::from_level_arg(arg).is_some())
-            || call_name.and_then(LogLevel::from_name).is_some()
+            || call_name.and_then(LogLevel::from_known_name).is_some()
     }
 
     fn in_function_body(node: Node) -> bool {

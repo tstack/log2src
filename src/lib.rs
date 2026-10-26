@@ -7,7 +7,7 @@ use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -190,6 +190,9 @@ pub struct StatementsInFile {
     /// The statements with a string-literal message.  Use `statements()` to also get the ones
     /// whose message is a constant.
     log_statements: Vec<SourceRef>,
+    /// The level of each of `log_statements` when it was extracted, before the levels of
+    /// calls that don't look like logging were pruned by `SourceTree::prune_log_calls()`.
+    walked_levels: Vec<LogLevel>,
     /// The statements whose message is a constant.  The constants are usually defined in other
     /// files, so these are rebuilt by `SourceTree::resolve_message_refs()` instead of cached.
     #[serde(skip)]
@@ -255,9 +258,80 @@ pub struct SourceTree {
 pub struct LogCall {
     /// The number of statements that call it.
     pub statements: usize,
-    /// The number of statements with each level.  The level usually comes from the name of
-    /// the call, but it can also come from an argument, like `syslog(LOG_ERR, ...)`.
+    /// The number of statements with each level, before pruning.  The level usually comes
+    /// from the name of the call, but it can also come from an argument, like
+    /// `syslog(LOG_ERR, ...)`.
     pub levels: BTreeMap<LogLevel, usize>,
+    /// The prefix shared with other calls, like `ws` for `ws_debug`, if the level comes from
+    /// a prefix that might not be a logger.  See [`LogLevel::call_family`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// True if the family does not look like logging, so the statements that got their level
+    /// from the name of this call were changed to `Unknown`.
+    pub pruned: bool,
+}
+
+/// Collect the calls of the statements that have a level, which are the ones identified as
+/// logging.  Then, for the calls whose level comes from a prefix that might not be a logger,
+/// like `ws_warning`, `luaL_error`, or `zbee_append_info`, check that the calls with the same
+/// prefix have at least two levels other than `Info`.  A logger has several levels, but
+/// something like `luaL_error` raises an error and `append_info` adds text to the packet info.
+/// "info" and "message" are not counted since they are usually nouns.  The statements in a
+/// family that fails the check have their level changed to `Unknown`.
+fn prune_log_calls(mut stmts: Vec<&mut SourceRef>) -> BTreeMap<String, LogCall> {
+    let mut log_calls: BTreeMap<String, LogCall> = BTreeMap::new();
+    for stmt in &stmts {
+        let Some(call_name) = &stmt.call_name else {
+            continue;
+        };
+        if stmt.level == LogLevel::Unknown {
+            continue;
+        }
+        let log_call = log_calls
+            .entry(call_name.clone())
+            .or_insert_with(|| LogCall {
+                family: LogLevel::call_family(call_name),
+                ..LogCall::default()
+            });
+        log_call.statements += 1;
+        *log_call.levels.entry(stmt.level).or_default() += 1;
+    }
+    let mut family_levels: HashMap<&str, BTreeSet<LogLevel>> = HashMap::new();
+    for log_call in log_calls.values() {
+        if let Some(family) = &log_call.family {
+            family_levels.entry(family.as_str()).or_default().extend(
+                log_call
+                    .levels
+                    .keys()
+                    .filter(|level| **level != LogLevel::Info),
+            );
+        }
+    }
+    let pruned_families: HashSet<String> = family_levels
+        .into_iter()
+        .filter(|(_, levels)| levels.len() < 2)
+        .map(|(family, _)| family.to_string())
+        .collect();
+    for log_call in log_calls.values_mut() {
+        log_call.pruned = log_call
+            .family
+            .as_ref()
+            .is_some_and(|family| pruned_families.contains(family));
+    }
+    for stmt in stmts.iter_mut() {
+        let Some(call_name) = &stmt.call_name else {
+            continue;
+        };
+        // A level from an argument, like `syslog(LOG_ERR, ...)`, is kept.
+        let pruned = log_calls
+            .get(call_name)
+            .is_some_and(|log_call| log_call.pruned)
+            && LogLevel::from_name(call_name) == Some(stmt.level);
+        if pruned {
+            stmt.level = LogLevel::Unknown;
+        }
+    }
+    log_calls
 }
 
 /// Maps a file name and line number from a log message to the statements that matched it.
@@ -302,25 +376,24 @@ impl SourceTree {
         summary
     }
 
-    /// Collect the calls of the statements that have a level, which are the ones identified as
-    /// logging.
-    fn collect_log_calls(&mut self) {
-        self.log_calls.clear();
+    /// Collect the logging calls under this root and prune the levels of the ones that don't
+    /// look like logging, see `prune_log_calls()`.  This needs to be redone whenever any file
+    /// changes, since the decision depends on the calls in all of the files.
+    fn prune_log_calls(&mut self) {
         let stmts = self
             .files_with_statements
-            .values()
-            .flat_map(|sif| sif.statements());
-        for stmt in stmts {
-            let Some(call_name) = &stmt.call_name else {
-                continue;
-            };
-            if stmt.level == LogLevel::Unknown {
-                continue;
-            }
-            let log_call = self.log_calls.entry(call_name.clone()).or_default();
-            log_call.statements += 1;
-            *log_call.levels.entry(stmt.level).or_default() += 1;
-        }
+            .values_mut()
+            .flat_map(|sif| {
+                // Start over from the levels the statements were extracted with.
+                for (stmt, level) in sif.log_statements.iter_mut().zip(&sif.walked_levels) {
+                    stmt.level = *level;
+                }
+                sif.log_statements
+                    .iter_mut()
+                    .chain(sif.resolved_statements.iter_mut())
+            })
+            .collect();
+        self.log_calls = prune_log_calls(stmts);
     }
 
     fn rebuild_prefilter(&mut self) {
@@ -640,7 +713,7 @@ impl LogMatcher {
             });
         }
         decoded_root.resolve_message_refs();
-        decoded_root.collect_log_calls();
+        decoded_root.prune_log_calls();
         decoded_root.rebuild_prefilter();
         Ok(decoded_root)
     }
@@ -886,7 +959,7 @@ impl LogMatcher {
             ref_summary.resolved += summary.resolved;
             ref_summary.not_found += summary.not_found;
             ref_summary.no_text += summary.no_text;
-            coll.collect_log_calls();
+            coll.prune_log_calls();
             coll.rebuild_prefilter();
         });
         let mut found = format!("{} found", self.statements().count());
@@ -1921,6 +1994,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                 Some(StatementsInFile {
                     path: code.filename.clone(),
                     id: code.info.id,
+                    walked_levels: matched.iter().map(|stmt| stmt.level).collect(),
                     log_statements: matched,
                     resolved_statements: vec![],
                     constants: symbols.constants,
@@ -4907,29 +4981,44 @@ def main(x, t, pct):
 
     fn extract_levels(path: &str, source: &str) -> Vec<(String, LogLevel)> {
         let code = CodeSource::from_string(Path::new(path), source);
-        extract_logging(&[code], &ProgressTracker::new())
+        let mut sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements
+            .unwrap();
+        prune_log_calls(sif.log_statements.iter_mut().collect());
+        sif.log_statements
             .into_iter()
             .map(|src_ref| (src_ref.text, src_ref.level))
             .collect()
     }
 
     #[test]
-    fn test_collect_log_calls() {
-        let code = CodeSource::from_string(
-            Path::new("in-mem.c"),
-            r#"
+    fn test_prune_log_calls() {
+        let codes = [
+            CodeSource::from_string(
+                Path::new("a.c"),
+                r#"
 int main(int argc, char *argv[]) {
     log_debug("first debug message %d", argc);
-    log_debug("second debug message");
     syslog(LOG_ERR, "syslog error message");
     syslog(LOG_INFO, "syslog info message");
     printf("plain message\n");
+    ws_debug("ws debug message");
+    ws_info("ws info message");
+    luaL_error(L, "lua error message");
 }
 "#,
-        );
+            ),
+            CodeSource::from_string(
+                Path::new("b.c"),
+                r#"
+void dissect(void) {
+    ws_warning("ws warn message");
+    dissect_error("dissect error message");
+    dissect_info("dissect info message");
+}
+"#,
+            ),
+        ];
         let mut tree = SourceTree {
             tree: SourceHierTree::from(Path::new("in-mem")),
             files_with_statements: HashMap::new(),
@@ -4938,27 +5027,79 @@ int main(int argc, char *argv[]) {
             line_cache: RwLock::default(),
             log_calls: BTreeMap::new(),
         };
-        for sif in extract_logging(&[code], &ProgressTracker::new()) {
+        for sif in extract_logging(&codes, &ProgressTracker::new()) {
             tree.files_with_statements.insert(sif.id, sif);
         }
-        tree.collect_log_calls();
-        let found: Vec<(&str, usize, Vec<(LogLevel, usize)>)> = tree
+        // Pruning again, like after a file changes, starts over from the extracted levels.
+        tree.prune_log_calls();
+        tree.prune_log_calls();
+        let found: Vec<(&str, Vec<(LogLevel, usize)>, Option<&str>, bool)> = tree
             .log_calls
             .iter()
             .map(|(name, log_call)| {
                 (
                     name.as_str(),
-                    log_call.statements,
                     log_call.levels.clone().into_iter().collect(),
+                    log_call.family.as_deref(),
+                    log_call.pruned,
                 )
             })
             .collect();
-        // `printf` has no level, so it is not identified as logging.
+        // `printf` has no level, so it is not identified as logging.  The `ws` family has two
+        // levels other than `Info`, but `dissect` and `luaL` only have one.
         assert_eq!(
             found,
             vec![
-                ("log_debug", 2, vec![(LogLevel::Debug, 2)]),
-                ("syslog", 2, vec![(LogLevel::Info, 1), (LogLevel::Error, 1)]),
+                (
+                    "dissect_error",
+                    vec![(LogLevel::Error, 1)],
+                    Some("dissect"),
+                    true
+                ),
+                (
+                    "dissect_info",
+                    vec![(LogLevel::Info, 1)],
+                    Some("dissect"),
+                    true
+                ),
+                ("log_debug", vec![(LogLevel::Debug, 1)], None, false),
+                (
+                    "luaL_error",
+                    vec![(LogLevel::Error, 1)],
+                    Some("lua_l"),
+                    true
+                ),
+                (
+                    "syslog",
+                    vec![(LogLevel::Info, 1), (LogLevel::Error, 1)],
+                    None,
+                    false
+                ),
+                ("ws_debug", vec![(LogLevel::Debug, 1)], Some("ws"), false),
+                ("ws_info", vec![(LogLevel::Info, 1)], Some("ws"), false),
+                ("ws_warning", vec![(LogLevel::Warn, 1)], Some("ws"), false),
+            ]
+        );
+        let mut levels: Vec<(&str, LogLevel)> = tree
+            .files_with_statements
+            .values()
+            .flat_map(|sif| sif.statements())
+            .map(|stmt| (stmt.text.as_str(), stmt.level))
+            .collect();
+        levels.sort();
+        assert_eq!(
+            levels,
+            vec![
+                ("\"dissect error message\"", LogLevel::Unknown),
+                ("\"dissect info message\"", LogLevel::Unknown),
+                ("\"first debug message %d\"", LogLevel::Debug),
+                ("\"lua error message\"", LogLevel::Unknown),
+                ("\"plain message\\n\"", LogLevel::Unknown),
+                ("\"syslog error message\"", LogLevel::Error),
+                ("\"syslog info message\"", LogLevel::Info),
+                ("\"ws debug message\"", LogLevel::Debug),
+                ("\"ws info message\"", LogLevel::Info),
+                ("\"ws warn message\"", LogLevel::Warn),
             ]
         );
     }

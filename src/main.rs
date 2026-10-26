@@ -601,6 +601,8 @@ fn run_calls(cli: &Cli) -> miette::Result<()> {
                 "name": name,
                 "statements": log_call.statements,
                 "levels": log_call.levels,
+                "family": log_call.family,
+                "pruned": log_call.pruned,
             });
             if !print_json(&result) {
                 return Ok(());

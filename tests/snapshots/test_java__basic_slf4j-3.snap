@@ -25,4 +25,4 @@ exit_code: 0
 
 ----- stderr -----
   ⚠ failed to read cache file "cache.XXX"
-  ╰─▶ Io { inner: Error { kind: UnexpectedEof, message: "failed to fill whole buffer" }, additional: 1 }
+  ╰─▶ Io { inner: Error { kind: UnexpectedEof, message: "failed to fill whole buffer" }, additional: 11 }
