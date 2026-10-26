@@ -1,0 +1,25 @@
+---
+source: tests/test_cli.rs
+info:
+  program: log2src
+  args:
+    - statements
+    - "-d"
+    - tests
+    - "--lang"
+    - "KOTLIN,cpp"
+    - "--summary"
+  env:
+    APPDATA: /tmp/.tmplWEefI
+    COLS: "1000"
+    HOME: /tmp/.tmplWEefI
+    LOCALAPPDATA: /tmp/.tmplWEefI
+    USERPROFILE: /tmp/.tmplWEefI
+    XDG_CONFIG_HOME: /tmp/.tmplWEefI
+---
+success: true
+exit_code: 0
+----- stdout -----
+{"byLanguage":{"Kotlin":{"Debug":1,"Info":3}},"files":1,"statements":4}
+
+----- stderr -----

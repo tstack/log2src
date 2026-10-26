@@ -1,0 +1,24 @@
+---
+source: tests/test_cli.rs
+info:
+  program: log2src
+  args:
+    - statements
+    - "-d"
+    - examples
+    - "--file"
+    - nope.rs
+  env:
+    APPDATA: /tmp/.tmpxt2ul8
+    COLS: "1000"
+    HOME: /tmp/.tmpxt2ul8
+    LOCALAPPDATA: /tmp/.tmpxt2ul8
+    USERPROFILE: /tmp/.tmpxt2ul8
+    XDG_CONFIG_HOME: /tmp/.tmpxt2ul8
+---
+success: false
+exit_code: 1
+----- stdout -----
+
+----- stderr -----
+Error:   × cannot find source file "nope.rs"

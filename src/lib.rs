@@ -134,6 +134,12 @@ impl Cache {
         let location = project_dirs.cache_dir().to_path_buf();
         Ok(Cache { location })
     }
+
+    /// The path of the entry that holds the log statements for the given source root.
+    pub fn entry_path(&self, root: &Path) -> PathBuf {
+        let root = root.canonicalize().unwrap_or(root.to_owned());
+        self.location.join(to_cached_name(&root))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -920,11 +926,12 @@ impl LogMatcher {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Copy, Clone, Serialize, Deserialize, clap::ValueEnum)]
 pub enum SourceLanguage {
     Rust,
     Java,
     #[serde(rename = "C++")]
+    #[value(alias = "c++")]
     Cpp,
     Python,
     Kotlin,

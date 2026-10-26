@@ -1,0 +1,27 @@
+---
+source: tests/test_cli.rs
+info:
+  program: log2src
+  args:
+    - statements
+    - "-d"
+    - examples
+    - "--file"
+    - basic.rs
+  env:
+    APPDATA: /tmp/.tmpFyp3zN
+    COLS: "1000"
+    HOME: /tmp/.tmpFyp3zN
+    LOCALAPPDATA: /tmp/.tmpFyp3zN
+    USERPROFILE: /tmp/.tmpFyp3zN
+    XDG_CONFIG_HOME: /tmp/.tmpFyp3zN
+---
+success: true
+exit_code: 0
+----- stdout -----
+{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":6,"endLineNumber":6,"column":11,"name":"main","qualifiedName":"main","blockId":42,"text":"\"Hello from main\"","level":"Debug","quality":13,"pattern":"(?s)^Hello from main$","args":[],"argKinds":[],"vars":[],"varKinds":[],"kinds":[],"segments":["Hello from main"]}
+{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"foo","qualifiedName":"foo","blockId":186,"text":"\"Hello from foo i={}\"","level":"Debug","quality":14,"pattern":"(?s)^Hello from foo i=(.*)$","args":["Placeholder"],"argKinds":["Any"],"vars":["i"],"varKinds":["Any"],"kinds":["Any"],"segments":["Hello from foo i=",""]}
+{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":19,"endLineNumber":19,"column":11,"name":"bar","qualifiedName":"bar","blockId":244,"text":"\"Hello from bar j={j}\"","level":"Debug","quality":14,"pattern":"(?s)^Hello from bar j=(.*)$","args":[{"Named":"j"}],"argKinds":["Any"],"vars":[],"varKinds":[],"kinds":["Any"],"segments":["Hello from bar j=",""]}
+{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":23,"endLineNumber":23,"column":11,"name":"baz","qualifiedName":"baz","blockId":308,"text":"\"Hello from baz i={1} j={0}\"","level":"Debug","quality":16,"pattern":"(?s)^Hello from baz i=(.*) j=(.*)$","args":[{"Positional":1},{"Positional":0}],"argKinds":["Any","Any"],"vars":["j","i"],"varKinds":["Any","Any"],"kinds":["Any","Any"],"segments":["Hello from baz i="," j=",""]}
+
+----- stderr -----

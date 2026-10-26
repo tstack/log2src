@@ -5,13 +5,17 @@ expression: events
 - NewFile:
     - test_rust.rs
     - language: Rust
-      id: 9
+      id: 10
 - NewFile:
     - test_kotlin.rs
     - language: Rust
-      id: 8
+      id: 9
 - NewFile:
     - test_java.rs
+    - language: Rust
+      id: 8
+- NewFile:
+    - test_cli.rs
     - language: Rust
       id: 7
 - NewFile:

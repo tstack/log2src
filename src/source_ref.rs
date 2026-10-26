@@ -15,7 +15,7 @@ pub enum FormatArgument {
 }
 
 /// The normalized level of a log statement, derived from the name of the logging call.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq, clap::ValueEnum)]
 pub enum LogLevel {
     Trace,
     Debug,
