@@ -3,12 +3,13 @@ use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser as ClapParse
 use colored_json::{ColoredFormatter, CompactFormatter, Styler};
 use indicatif::{ProgressBar, ProgressStyle};
 use log2src::{
-    Cache, LogError, LogFormat, LogLevel, LogMapping, LogMatchOptions, LogMatcher, LogRef,
+    Cache, LogCall, LogError, LogFormat, LogLevel, LogMapping, LogMatchOptions, LogMatcher, LogRef,
     LogRefBuilder, ProgressTracker, ProgressUpdate, Revision, SourceLanguage, SourceRef,
 };
 use miette::{miette, IntoDiagnostic, MietteHandlerOpts, Report};
 use serde::Serialize;
 use serde_json::json;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{stdout, BufRead, BufReader, Write};
 use std::path::Path;
@@ -591,19 +592,25 @@ fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
     Ok(())
 }
 
+/// A line of output from the `calls` sub-command.
+#[derive(Serialize)]
+struct CallOutput<'a> {
+    root: Cow<'a, str>,
+    name: &'a str,
+    #[serde(flatten)]
+    log_call: &'a LogCall,
+}
+
 fn run_calls(cli: &Cli) -> miette::Result<()> {
     let log_matcher = load_log_matcher(cli, CacheMode::ReadWrite, true)?;
 
     for (root, log_calls) in log_matcher.log_calls() {
         for (name, log_call) in log_calls {
-            let result = json!({
-                "root": root.to_string_lossy(),
-                "name": name,
-                "statements": log_call.statements,
-                "levels": log_call.levels,
-                "family": log_call.family,
-                "pruned": log_call.pruned,
-            });
+            let result = CallOutput {
+                root: root.to_string_lossy(),
+                name,
+                log_call,
+            };
             if !print_json(&result) {
                 return Ok(());
             }

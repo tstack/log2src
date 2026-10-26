@@ -45,7 +45,7 @@ impl LogLevel {
 
     /// Like [`LogLevel::from_name`], but only for names that are known to be logging on their
     /// own, without the names with a prefix that might not be a logger.
-    pub(crate) fn from_known_name(name: &str) -> Option<LogLevel> {
+    fn from_known_name(name: &str) -> Option<LogLevel> {
         Self::classify(name, false)
     }
 

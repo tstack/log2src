@@ -7,16 +7,16 @@ info:
     - "-d"
     - examples
   env:
-    APPDATA: {home}
+    APPDATA: /tmp/.tmpj3rqXc
     COLS: "1000"
-    HOME: {home}
-    LOCALAPPDATA: {home}
-    USERPROFILE: {home}
-    XDG_CONFIG_HOME: {home}
+    HOME: /tmp/.tmpj3rqXc
+    LOCALAPPDATA: /tmp/.tmpj3rqXc
+    USERPROFILE: /tmp/.tmpj3rqXc
+    XDG_CONFIG_HOME: /tmp/.tmpj3rqXc
 ---
 success: true
 exit_code: 0
 ----- stdout -----
-{"family":null,"levels":{"Debug":19},"name":"debug","pruned":false,"root":"{example_dir}","statements":19}
+{"root":"{example_dir}","name":"debug","statements":19,"levels":{"Debug":19},"pruned":false}
 
 ----- stderr -----
