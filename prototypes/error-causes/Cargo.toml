@@ -1,8 +1,0 @@
-[package]
-name = "error-causes-proto"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-log2src = { path = "../.." }
-regex = "1"
