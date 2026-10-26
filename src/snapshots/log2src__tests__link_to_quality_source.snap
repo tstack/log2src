@@ -9,6 +9,7 @@ endLineNumber: 27
 column: 11
 name: namedarg
 text: "\"Hello, {name}!\""
+level: Debug
 quality: 7
 pattern: "(?s)^Hello, (.+)!$"
 args:

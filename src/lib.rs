@@ -31,7 +31,7 @@ pub use progress::ProgressUpdate;
 pub use progress::WorkInfo;
 use source_query::QueryResult;
 pub use source_query::SourceQuery;
-pub use source_ref::SourceRef;
+pub use source_ref::{LogLevel, SourceRef};
 
 #[derive(Error, Debug, Diagnostic, Clone)]
 pub enum LogError {
@@ -254,7 +254,7 @@ impl LogMatcher {
             };
             if let Some(src_ref) = matches
                 .iter()
-                .sorted_by(|lhs, rhs| rhs.quality.cmp(&lhs.quality))
+                .sorted_by(|lhs, rhs| log_ref.compare_candidates(lhs, rhs))
                 .next()
             {
                 let exception_trace = match log_ref {
@@ -419,6 +419,27 @@ impl SourceLanguage {
                         )
                         (#not-any-of? @macro-name "format" "vec")
                     )
+                    ; macros that take the level before the format string, like
+                    ; `log!(Level::Warn, "...")` or `tracing::event!(Level::INFO, "...")`
+                    (macro_invocation macro: (_) @macro-name
+                        (token_tree .
+                            (identifier) @_level . (string_literal) @log
+                        )
+                        (#match? @macro-name "(^|::)(log|event)$")
+                        (#not-eq? @_level "target")
+                    )
+                    (macro_invocation macro: (_) @macro-name
+                        (token_tree .
+                            (identifier) . (identifier) . (string_literal) @log
+                        )
+                        (#match? @macro-name "(^|::)(log|event)$")
+                    )
+                    (macro_invocation macro: (_) @macro-name
+                        (token_tree .
+                            (identifier) . (identifier) . (identifier) . (string_literal) @log
+                        )
+                        (#match? @macro-name "(^|::)(log|event)$")
+                    )
                 "#
             }
             SourceLanguage::Java => {
@@ -432,7 +453,15 @@ impl SourceLanguage {
                             (argument_list . (string_literal) @arguments)
                         ]
                         (#match? @object-name "log(ger)?|LOG(GER)?")
-                        (#match? @method-name "fine|debug|info|warn|trace|error")
+                        (#match? @method-name "fine|debug|info|warn|trace|error|severe|fatal")
+                    )
+                    ; `log.log(Level.WARNING, "...")`
+                    (method_invocation
+                        object: (identifier) @object-name
+                        name: (identifier) @method-name
+                        arguments: (argument_list . (field_access) . (string_literal) @arguments)
+                        (#match? @object-name "log(ger)?|LOG(GER)?")
+                        (#eq? @method-name "log")
                     )
                 "#
             }
@@ -462,6 +491,18 @@ impl SourceLanguage {
                         )
                       )
                     )
+                )
+                ; `logger.log(logging.WARNING, "...")`
+                (
+                    (expression_statement
+                      (call
+                        function: (_) @func
+                        arguments: (argument_list .
+                          (_) . (string) @args
+                        )
+                      )
+                    )
+                    (#match? @func "(^|\\.)log$")
                 )
                 "#
             }
@@ -632,6 +673,8 @@ pub struct LogDetails<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lineno: Option<usize>,
     #[serde(skip_serializing)]
+    pub level: Option<LogLevel>,
+    #[serde(skip_serializing)]
     pub body: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace: Option<StackTrace<'a>>,
@@ -642,6 +685,7 @@ impl<'a> LogDetails<'a> {
         self.thread.is_none()
             && self.file.is_none()
             && self.lineno.is_none()
+            && self.level.is_none()
             && self.body.is_none()
             && self.trace.is_none()
     }
@@ -666,6 +710,7 @@ impl<'a> LogRefBuilder<'a> {
                     .map(|m| m.as_str().parse::<usize>().unwrap_or_default()),
             )
             .with_thread(captures.name("thread").map(|m| m.as_str()))
+            .with_level(captures.name("level").map(|m| m.as_str()))
             .with_body(captures.name("body").map(|m| m.as_str()))
             .build(content)
     }
@@ -680,6 +725,10 @@ impl<'a> LogRefBuilder<'a> {
     }
     pub fn with_lineno(mut self, lineno: Option<usize>) -> Self {
         self.details.lineno = lineno;
+        self
+    }
+    pub fn with_level(mut self, level: Option<&'a str>) -> Self {
+        self.details.level = level.and_then(LogLevel::from_log_text);
         self
     }
 
@@ -730,12 +779,27 @@ impl<'a> LogRef<'a> {
             self.line
         }
     }
+
+    pub fn level(&self) -> Option<LogLevel> {
+        self.details.and_then(|details| details.level)
+    }
+
+    /// Order candidate source statements for this message from best to worst.  The highest
+    /// quality wins and, when the quality is the same, a statement with the same level as the
+    /// message is preferred.
+    fn compare_candidates(&self, lhs: &SourceRef, rhs: &SourceRef) -> std::cmp::Ordering {
+        let level = self.level();
+        let level_matches = |src_ref: &SourceRef| level == Some(src_ref.level);
+        rhs.quality
+            .cmp(&lhs.quality)
+            .then_with(|| level_matches(rhs).cmp(&level_matches(lhs)))
+    }
 }
 
 pub fn link_to_source<'a>(log_ref: &LogRef, src_refs: &'a [SourceRef]) -> Option<&'a SourceRef> {
     src_refs
         .iter()
-        .sorted_by(|lhs, rhs| rhs.quality.cmp(&lhs.quality))
+        .sorted_by(|lhs, rhs| log_ref.compare_candidates(lhs, rhs))
         .find(|&source_ref| source_ref.captures(log_ref.body()).is_some())
 }
 
@@ -881,6 +945,7 @@ mod tests {
             thread: None,
             file: Some("JvmPauseMonitor"),
             lineno: Some(146),
+            level: Some(LogLevel::Info),
             body: Some("JvmPauseMonitor-n0: Started"),
             trace: None,
         });
@@ -1155,6 +1220,200 @@ processing \started -- {args[0]}""")
                 value: "bar".to_string()
             },]
         );
+    }
+
+    fn extract_levels(path: &str, source: &str) -> Vec<(String, LogLevel)> {
+        let code = CodeSource::from_string(&Path::new(path), source);
+        extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements
+            .into_iter()
+            .map(|src_ref| (src_ref.text, src_ref.level))
+            .collect()
+    }
+
+    #[test]
+    fn test_levels_rust() {
+        let levels = extract_levels(
+            "in-mem.rs",
+            r#"
+fn main() {
+    trace!("trace message");
+    debug!("debug message");
+    info!("info message");
+    log::warn!("warn message");
+    tracing::error!("error message");
+    println!("plain message");
+    log::log!(Level::Warn, "log macro message");
+    tracing::event!(tracing::Level::INFO, "event macro message");
+    log!(lvl, "level variable message");
+    log!(target: "app", "target message");
+}
+"#,
+        );
+        assert_eq!(
+            levels,
+            vec![
+                ("\"trace message\"".to_string(), LogLevel::Trace),
+                ("\"debug message\"".to_string(), LogLevel::Debug),
+                ("\"info message\"".to_string(), LogLevel::Info),
+                ("\"warn message\"".to_string(), LogLevel::Warn),
+                ("\"error message\"".to_string(), LogLevel::Error),
+                ("\"plain message\"".to_string(), LogLevel::Unknown),
+                ("\"log macro message\"".to_string(), LogLevel::Warn),
+                ("\"event macro message\"".to_string(), LogLevel::Info),
+                ("\"level variable message\"".to_string(), LogLevel::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_levels_java() {
+        let levels = extract_levels(
+            "in-mem.java",
+            r#"
+class Main {
+    void run() {
+        LOG.trace("trace message");
+        log.debug("debug message");
+        logger.info("info message");
+        LOGGER.warn("warn message");
+        LOG.error("error message");
+        log.severe("severe message");
+        LOG.fatal("fatal message");
+        log.finest("finest message");
+        log.log(Level.WARNING, "level arg message");
+    }
+}
+"#,
+        );
+        assert_eq!(
+            levels,
+            vec![
+                ("\"trace message\"".to_string(), LogLevel::Trace),
+                ("\"debug message\"".to_string(), LogLevel::Debug),
+                ("\"info message\"".to_string(), LogLevel::Info),
+                ("\"warn message\"".to_string(), LogLevel::Warn),
+                ("\"error message\"".to_string(), LogLevel::Error),
+                ("\"severe message\"".to_string(), LogLevel::Error),
+                ("\"fatal message\"".to_string(), LogLevel::Fatal),
+                ("\"finest message\"".to_string(), LogLevel::Trace),
+                ("\"level arg message\"".to_string(), LogLevel::Warn),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_levels_cpp() {
+        let levels = extract_levels(
+            "in-mem.cc",
+            r#"
+int main(int argc, char* argv[]) {
+    spdlog::info("info message");
+    logger->warn("warn message");
+    SPDLOG_ERROR("error message");
+    spdlog::critical("critical message");
+    log_debug("lnav debug message");
+    log_warning("lnav warn message");
+    syslog(LOG_ERR, "syslog error message");
+    spdlog::log(spdlog::level::trace, "spdlog trace message");
+    report_error("not a log message");
+    printf("plain message");
+    log_info("conn error", "second message");
+    logger->info(err, "variable arg message");
+    logInfo("camel message");
+    errors.error("not a log message either");
+}
+"#,
+        );
+        assert_eq!(
+            levels,
+            vec![
+                ("\"info message\"".to_string(), LogLevel::Info),
+                ("\"warn message\"".to_string(), LogLevel::Warn),
+                ("\"error message\"".to_string(), LogLevel::Error),
+                ("\"critical message\"".to_string(), LogLevel::Fatal),
+                ("\"lnav debug message\"".to_string(), LogLevel::Debug),
+                ("\"lnav warn message\"".to_string(), LogLevel::Warn),
+                ("\"syslog error message\"".to_string(), LogLevel::Error),
+                ("\"spdlog trace message\"".to_string(), LogLevel::Trace),
+                ("\"not a log message\"".to_string(), LogLevel::Unknown),
+                ("\"plain message\"".to_string(), LogLevel::Unknown),
+                ("\"conn error\"".to_string(), LogLevel::Info),
+                ("\"second message\"".to_string(), LogLevel::Info),
+                ("\"variable arg message\"".to_string(), LogLevel::Info),
+                ("\"camel message\"".to_string(), LogLevel::Info),
+                (
+                    "\"not a log message either\"".to_string(),
+                    LogLevel::Unknown
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_levels_python() {
+        let levels = extract_levels(
+            "in-mem.py",
+            r#"
+def main():
+    logger.debug("debug message")
+    logging.info("info message")
+    logger.warning("warn message")
+    self.log.error("error message")
+    logger.exception("exception message")
+    logger.critical("critical message")
+    print("plain message")
+    warnings.warn("deprecated message")
+    parser.error("bad arg message")
+    logger.log(logging.WARNING, "level arg message")
+    logging.log(level, "level variable message")
+"#,
+        );
+        assert_eq!(
+            levels,
+            vec![
+                ("\"debug message\"".to_string(), LogLevel::Debug),
+                ("\"info message\"".to_string(), LogLevel::Info),
+                ("\"warn message\"".to_string(), LogLevel::Warn),
+                ("\"error message\"".to_string(), LogLevel::Error),
+                ("\"exception message\"".to_string(), LogLevel::Error),
+                ("\"critical message\"".to_string(), LogLevel::Fatal),
+                ("\"plain message\"".to_string(), LogLevel::Unknown),
+                ("\"deprecated message\"".to_string(), LogLevel::Unknown),
+                ("\"bad arg message\"".to_string(), LogLevel::Unknown),
+                ("\"level arg message\"".to_string(), LogLevel::Warn),
+                ("\"level variable message\"".to_string(), LogLevel::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_link_to_source_by_level() {
+        let code = CodeSource::from_string(
+            &Path::new("in-mem.rs"),
+            r#"
+fn main() {
+    debug!("retry");
+    warn!("retry");
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let log_format: LogFormat = r"^(?<level>\w+) (?<body>.*)$".try_into().unwrap();
+        for (line, expected) in [
+            ("DEBUG retry", LogLevel::Debug),
+            ("WARN retry", LogLevel::Warn),
+        ] {
+            let log_ref =
+                LogRefBuilder::new().build_from_captures(log_format.captures(line).unwrap(), line);
+            let result = link_to_source(&log_ref, &src_refs).unwrap();
+            assert_eq!(result.level, expected, "{line}");
+        }
     }
 
     const TRACE: &str = r#"JvmPauseMonitor-n0: Started

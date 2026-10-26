@@ -9,6 +9,7 @@ expression: src_refs
   column: 13
   name: run
   text: "\"{}: Started\""
+  level: Info
   quality: 8
   pattern: "(?s)^(.+): Started$"
   args:
@@ -22,6 +23,7 @@ expression: src_refs
   column: 15
   name: run
   text: "\"{}: Stopped\""
+  level: Info
   quality: 8
   pattern: "(?s)^(.+): Stopped$"
   args:
