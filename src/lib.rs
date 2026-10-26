@@ -1080,7 +1080,8 @@ impl SourceLanguage {
                         (token_tree .
                             (string_literal) @log
                         )
-                        (#not-any-of? @macro-name "format" "vec")
+                        ; standard macros that build strings or read files at compile time
+                        (#not-match? @macro-name "(^|::)(format|vec|env|option_env|include|include_str|include_bytes|concat|stringify|compile_error)$")
                     )
                     ; macros that take the level before the format string, like
                     ; `log!(Level::Warn, "...")` or `tracing::event!(Level::INFO, "...")`
@@ -3283,21 +3284,25 @@ class Server:
 
     #[test]
     fn test_name_outside_function() {
-        // Statements outside of a function should not be named after the whole file.
+        // Statements outside of a function should not be named after the whole file, and
+        // compile-time macros, like `env!()`, are not logging.
         let source = r#"
 const VERSION: &str = env!("VERSION");
 static DEFAULTS: &str = include_str!("defaults.toml");
+static CONFIG: LazyLock<Config> = LazyLock::new(|| {
+    info!("loading config");
+    Config::load(concat!("a", "b"))
+});
 mod net {
-    const NAME: &str = env!("NAME");
+    static NAME: LazyLock<String> = LazyLock::new(|| {
+        debug!("naming");
+        std::env!("NAME").to_string()
+    });
 }
 "#;
         assert_eq!(
             qualified_names("in-mem.rs", source),
-            pairs(&[
-                ("VERSION", "VERSION"),
-                ("DEFAULTS", "DEFAULTS"),
-                ("NAME", "net::NAME"),
-            ])
+            pairs(&[("CONFIG", "CONFIG"), ("NAME", "net::NAME")])
         );
     }
 
