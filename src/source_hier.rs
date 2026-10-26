@@ -703,9 +703,9 @@ mod test {
         let tests_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
         let temp_test_dir = setup_test_environment(&tests_path);
         fs::create_dir(temp_test_dir.path().join(".git")).unwrap();
-        let _ = File::create_new(temp_test_dir.path().join(".git/config"))
+        File::create_new(temp_test_dir.path().join(".git/config"))
             .unwrap()
-            .write("abc".as_bytes())
+            .write_all("abc".as_bytes())
             .unwrap();
         let basic_path = temp_test_dir.path().join("tests/java/Basic.java");
         {
@@ -734,15 +734,15 @@ mod test {
         let no_events: Vec<ScanEvent> = tree.scan().map(redact_event).collect();
         assert_yaml_snapshot!(no_events);
         fs::remove_file(temp_test_dir.path().join("tests/test_java.rs")).unwrap();
-        let _ = File::create(temp_test_dir.path().join("new.rs"))
+        File::create(temp_test_dir.path().join("new.rs"))
             .unwrap()
-            .write("abc".as_bytes())
+            .write_all("abc".as_bytes())
             .unwrap();
-        let _ = File::options()
+        File::options()
             .append(true)
             .open(&basic_path)
             .unwrap()
-            .write("def".as_bytes())
+            .write_all("def".as_bytes())
             .unwrap();
         tree.sync();
         let new_and_updated_events: Vec<ScanEvent> = tree.scan().map(redact_event).collect();

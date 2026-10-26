@@ -452,6 +452,7 @@ fn compare_candidates(
 
 /// Collection of root paths to their tree of source files
 /// that contain log statements.
+#[derive(Default)]
 pub struct LogMatcher {
     roots: HashMap<PathBuf, SourceTree>,
 }
@@ -494,18 +495,10 @@ impl ExtractLogSummary {
     }
 }
 
-impl Default for LogMatcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl LogMatcher {
     /// Create an empty LogMatcher
     pub fn new() -> Self {
-        Self {
-            roots: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Find a file, in any language, under one of the roots.  The file with the same name that
@@ -914,7 +907,7 @@ impl LogMatcher {
                         trace: Some(trace), ..
                     }),
                 ..
-            } => trace.to_exception_trace(self),
+            } => trace.exception_call_sites(self),
             _ => Vec::new(),
         };
         let variables = if options.extract_variables {
@@ -1370,7 +1363,7 @@ pub struct StackTrace<'a> {
 }
 
 impl<'a> StackTrace<'a> {
-    fn to_exception_trace(self, log_matcher: &LogMatcher) -> Vec<CallSite> {
+    fn exception_call_sites(&self, log_matcher: &LogMatcher) -> Vec<CallSite> {
         let mut retval = Vec::new();
         match self.language {
             SourceLanguage::Rust => {}
@@ -1441,21 +1434,14 @@ impl<'a> LogDetails<'a> {
     }
 }
 
+#[derive(Default)]
 pub struct LogRefBuilder<'a> {
     details: LogDetails<'a>,
 }
 
-impl<'a> Default for LogRefBuilder<'a> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<'a> LogRefBuilder<'a> {
     pub fn new() -> Self {
-        Self {
-            details: Default::default(),
-        }
+        Self::default()
     }
 
     pub fn build_from_captures(self, captures: Captures<'a>, content: &'a str) -> LogRef<'a> {
@@ -1734,7 +1720,11 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                         });
                         args_target = ArgsTarget::MessageRef;
                     }
-                    "args" | "this" if !matches!(args_target, ArgsTarget::None) => {
+                    // Arguments are only kept for the message that precedes them.
+                    "args" | "this" => {
+                        if matches!(args_target, ArgsTarget::None) {
+                            continue;
+                        }
                         let range = result.range;
                         let source = code.buffer.as_str();
                         let text = source[range.start_byte..range.end_byte].to_string();
@@ -4653,7 +4643,7 @@ java.lang.IllegalStateException: simulated failure for demo
             content,
         };
         let trace: Vec<_> = stacktrace
-            .to_exception_trace(&log_matcher)
+            .exception_call_sites(&log_matcher)
             .into_iter()
             .map(|site| (site.name, site.language, site.line_no))
             .collect();
@@ -4802,7 +4792,7 @@ java.lang.IllegalStateException: simulated failure for demo
             content,
         };
         let trace: Vec<_> = stacktrace
-            .to_exception_trace(&log_matcher)
+            .exception_call_sites(&log_matcher)
             .into_iter()
             .map(|site| {
                 (
@@ -4845,7 +4835,7 @@ ZeroDivisionError: division by zero
         };
 
         let log_matcher = LogMatcher::new();
-        let trace = stacktrace.to_exception_trace(&log_matcher);
+        let trace = stacktrace.exception_call_sites(&log_matcher);
         assert_yaml_snapshot!(trace);
     }
 }
