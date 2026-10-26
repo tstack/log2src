@@ -34,6 +34,7 @@ pub struct ProgressListener {
 }
 
 /// A mechanism for tracking progress.
+#[derive(Default)]
 pub struct ProgressTracker {
     subscribers: Vec<Sender<ProgressUpdate>>,
 }
@@ -85,9 +86,7 @@ impl Drop for WorkGuard {
 impl ProgressTracker {
     /// Create an empty tracker.
     pub fn new() -> ProgressTracker {
-        ProgressTracker {
-            subscribers: vec![],
-        }
+        Self::default()
     }
 
     /// Notify subscribers of a step in a process.

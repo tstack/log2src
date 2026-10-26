@@ -95,7 +95,7 @@ pub struct SourceFileInfo {
 impl SourceFileInfo {
     // Allow the ID counter to be set for a thread from the SourceHierTree.
     thread_local! {
-        static NEXT_ID: RefCell<usize> = RefCell::new(0);
+        static NEXT_ID: RefCell<usize> = const { RefCell::new(0) };
     }
 
     pub fn new(language: SourceLanguage) -> Self {
@@ -176,7 +176,7 @@ impl SourceHierContent {
                 if meta.is_dir() {
                     Self::from_dir(path, gi)
                 } else if meta.is_file() {
-                    match SourceLanguage::from_path(&path) {
+                    match SourceLanguage::from_path(path) {
                         Some(language) => match meta.modified() {
                             Ok(last_modified_time) => Self::File {
                                 info: SourceFileInfo::new(language),
@@ -287,7 +287,7 @@ impl SourceHierContent {
                     for (name, meta) in latest_entries {
                         let child_path = path.join(&name);
                         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                        if is_ignored_dir(&name.as_os_str()) || gi.is_ignored(&child_path, is_dir) {
+                        if is_ignored_dir(name.as_os_str()) || gi.is_ignored(&child_path, is_dir) {
                             // The entry might have been ignored since the last sync.
                             if let Some(node) = entries.remove(&name) {
                                 node.deleted(path, &name, deleted_events);
@@ -360,7 +360,7 @@ impl SourceHierNode {
                         content: SourceHierContent::from_dir(path, gi),
                     }
                 } else if meta.is_file() {
-                    match SourceLanguage::from_path(&path) {
+                    match SourceLanguage::from_path(path) {
                         Some(language) => match meta.modified() {
                             Ok(last_modified_time) => Self {
                                 last_scan_time: None,
@@ -420,7 +420,7 @@ impl SourceHierNode {
             SourceHierContent::Directory { entries } => {
                 let dir_path = path.join(name);
                 for (child_name, node) in entries {
-                    node.deleted(&dir_path, &child_name, deleted_events);
+                    node.deleted(&dir_path, child_name, deleted_events);
                 }
             }
             SourceHierContent::Error { .. } => {}
@@ -463,7 +463,7 @@ impl Iterator for TreeScanner<'_> {
     type Item = ScanEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(event) = self.deleted_events.pop() {
+        if let Some(event) = self.deleted_events.pop() {
             return Some(event);
         }
         while let Some(cursor) = self.stack.pop() {
@@ -478,7 +478,7 @@ impl Iterator for TreeScanner<'_> {
                 SourceHierContent::Directory { ref mut entries } => {
                     for child in entries.iter_mut() {
                         self.stack.push(TreeCursorMut {
-                            curr_path: cursor.curr_path.join(&child.0),
+                            curr_path: cursor.curr_path.join(child.0),
                             curr_node: child.1,
                         });
                     }
@@ -540,7 +540,7 @@ impl SourceHierTree {
     /// Scan the tree for changes that have happened since the last scan.  Changes to the tree
     /// are introduced by the sync() method.
     pub fn scan(&'_ mut self) -> TreeScanner<'_> {
-        let deleted_events = std::mem::replace(&mut self.deleted_events, Vec::new());
+        let deleted_events = std::mem::take(&mut self.deleted_events);
         TreeScanner {
             deleted_events,
             stack: vec![TreeCursorMut {
@@ -702,15 +702,17 @@ mod test {
     fn test_with_resources_dir() {
         let tests_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
         let temp_test_dir = setup_test_environment(&tests_path);
-        let _ = fs::create_dir(temp_test_dir.path().join(".git")).unwrap();
-        let _ = File::create_new(temp_test_dir.path().join(".git/config"))
+        fs::create_dir(temp_test_dir.path().join(".git")).unwrap();
+        File::create_new(temp_test_dir.path().join(".git/config"))
             .unwrap()
-            .write("abc".as_bytes())
+            .write_all("abc".as_bytes())
             .unwrap();
         let basic_path = temp_test_dir.path().join("tests/java/Basic.java");
         {
             let metadata = fs::metadata(&basic_path).unwrap();
             let mut perms = metadata.permissions();
+            // Only the test's own temporary copy is made writable.
+            #[allow(clippy::permissions_set_readonly_false)]
             perms.set_readonly(false);
             fs::set_permissions(&basic_path, perms).unwrap();
         }
@@ -731,21 +733,21 @@ mod test {
         );
         let no_events: Vec<ScanEvent> = tree.scan().map(redact_event).collect();
         assert_yaml_snapshot!(no_events);
-        let _ = fs::remove_file(temp_test_dir.path().join("tests/test_java.rs")).unwrap();
-        let _ = File::create(temp_test_dir.path().join("new.rs"))
+        fs::remove_file(temp_test_dir.path().join("tests/test_java.rs")).unwrap();
+        File::create(temp_test_dir.path().join("new.rs"))
             .unwrap()
-            .write("abc".as_bytes())
+            .write_all("abc".as_bytes())
             .unwrap();
-        let _ = File::options()
+        File::options()
             .append(true)
             .open(&basic_path)
             .unwrap()
-            .write("def".as_bytes())
+            .write_all("def".as_bytes())
             .unwrap();
         tree.sync();
         let new_and_updated_events: Vec<ScanEvent> = tree.scan().map(redact_event).collect();
         assert_yaml_snapshot!(new_and_updated_events);
-        let _ = fs::remove_dir_all(temp_test_dir.path().join("tests/java")).unwrap();
+        fs::remove_dir_all(temp_test_dir.path().join("tests/java")).unwrap();
         tree.sync();
         let deleted_dir_events: Vec<ScanEvent> = tree.scan().map(redact_event).collect();
         assert_yaml_snapshot!(deleted_dir_events);
@@ -758,11 +760,11 @@ mod test {
         fs::create_dir(root.join("src")).unwrap();
         File::create(root.join("src/main.rs"))
             .unwrap()
-            .write(b"fn main() {}")
+            .write_all(b"fn main() {}")
             .unwrap();
         File::create(root.join("src/lib.rs"))
             .unwrap()
-            .write(b"fn lib() {}")
+            .write_all(b"fn lib() {}")
             .unwrap();
 
         let mut tree = SourceHierTree::from(root);
@@ -799,16 +801,16 @@ mod test {
         fs::create_dir(root.join("src")).unwrap();
         File::create(root.join("src/main.rs"))
             .unwrap()
-            .write(b"fn main() {}")
+            .write_all(b"fn main() {}")
             .unwrap();
         File::create(root.join("debug.log"))
             .unwrap()
-            .write(b"some log")
+            .write_all(b"some log")
             .unwrap();
         fs::create_dir(root.join("build")).unwrap();
         File::create(root.join("build/output.rs"))
             .unwrap()
-            .write(b"generated")
+            .write_all(b"generated")
             .unwrap();
 
         let mut tree = SourceHierTree::from(root);

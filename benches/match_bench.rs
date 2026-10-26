@@ -164,7 +164,7 @@ fn prefilter_stats(stmts: &[&SourceRef], label: &str, bodies: &[&str]) {
             .chain(always.iter())
             .map(|&i| stmts[i])
             .collect();
-        cands.sort_by(|lhs, rhs| rhs.quality.cmp(&lhs.quality));
+        cands.sort_by_key(|cand| std::cmp::Reverse(cand.quality));
         candidates.push(cands.len());
         let tried = match cands.iter().position(|c| c.pattern().is_match(body)) {
             Some(pos) => pos + 1,
@@ -201,7 +201,7 @@ fn prefilter_stats(stmts: &[&SourceRef], label: &str, bodies: &[&str]) {
         misses
     );
     let mut hot: Vec<_> = hot_literals.into_iter().collect();
-    hot.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1));
+    hot.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     for (id, count) in hot.iter().take(5) {
         println!(
             "  hot literal {:?}: {} candidates contributed",
@@ -248,11 +248,14 @@ struct Line {
     file: Option<String>,
 }
 
-fn time<F: FnMut(&Line) -> Option<(String, usize, usize)>>(
+/// The path, line number, and quality of the statement a line matched, if any.
+type MatchResult = Option<(String, usize, usize)>;
+
+fn time<F: FnMut(&Line) -> MatchResult>(
     lines: &[Line],
     rounds: usize,
     mut f: F,
-) -> (Duration, Vec<Option<(String, usize, usize)>>) {
+) -> (Duration, Vec<MatchResult>) {
     let mut results = Vec::new();
     let start = Instant::now();
     for round in 0..rounds {
@@ -340,9 +343,9 @@ impl<'a> OldMatcher<'a> {
             }
         }
         // Do the same work as building the LogMapping in the real code.
-        best.map(|src_ref| {
+        if let Some(src_ref) = best {
             let _ = extract_variables(log_ref, src_ref);
-        });
+        }
         best
     }
 }
@@ -487,7 +490,7 @@ fn main() {
             elapsed / lines.len() as u32,
             results.iter().filter(|r| r.is_some()).count()
         );
-        let quality = |r: &Option<(String, usize, usize)>| r.as_ref().map(|k| k.2);
+        let quality = |r: &MatchResult| r.as_ref().map(|k| k.2);
         let better = old_results
             .iter()
             .zip(&results)
@@ -509,7 +512,8 @@ fn main() {
 
     // Extracting the variables of statements with more than one placeholder, which is where
     // the line might need to be re-split.  Values with spaces make more of the splits ambiguous.
-    let value_styles: [(&str, fn(usize) -> String); 2] = [
+    type ValueStyle = (&'static str, fn(usize) -> String);
+    let value_styles: [ValueStyle; 2] = [
         ("one-word values", |n| format!("val{n}")),
         ("multi-word values", |n| format!("val {n} x")),
     ];
