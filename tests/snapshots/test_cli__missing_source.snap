@@ -5,12 +5,12 @@ info:
   args:
     - statements
   env:
-    APPDATA: /tmp/.tmpmTvTKq
+    APPDATA: /tmp/.tmpcd6T2X
     COLS: "1000"
-    HOME: /tmp/.tmpmTvTKq
-    LOCALAPPDATA: /tmp/.tmpmTvTKq
-    USERPROFILE: /tmp/.tmpmTvTKq
-    XDG_CONFIG_HOME: /tmp/.tmpmTvTKq
+    HOME: /tmp/.tmpcd6T2X
+    LOCALAPPDATA: /tmp/.tmpcd6T2X
+    USERPROFILE: /tmp/.tmpcd6T2X
+    XDG_CONFIG_HOME: /tmp/.tmpcd6T2X
 ---
 success: false
 exit_code: 2
@@ -19,6 +19,6 @@ exit_code: 2
 ----- stderr -----
 error: at least one source directory must be given with '--source <SOURCE>'
 
-Usage: log2src [OPTIONS] <COMMAND>
+Usage: log2src statements [OPTIONS]
 
 For more information, try '--help'.

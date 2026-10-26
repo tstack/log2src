@@ -1,0 +1,30 @@
+---
+source: tests/test_cli.rs
+info:
+  program: log2src
+  args:
+    - match
+    - "-d"
+    - examples
+    - "--message"
+    - hello
+    - "--start"
+    - "1"
+  env:
+    APPDATA: /tmp/.tmp9bNKd8
+    COLS: "1000"
+    HOME: /tmp/.tmp9bNKd8
+    LOCALAPPDATA: /tmp/.tmp9bNKd8
+    USERPROFILE: /tmp/.tmp9bNKd8
+    XDG_CONFIG_HOME: /tmp/.tmp9bNKd8
+---
+success: false
+exit_code: 2
+----- stdout -----
+
+----- stderr -----
+error: the argument '--message <MESSAGE>' cannot be used with '--start <START>'
+
+Usage: log2src match --source <SOURCE> --message <MESSAGE>
+
+For more information, try '--help'.

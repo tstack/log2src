@@ -68,6 +68,16 @@ impl CommandGuard {
         self.home_guard.location.path()
     }
 
+    /// Create another command that shares this command's home directory, and so its cache.
+    #[allow(dead_code)]
+    pub fn sibling(&self, subcommand: &str) -> Result<Command, Box<dyn std::error::Error>> {
+        let mut cmd = Command::cargo_bin("log2src")?;
+        cmd.arg(subcommand);
+        cmd.env("COLS", "1000");
+        self.home_guard.set_vars_in(&mut cmd);
+        Ok(cmd)
+    }
+
     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
         self.cmd.arg(arg);
         self

@@ -926,11 +926,12 @@ impl LogMatcher {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Copy, Clone, Serialize, Deserialize, clap::ValueEnum)]
 pub enum SourceLanguage {
     Rust,
     Java,
     #[serde(rename = "C++")]
+    #[value(alias = "c++")]
     Cpp,
     Python,
     Kotlin,

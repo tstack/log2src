@@ -1,5 +1,5 @@
 use clap::error::ErrorKind;
-use clap::{Args, CommandFactory, Parser as ClapParser, Subcommand};
+use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser as ClapParser, Subcommand};
 use colored_json::{ColoredFormatter, CompactFormatter, Styler};
 use indicatif::{ProgressBar, ProgressStyle};
 use log2src::{
@@ -47,12 +47,17 @@ struct Cli {
     #[arg(short, long, global = true)]
     verbose: bool,
 
-    /// Do not read or write the cache of log statements
+    /// Do not read or write the cache of log statements.  With `cache update`, rebuild the
+    /// entries from scratch instead of reading them first.
     #[arg(long, global = true)]
     no_cache: bool,
 
     #[command(subcommand)]
     command: Command,
+
+    /// The names of the sub-commands that were given, like `["cache", "update"]`.
+    #[arg(skip)]
+    command_path: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -83,11 +88,11 @@ struct MatchArgs {
     format: Option<String>,
 
     /// The first line in the log to use (0 based)
-    #[arg(short, long, value_name = "START")]
+    #[arg(short, long, value_name = "START", conflicts_with = "message")]
     start: Option<usize>,
 
     /// The number of log messages to process
-    #[arg(short, long, value_name = "COUNT")]
+    #[arg(short, long, value_name = "COUNT", conflicts_with = "message")]
     count: Option<usize>,
 
     /// Do not extract the values of variables from the messages
@@ -98,11 +103,11 @@ struct MatchArgs {
 #[derive(Args)]
 struct StatementsArgs {
     /// Only print statements with these levels
-    #[arg(long, value_name = "LEVEL", value_delimiter = ',', value_parser = parse_level)]
+    #[arg(long, value_name = "LEVEL", value_delimiter = ',', ignore_case = true)]
     level: Vec<LogLevel>,
 
     /// Only print statements in these languages
-    #[arg(long, value_name = "LANG", value_delimiter = ',', value_parser = parse_language)]
+    #[arg(long, value_name = "LANG", value_delimiter = ',', ignore_case = true)]
     lang: Vec<SourceLanguage>,
 
     /// Only print statements in this source file
@@ -133,54 +138,17 @@ enum CacheCommand {
     Clear,
 }
 
-const LEVELS: [LogLevel; 7] = [
-    LogLevel::Trace,
-    LogLevel::Debug,
-    LogLevel::Info,
-    LogLevel::Warn,
-    LogLevel::Error,
-    LogLevel::Fatal,
-    LogLevel::Unknown,
-];
-
-const LANGUAGES: [SourceLanguage; 5] = [
-    SourceLanguage::Rust,
-    SourceLanguage::Java,
-    SourceLanguage::Cpp,
-    SourceLanguage::Python,
-    SourceLanguage::Kotlin,
-];
-
-fn parse_level(arg: &str) -> Result<LogLevel, String> {
-    LEVELS
-        .into_iter()
-        .find(|level| format!("{:?}", level).eq_ignore_ascii_case(arg))
-        .ok_or_else(|| {
-            let names: Vec<_> = LEVELS
-                .iter()
-                .map(|level| format!("{:?}", level).to_lowercase())
-                .collect();
-            format!("expected one of: {}", names.join(", "))
-        })
-}
-
-fn parse_language(arg: &str) -> Result<SourceLanguage, String> {
-    LANGUAGES
-        .into_iter()
-        .find(|lang| lang.as_str().eq_ignore_ascii_case(arg))
-        .ok_or_else(|| {
-            let names: Vec<_> = LANGUAGES
-                .iter()
-                .map(|lang| lang.as_str().to_lowercase())
-                .collect();
-            format!("expected one of: {}", names.join(", "))
-        })
-}
-
 fn get_colored_formatter() -> ColoredFormatter<CompactFormatter> {
     let compact_formatter = CompactFormatter {};
 
     ColoredFormatter::with_styler(compact_formatter, Styler::default())
+}
+
+/// Print a value to stdout as a line of JSON.  Returns false if the reader went away, like
+/// when piping to `head`, so the caller can stop.
+fn print_json<T: Serialize>(value: &T) -> bool {
+    let line = get_colored_formatter().to_colored_json_auto(value).unwrap();
+    writeln!(stdout().lock(), "{}", line).is_ok()
 }
 
 #[must_use]
@@ -370,6 +338,8 @@ enum CacheMode {
     ReadWrite,
     /// Load the statements from the cache and always save them.
     ForceWrite,
+    /// Do not load the statements from the cache, but always save them.
+    Rebuild,
     /// Do not touch the cache.
     Disabled,
 }
@@ -397,7 +367,7 @@ fn build_log_matcher(
         .ok()
         .filter(|_| cache_mode != CacheMode::Disabled);
 
-    if let Some(cache) = &cache {
+    if let Some(cache) = cache.as_ref().filter(|_| cache_mode != CacheMode::Rebuild) {
         let res = log_matcher.load_from_cache(&cache, tracker);
         for err in res {
             let report = Report::new(err);
@@ -422,7 +392,9 @@ fn build_log_matcher(
         return Err(LogError::NoLogStatements.into());
     }
 
-    if extract_summary.changes() > 0 || cache_mode == CacheMode::ForceWrite {
+    if extract_summary.changes() > 0
+        || matches!(cache_mode, CacheMode::ForceWrite | CacheMode::Rebuild)
+    {
         if let Some(cache) = &cache {
             let res = log_matcher.cache_to(&cache, tracker);
             if let Err(err) = res {
@@ -441,19 +413,37 @@ fn load_log_matcher(
     require_statements: bool,
 ) -> miette::Result<LogMatcher> {
     if cli.sources.is_empty() {
-        Cli::command()
+        // Report the error against the sub-command so its usage is printed.
+        let mut command = Cli::command();
+        command.build();
+        let mut sub_command = &mut command;
+        for name in &cli.command_path {
+            sub_command = sub_command.find_subcommand_mut(name).unwrap();
+        }
+        sub_command
             .error(
                 ErrorKind::MissingRequiredArgument,
                 "at least one source directory must be given with '--source <SOURCE>'",
             )
             .exit();
     }
+    if !require_statements {
+        // When statements are required, a typo is reported as there being no statements.
+        // Otherwise, it looks like a source tree that just doesn't have any.
+        if let Some(missing) = cli
+            .sources
+            .iter()
+            .find(|source| !Path::new(source).exists())
+        {
+            return Err(miette!("source directory \"{}\" does not exist", missing));
+        }
+    }
 
     let mut tracker = ProgressTracker::new();
     let listener_thread = cli.verbose.then(|| spawn_progress_listener(&mut tracker));
     let cache_mode = if cli.no_cache {
         match cache_mode {
-            CacheMode::ForceWrite => CacheMode::ForceWrite,
+            CacheMode::ForceWrite | CacheMode::Rebuild => CacheMode::Rebuild,
             _ => CacheMode::Disabled,
         }
     } else {
@@ -585,20 +575,12 @@ fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
             "files": files.len(),
             "byLanguage": by_language,
         });
-        println!(
-            "{}",
-            get_colored_formatter()
-                .to_colored_json_auto(&summary)
-                .unwrap()
-        );
+        print_json(&summary);
         return Ok(());
     }
 
-    let mut out = stdout().lock();
     for stmt in statements {
-        let line = get_colored_formatter().to_colored_json_auto(stmt).unwrap();
-        if writeln!(out, "{}", line).is_err() {
-            // The reader went away, like when piping to `head`.
+        if !print_json(stmt) {
             break;
         }
     }
@@ -615,27 +597,26 @@ fn run_locate(cli: &Cli, args: &LocateArgs) -> miette::Result<()> {
             "path": path.to_string_lossy(),
             "file": found.map(|found| found.to_string_lossy().to_string()),
         });
-        println!(
-            "{}",
-            get_colored_formatter()
-                .to_colored_json_auto(&result)
-                .unwrap()
-        );
+        if !print_json(&result) {
+            break;
+        }
     }
 
     Ok(())
 }
 
-/// The paths of the entries in the cache, or only the ones for the given sources.
-fn cache_entries(cache: &Cache, sources: &[String]) -> Vec<PathBuf> {
-    if !sources.is_empty() {
-        return sources
-            .iter()
-            .map(|source| cache.entry_path(Path::new(source)))
-            .filter(|path| path.is_file())
-            .collect();
-    }
+/// Read the JSON header on the first line of a cache entry.
+fn read_entry_header(entry_path: &Path) -> serde_json::Value {
+    fs::File::open(entry_path)
+        .ok()
+        .and_then(|file| BufReader::new(file).lines().next())
+        .and_then(|line| line.ok())
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+        .unwrap_or_default()
+}
 
+/// The files in the cache directory whose names match the given predicate, sorted.
+fn cache_files(cache: &Cache, predicate: impl Fn(&str) -> bool) -> Vec<PathBuf> {
     let Ok(dir) = fs::read_dir(&cache.location) else {
         return vec![];
     };
@@ -647,23 +628,49 @@ fn cache_entries(cache: &Cache, sources: &[String]) -> Vec<PathBuf> {
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("cache."))
+                    .is_some_and(&predicate)
         })
         .collect();
     retval.sort();
     retval
 }
 
+/// The paths of the entries in the cache, or only the ones for the given sources.  Nested
+/// roots are merged when they are cached, so a source matches the entry of any root that
+/// contains it or that it contains.
+fn cache_entries(cache: &Cache, sources: &[String]) -> Vec<PathBuf> {
+    let entries = cache_files(cache, |name| name.starts_with("cache."));
+    if sources.is_empty() {
+        return entries;
+    }
+
+    let sources: Vec<PathBuf> = sources
+        .iter()
+        .map(|source| {
+            let path = Path::new(source);
+            path.canonicalize().unwrap_or(path.to_owned())
+        })
+        .collect();
+    entries
+        .into_iter()
+        .filter(|entry_path| {
+            let header = read_entry_header(entry_path);
+            let Some(root) = header.get("path").and_then(|root| root.as_str()) else {
+                return false;
+            };
+            let root = Path::new(root);
+            sources
+                .iter()
+                .any(|source| source.starts_with(root) || root.starts_with(source))
+        })
+        .collect()
+}
+
 /// Print the header of each cache entry.
 fn list_cache_entries(cache: &Cache, sources: &[String]) -> miette::Result<()> {
     let current_revision = serde_json::to_value(Revision::Current).into_diagnostic()?;
     for entry_path in cache_entries(cache, sources) {
-        let header = fs::File::open(&entry_path)
-            .ok()
-            .and_then(|file| BufReader::new(file).lines().next())
-            .and_then(|line| line.ok())
-            .and_then(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
-            .unwrap_or_default();
+        let header = read_entry_header(&entry_path);
         let size = fs::metadata(&entry_path).map_or(0, |meta| meta.len());
         let revision = header.get("revision").cloned().unwrap_or_default();
         let result = json!({
@@ -674,12 +681,9 @@ fn list_cache_entries(cache: &Cache, sources: &[String]) -> miette::Result<()> {
             "size": size,
             "stale": revision != current_revision,
         });
-        println!(
-            "{}",
-            get_colored_formatter()
-                .to_colored_json_auto(&result)
-                .unwrap()
-        );
+        if !print_json(&result) {
+            break;
+        }
     }
 
     Ok(())
@@ -689,7 +693,7 @@ fn run_cache(cli: &Cli, command: &CacheCommand) -> miette::Result<()> {
     let cache = Cache::open()?;
     match command {
         CacheCommand::Path => {
-            println!("{}", cache.location.display());
+            let _ = writeln!(stdout().lock(), "{}", cache.location.display());
         }
         CacheCommand::List => {
             list_cache_entries(&cache, &cli.sources)?;
@@ -699,7 +703,14 @@ fn run_cache(cli: &Cli, command: &CacheCommand) -> miette::Result<()> {
             list_cache_entries(&cache, &cli.sources)?;
         }
         CacheCommand::Clear => {
-            for entry_path in cache_entries(&cache, &cli.sources) {
+            let mut paths = cache_entries(&cache, &cli.sources);
+            if cli.sources.is_empty() {
+                // The temporary files left behind if saving an entry was interrupted.
+                paths.extend(cache_files(&cache, |name| {
+                    name.starts_with(".tmp") && name.ends_with(".tmp")
+                }));
+            }
+            for entry_path in paths {
                 fs::remove_file(&entry_path).map_err(|err| LogError::FailedToWriteCache {
                     source: Arc::new(err),
                 })?;
@@ -723,7 +734,13 @@ fn main() -> miette::Result<()> {
         )
     }));
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+    let mut sub_matches: &ArgMatches = &matches;
+    while let Some((name, next)) = sub_matches.subcommand() {
+        cli.command_path.push(name.to_string());
+        sub_matches = next;
+    }
 
     match &cli.command {
         Command::Match(args) => run_match(&cli, args),

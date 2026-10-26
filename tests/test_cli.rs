@@ -79,3 +79,63 @@ fn missing_source() -> Result<(), Box<dyn std::error::Error>> {
     assert_cmd_snapshot!(cmd.cmd);
     Ok(())
 }
+
+#[test]
+fn missing_source_dir() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = common_settings::CommandGuard::new("cache")?;
+    cmd.arg("update").arg("-d").arg("does-not-exist");
+
+    assert_cmd_snapshot!(cmd.cmd);
+    Ok(())
+}
+
+#[test]
+fn statements_by_lang() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = common_settings::CommandGuard::new("statements")?;
+    cmd.arg("-d")
+        .arg("tests")
+        .arg("--lang")
+        .arg("KOTLIN,cpp")
+        .arg("--summary");
+
+    assert_cmd_snapshot!(cmd.cmd);
+    Ok(())
+}
+
+#[test]
+fn match_message_with_start() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = common_settings::CommandGuard::new("match")?;
+    cmd.arg("-d")
+        .arg("examples")
+        .arg("--message")
+        .arg("hello")
+        .arg("--start")
+        .arg("1");
+
+    assert_cmd_snapshot!(cmd.cmd);
+    Ok(())
+}
+
+#[test]
+fn cache_clear_nested_source() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = common_settings::CommandGuard::new("cache")?;
+    let source = Path::new("tests").join("java");
+    cmd.arg("update")
+        .arg("-d")
+        .arg("tests")
+        .arg("-d")
+        .arg(&source);
+    assert!(cmd.cmd.output()?.status.success());
+
+    // The entry is for `tests`, which contains `tests/java`.
+    let mut clear = cmd.sibling("cache")?;
+    clear.arg("clear").arg("-v").arg("-d").arg(&source);
+    let output = clear.output()?;
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stderr)?.contains("Removed "));
+
+    let mut list = cmd.sibling("cache")?;
+    list.arg("list");
+    assert!(list.output()?.stdout.is_empty());
+    Ok(())
+}

@@ -1,0 +1,23 @@
+---
+source: tests/test_cli.rs
+info:
+  program: log2src
+  args:
+    - cache
+    - update
+    - "-d"
+    - does-not-exist
+  env:
+    APPDATA: /tmp/.tmpi1NQHY
+    COLS: "1000"
+    HOME: /tmp/.tmpi1NQHY
+    LOCALAPPDATA: /tmp/.tmpi1NQHY
+    USERPROFILE: /tmp/.tmpi1NQHY
+    XDG_CONFIG_HOME: /tmp/.tmpi1NQHY
+---
+success: false
+exit_code: 1
+----- stdout -----
+
+----- stderr -----
+Error:   × source directory "does-not-exist" does not exist
