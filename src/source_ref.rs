@@ -326,6 +326,19 @@ impl ArgCounter {
     }
 }
 
+/// What a statement's message is used for.  Statements are found by their shape, like a call
+/// that takes a format string, so this is decided after extraction, and log messages are only
+/// matched against other kinds of statements when no `Log` statement matches.
+#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+pub enum MessageCategory {
+    /// A logging call, whose level is in `SourceRef::level`.
+    #[default]
+    Log,
+    /// Some other use of a message, like a call in a family that `prune_log_calls()` decided
+    /// does not look like logging.
+    Other,
+}
+
 // TODO: get rid of this clone?
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SourceRef {
@@ -348,6 +361,7 @@ pub struct SourceRef {
     pub block_id: u32,
     pub text: String,
     pub level: LogLevel,
+    pub category: MessageCategory,
     /// The name of the logging function/macro/method that was called, as written in the source,
     /// like `ws_debug`, `logger.info`, or `syslog`.
     #[serde(rename(serialize = "callName"))]
@@ -440,6 +454,7 @@ impl SourceRef {
                 block_id: result.block_id,
                 text,
                 level,
+                category: MessageCategory::Log,
                 call_name,
                 quality,
                 pattern_str: matcher.as_str().to_string(),
@@ -486,6 +501,7 @@ impl SourceRef {
             block_id: message_ref.block_id,
             text: message_ref.text.clone(),
             level: message_ref.level,
+            category: MessageCategory::Log,
             call_name: message_ref.call_name.clone(),
             quality,
             pattern_str: matcher.as_str().to_string(),

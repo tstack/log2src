@@ -12,6 +12,7 @@ expression: src_refs
   blockId: 43
   text: "\"you're only as funky as your last cut\""
   level: Debug
+  category: Log
   callName: debug
   quality: 30
   pattern: "(?s)^you're only as funky as your last cut$"
@@ -32,6 +33,7 @@ expression: src_refs
   blockId: 224
   text: "\"this won't match i={}; j={}\""
   level: Debug
+  category: Log
   callName: "log::debug"
   quality: 19
   pattern: "(?s)^this won't match i=(.*); j=(.*)$"
@@ -64,6 +66,7 @@ expression: src_refs
   blockId: 326
   text: "\"{salutation}, {name}!\""
   level: Debug
+  category: Log
   callName: debug
   quality: 2
   pattern: "(?s)^(.*), (.*)!$"
@@ -92,6 +95,7 @@ expression: src_refs
   blockId: 427
   text: "\"Hello, {name}!\""
   level: Debug
+  category: Log
   callName: debug
   quality: 7
   pattern: "(?s)^Hello, (.*)!$"
@@ -116,6 +120,7 @@ expression: src_refs
   blockId: 548
   text: "\"{salutation}, {name}!\""
   level: Debug
+  category: Log
   callName: debug
   quality: 2
   pattern: "(?s)^(.*), (.*)!$"

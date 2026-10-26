@@ -12,6 +12,7 @@ qualifiedName: namedarg
 blockId: 427
 text: "\"Hello, {name}!\""
 level: Debug
+category: Log
 callName: debug
 quality: 7
 pattern: "(?s)^Hello, (.*)!$"

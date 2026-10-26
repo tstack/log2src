@@ -12,6 +12,7 @@ expression: src_refs
   blockId: 24
   text: "\"{}: Started\""
   level: Info
+  category: Log
   callName: info
   quality: 8
   pattern: "(?s)^(.*): Started$"
@@ -38,6 +39,7 @@ expression: src_refs
   blockId: 69
   text: "\"{}: Stopped\""
   level: Info
+  category: Log
   callName: info
   quality: 8
   pattern: "(?s)^(.*): Stopped$"
