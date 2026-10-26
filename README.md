@@ -40,7 +40,7 @@ log2src match -d ~/src/app -l app.log -f '^\S+ \w+ (?<body>.*)'
 log2src match -d ~/src/app --message 'Connected to db after 3 retries'
 
 # List the log statements that were found, optionally filtered
-log2src statements -d ~/src/app --level warn,error --lang java -o tsv
+log2src statements -d ~/src/app --level warn,error --lang java
 log2src statements -d ~/src/app --file Database.java
 log2src statements -d ~/src/app --summary
 

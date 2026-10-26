@@ -1,5 +1,5 @@
 use clap::error::ErrorKind;
-use clap::{Args, CommandFactory, Parser as ClapParser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser as ClapParser, Subcommand};
 use colored_json::{ColoredFormatter, CompactFormatter, Styler};
 use indicatif::{ProgressBar, ProgressStyle};
 use log2src::{
@@ -95,14 +95,6 @@ struct MatchArgs {
     no_vars: bool,
 }
 
-#[derive(Copy, Clone, ValueEnum)]
-enum StatementsOutput {
-    /// One JSON object per statement
-    Json,
-    /// Tab-separated path, line, level, name, and message
-    Tsv,
-}
-
 #[derive(Args)]
 struct StatementsArgs {
     /// Only print statements with these levels
@@ -117,12 +109,8 @@ struct StatementsArgs {
     #[arg(long, value_name = "FILE")]
     file: Option<PathBuf>,
 
-    /// The output format
-    #[arg(short, long, value_enum, default_value_t = StatementsOutput::Json)]
-    output: StatementsOutput,
-
     /// Print the number of statements by language and level instead of the statements
-    #[arg(long, conflicts_with = "output")]
+    #[arg(long)]
     summary: bool,
 }
 
@@ -551,15 +539,6 @@ fn run_match(cli: &Cli, args: &MatchArgs) -> miette::Result<()> {
     accumulator.eof()
 }
 
-/// Escape the characters that would break up a TSV row.
-fn escape_tsv(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\t', "\\t")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-}
-
 fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
     let log_matcher = load_log_matcher(cli, CacheMode::ReadWrite, true)?;
 
@@ -617,17 +596,7 @@ fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
 
     let mut out = stdout().lock();
     for stmt in statements {
-        let line = match args.output {
-            StatementsOutput::Json => get_colored_formatter().to_colored_json_auto(stmt).unwrap(),
-            StatementsOutput::Tsv => format!(
-                "{}\t{}\t{:?}\t{}\t{}",
-                escape_tsv(&stmt.source_path),
-                stmt.line_no,
-                stmt.level,
-                escape_tsv(&stmt.name),
-                escape_tsv(&stmt.text)
-            ),
-        };
+        let line = get_colored_formatter().to_colored_json_auto(stmt).unwrap();
         if writeln!(out, "{}", line).is_err() {
             // The reader went away, like when piping to `head`.
             break;
