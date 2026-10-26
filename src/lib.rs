@@ -1083,6 +1083,14 @@ impl SourceLanguage {
                         ; standard macros that build strings or read files at compile time
                         (#not-match? @macro-name "(^|::)(format|vec|env|option_env|include|include_str|include_bytes|concat|stringify|compile_error)$")
                     )
+                    ; a format string built with `concat!`, like `info!(concat!("a ", "{}"), x)`
+                    (macro_invocation macro: (_) @macro-name
+                        (token_tree .
+                            (identifier) @_concat . "!" . (token_tree) @log
+                        )
+                        (#eq? @_concat "concat")
+                        (#not-match? @macro-name "(^|::)(format|vec|env|option_env|include|include_str|include_bytes|concat|stringify|compile_error)$")
+                    )
                     ; macros that take the level before the format string, like
                     ; `log!(Level::Warn, "...")` or `tracing::event!(Level::INFO, "...")`
                     (macro_invocation macro: (_) @macro-name
@@ -1702,7 +1710,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                             line_no: range.start_point.row + 1,
                             end_line_no: range.end_point.row + 1,
                             column: range.start_point.column,
-                            name: code.buffer[result.name_range].to_string(),
+                            name: result.name,
                             qualified_name: result.qualified_name,
                             block_id: result.block_id,
                             text: text.to_string(),
@@ -3275,11 +3283,60 @@ class Server:
         assert_eq!(
             qualified_names("in-mem.py", source),
             pairs(&[
-                ("", "<module>"),
+                ("<module>", "<module>"),
                 ("handle", "Server.handle"),
                 ("inner", "Server.handle.<locals>.inner"),
             ])
         );
+    }
+
+    #[test]
+    fn test_name_cpp_namespace_scope() {
+        let source = r#"
+namespace net {
+auto init = [] { LOG(INFO, "start"); };
+}
+"#;
+        assert_eq!(
+            qualified_names("in-mem.cc", source),
+            pairs(&[("init", "net::init")])
+        );
+    }
+
+    #[test]
+    fn test_name_in_attribute() {
+        let source = r#"
+mod net {
+    #[doc = my_macro!("in attr")]
+    // a comment
+    #[inline]
+    fn handle() {}
+}
+"#;
+        assert_eq!(
+            qualified_names("in-mem.rs", source),
+            pairs(&[("handle", "net::handle")])
+        );
+    }
+
+    #[test]
+    fn test_rust_concat_format() {
+        let source = r#"
+fn main() {
+    info!(concat!("request ", "{} done"), id);
+    warn!(concat!("x", env!("Y")));
+    let p = Config::load(concat!("a", "b"));
+}
+"#;
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.rs"), source);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
+        assert_eq!(patterns, vec![r"(?s)^request (.*) done$"]);
+        assert_eq!(src_refs[0].level, LogLevel::Info);
+        assert_eq!(src_refs[0].vars, vec!["id"]);
     }
 
     #[test]
