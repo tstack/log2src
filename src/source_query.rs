@@ -175,6 +175,45 @@ impl<'a> SourceQuery<'a> {
                 // Computed on demand since only some captures need them.
                 let mut leading_args: Option<Vec<String>> = None;
                 let mut kind = child.kind();
+                // The argument of the log call that holds the message, which is not the
+                // message itself when it is wrapped, like `String.format("...", x)`.
+                let mut outer = child;
+                // The node whose following siblings are the arguments for the placeholders.
+                let mut args_anchor = None;
+                let mut printf = false;
+                if query.capture_names()[capture.index as usize] == "message-call" {
+                    // A message built by another call, like `fmt::format("...", x)`.
+                    let Some(wrapped) = self.unwrap_message_call(child) else {
+                        break;
+                    };
+                    // Only the first message of a call is used, like other captures.
+                    let mut prev = child.prev_named_sibling();
+                    while let Some(arg) = prev {
+                        if self.is_message_like(arg) {
+                            break;
+                        }
+                        prev = arg.prev_named_sibling();
+                    }
+                    if prev.is_some() {
+                        break;
+                    }
+                    child = wrapped.literal;
+                    args_anchor = Some(wrapped.args_anchor);
+                    printf = wrapped.printf;
+                    kind = child.kind();
+                }
+                if let Some(lambda) = outer.parent().filter(|p| p.kind() == "lambda_expression") {
+                    // A Java supplier, like `log.fine(() -> "...")`.
+                    outer = lambda;
+                }
+                if outer != capture.node || child != capture.node {
+                    // Strings and calls are wrapped like this for all sorts of reasons, so
+                    // only keep the ones passed to a logging call.
+                    let leading = leading_args.get_or_insert_with(|| self.leading_args(outer));
+                    if !Self::has_level(call_name.as_deref(), leading) {
+                        break;
+                    }
+                }
                 if query.capture_names()[capture.index as usize] == "message-ref" {
                     // A log message that is a constant defined elsewhere, like
                     // `log.info(Messages.LOG_STARTING, name)`.
@@ -195,7 +234,7 @@ impl<'a> SourceQuery<'a> {
                 if self.source_language == SourceLanguage::Cpp && kind == "raw_string_literal" {
                     // Raw strings are used for all sorts of things, like JSON and usage text,
                     // so only keep the ones passed to a logging call.
-                    let leading = leading_args.get_or_insert_with(|| self.leading_args(child));
+                    let leading = leading_args.get_or_insert_with(|| self.leading_args(outer));
                     if !Self::has_level(call_name.as_deref(), leading) {
                         break;
                     }
@@ -264,7 +303,7 @@ impl<'a> SourceQuery<'a> {
                             && self.source_language == SourceLanguage::Cpp
                             && !Self::has_level(
                                 call_name.as_deref(),
-                                leading_args.get_or_insert_with(|| self.leading_args(child)),
+                                leading_args.get_or_insert_with(|| self.leading_args(outer)),
                             )
                         {
                             // C++ strings are concatenated for all sorts of calls, like paths
@@ -284,6 +323,26 @@ impl<'a> SourceQuery<'a> {
                                 None => break,
                             }
                         }
+                        if printf {
+                            // A Java `String.format()` message, so the printf-style
+                            // conversions need to become placeholders.  Concatenated
+                            // expressions would mix the two kinds of placeholders.
+                            if concat_args
+                                .iter()
+                                .any(|(arg, _)| matches!(arg, FormatArgument::Named(_)))
+                            {
+                                break;
+                            }
+                            let Some(text) = concat_pattern
+                                .take()
+                                .map(Cow::Owned)
+                                .or_else(|| self.string_contents(child))
+                            else {
+                                break;
+                            };
+                            concat_pattern = Some(printf_to_placeholders(&text));
+                            concat_args.clear();
+                        }
                         // only return results after the format string literal, other captures
                         // are not relevant.
                         got_string_literal = true;
@@ -301,13 +360,13 @@ impl<'a> SourceQuery<'a> {
                 let mut arg_start: Option<(usize, Point)> = None;
 
                 if filter_idx.is_none() || filter_idx.is_some_and(|f| f == capture.index) {
-                    let anchor = Self::statement_anchor(child);
+                    let anchor = Self::statement_anchor(outer);
                     let (name, qualified_name) = self.names(anchor);
                     let block_id = self.block_id(anchor);
                     let qr_index = results.len();
                     results.push(QueryResult {
                         kind: kind.to_string(),
-                        range: capture.node.range(),
+                        range: child.range(),
                         name: name.clone(),
                         qualified_name: qualified_name.clone(),
                         block_id,
@@ -318,8 +377,11 @@ impl<'a> SourceQuery<'a> {
                         call_name: call_name.clone(),
                         leading_args: leading_args
                             .take()
-                            .unwrap_or_else(|| self.leading_args(child)),
+                            .unwrap_or_else(|| self.leading_args(outer)),
                     });
+                    if let Some(anchor) = args_anchor {
+                        child = anchor;
+                    }
                     if self.source_language == SourceLanguage::Python
                         && matches!(child.kind(), "string" | "concatenated_string")
                     {
@@ -1083,6 +1145,88 @@ impl<'a> SourceQuery<'a> {
         }
     }
 
+    /// Check if an argument of a log call looks like a message, so that only the first one is
+    /// used.
+    fn is_message_like(&self, node: Node) -> bool {
+        matches!(
+            node.kind(),
+            "string_literal" | "concatenated_string" | "raw_string_literal"
+        ) || (node.kind() == "binary_expression" && self.concat_pattern(node).is_some())
+            || self.unwrap_message_call(node).is_some()
+    }
+
+    /// Find the string-literal in a message that is built by another call, like
+    /// `String.format("...", x)` in Java, or `fmt::format("...", x)` and gettext's `_("...")` in
+    /// C++.  Returns None if the call is not one of those or its message is not a literal.
+    fn unwrap_message_call(&self, call: Node<'a>) -> Option<WrappedMessage<'a>> {
+        let (kind, args) = match (self.source_language, call.kind()) {
+            (SourceLanguage::Java, "method_invocation") => {
+                let object = call.child_by_field_name("object")?;
+                let name = &self.source[call.child_by_field_name("name")?.byte_range()];
+                let kind = match (&self.source[object.byte_range()], name) {
+                    ("String" | "java.lang.String", "format") => MessageCall::Printf,
+                    ("MessageFormat" | "java.text.MessageFormat", "format") => MessageCall::Format,
+                    _ => return None,
+                };
+                (kind, call.child_by_field_name("arguments")?)
+            }
+            (SourceLanguage::Cpp, "call_expression") => {
+                let function = &self.source[call.child_by_field_name("function")?.byte_range()];
+                let kind = match function {
+                    "format" | "fmt::format" | "std::format" => MessageCall::Format,
+                    "_" | "N_" | "gettext" | "tr" | "fmt::runtime" => MessageCall::Passthrough,
+                    _ => return None,
+                };
+                (kind, call.child_by_field_name("arguments")?)
+            }
+            _ => return None,
+        };
+        let mut cursor = args.walk();
+        let mut named = args
+            .named_children(&mut cursor)
+            .filter(|arg| !arg.kind().contains("comment"));
+        let mut first = named.next()?;
+        if kind == MessageCall::Printf
+            && matches!(
+                first.kind(),
+                "identifier" | "field_access" | "method_invocation"
+            )
+        {
+            // The Locale, like `String.format(Locale.ROOT, "...", x)`.
+            first = named.next()?;
+        }
+        let literal_kinds: &[&str] = match self.source_language {
+            SourceLanguage::Cpp => &[
+                "string_literal",
+                "concatenated_string",
+                "raw_string_literal",
+                "binary_expression",
+            ],
+            _ => &["string_literal", "binary_expression"],
+        };
+        let literal = if literal_kinds.contains(&first.kind()) {
+            first
+        } else {
+            // A translated format string, like `fmt::format(_("..."), x)`.
+            let inner = self.unwrap_message_call(first)?;
+            if inner.args_anchor != first {
+                return None;
+            }
+            inner.literal
+        };
+        Some(WrappedMessage {
+            literal,
+            // A translation does not do any formatting, so the arguments for the placeholders
+            // follow the call itself.
+            args_anchor: if kind == MessageCall::Passthrough {
+                call
+            } else {
+                first
+            },
+            printf: kind == MessageCall::Printf,
+        })
+    }
+
     /// Check if a call has a log level, either from the name of the call or from one of the
     /// `leading_args` before the message.
     fn has_level(call_name: Option<&str>, leading_args: &[String]) -> bool {
@@ -1490,6 +1634,42 @@ impl<'a> SourceQuery<'a> {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+#[derive(Copy, Clone, PartialEq)]
+enum MessageCall {
+    /// `String.format()`, which uses printf-style conversions.
+    Printf,
+    /// A call that formats with the language's usual placeholders, like `fmt::format()`.
+    Format,
+    /// A call that returns the message as-is for formatting elsewhere, like gettext's `_()` or
+    /// `fmt::runtime()`.
+    Passthrough,
+}
+
+/// A message that is built by another call, like `String.format("...", x)`.
+struct WrappedMessage<'a> {
+    /// The format string.
+    literal: Node<'a>,
+    /// The node whose following siblings are the arguments for the placeholders.
+    args_anchor: Node<'a>,
+    /// True if the placeholders are printf-style conversions in a Java message.
+    printf: bool,
+}
+
+/// Convert the printf-style conversions in a Java `String.format()` message, like `%s` or
+/// `%.2f`, into the `{}` placeholders that are used for the other Java messages.
+fn printf_to_placeholders(text: &str) -> String {
+    static CONVERSION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"%(?:\d+\$)?[-#+ 0,(<]*\d*(?:\.\d+)?(?:[tT][a-zA-Z]|[a-zA-Z%])").unwrap()
+    });
+    CONVERSION_REGEX
+        .replace_all(text, |caps: &regex::Captures| match &caps[0] {
+            "%%" => "%".to_string(),
+            "%n" => "\\n".to_string(),
+            _ => "{}".to_string(),
+        })
+        .into_owned()
 }
 
 enum ConcatPiece<'a> {

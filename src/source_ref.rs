@@ -68,11 +68,24 @@ impl LogLevel {
                     _ => Self::from_word(&last),
                 };
             }
-            return if words.iter().any(|w| is_logging_word(w)) {
-                Self::from_word(&last)
+            // The level is usually at the end, but there can be a suffix after it, like the
+            // `once` in `log_warn_once`, the `if` in `LOG_INFO_IF`, or the `hand` in
+            // `tr_logAddTraceHand`.  In that case, the level has to come after a logging word,
+            // which can also be in the qualifier, like `logger.warning_once`.
+            let qualified = segments
+                .iter()
+                .flat_map(|seg| split_words(seg))
+                .any(|w| is_logging_word(&w));
+            words.push(last);
+            let after_logging = if qualified {
+                0
             } else {
-                None
+                words.iter().position(|w| is_logging_word(w))? + 1
             };
+            return words[after_logging..]
+                .iter()
+                .rev()
+                .find_map(|w| Self::from_word(w));
         }
         // For a qualified name, like `logger.warn` or `spdlog::level::info`, the qualifier
         // needs to look logging related so that something like `warnings.warn` or
@@ -92,7 +105,8 @@ impl LogLevel {
         match word {
             "trace" | "finer" | "finest" => Some(LogLevel::Trace),
             "debug" | "dbg" | "fine" => Some(LogLevel::Debug),
-            "info" | "notice" => Some(LogLevel::Info),
+            // `config` is a java.util.logging level between `info` and `fine`.
+            "info" | "notice" | "config" => Some(LogLevel::Info),
             "warn" | "warning" => Some(LogLevel::Warn),
             "error" | "err" | "exception" | "severe" => Some(LogLevel::Error),
             "fatal" | "critical" | "crit" | "alert" | "emerg" => Some(LogLevel::Fatal),

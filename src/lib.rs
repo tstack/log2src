@@ -153,7 +153,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "27")]
+    #[serde(rename = "28")]
     Current,
 }
 
@@ -1126,7 +1126,41 @@ impl SourceLanguage {
                                 [(string_literal) (binary_expression)] @arguments)
                         ]
                         (#match? @object-name "log(ger)?|LOG(GER)?")
-                        (#match? @method-name "^log$|fine|debug|info|warn|trace|error|severe|fatal")
+                        (#match? @method-name "^log$|fine|config|debug|info|warn|trace|error|severe|fatal")
+                    )
+                    ; A message that is built by another call, like String.format("...", x)
+                    (method_invocation
+                        object: (identifier) @object-name
+                        name: (identifier) @method-name
+                        arguments: [
+                            (argument_list . (method_invocation) @message-call)
+                            (argument_list . [(field_access) (identifier)] .
+                                (method_invocation) @message-call)
+                        ]
+                        (#match? @object-name "log(ger)?|LOG(GER)?")
+                        (#match? @method-name "^log$|fine|config|debug|info|warn|trace|error|severe|fatal")
+                    )
+                    ; A Supplier for the message, like log.fine(() -> "...") or
+                    ; log.log(Level.WARNING, e, () -> "...")
+                    (method_invocation
+                        object: (identifier) @object-name
+                        name: (identifier) @method-name
+                        arguments: [
+                            (argument_list . (lambda_expression
+                                body: [(string_literal) (binary_expression)] @arguments))
+                            (argument_list . (_) . (lambda_expression
+                                body: [(string_literal) (binary_expression)] @arguments))
+                            (argument_list . (_) . (_) . (lambda_expression
+                                body: [(string_literal) (binary_expression)] @arguments))
+                            (argument_list . (lambda_expression
+                                body: (method_invocation) @message-call))
+                            (argument_list . (_) . (lambda_expression
+                                body: (method_invocation) @message-call))
+                            (argument_list . (_) . (_) . (lambda_expression
+                                body: (method_invocation) @message-call))
+                        ]
+                        (#match? @object-name "log(ger)?|LOG(GER)?")
+                        (#match? @method-name "^log$|fine|config|debug|info|warn|trace|error|severe|fatal")
                     )
                     ; A message that is a constant, like log.info(Messages.LOG_STARTING, name)
                     (method_invocation
@@ -1134,7 +1168,7 @@ impl SourceLanguage {
                         name: (identifier) @method-name
                         arguments: (argument_list . [(identifier) (field_access)] @message-ref)
                         (#match? @object-name "log(ger)?|LOG(GER)?")
-                        (#match? @method-name "fine|debug|info|warn|trace|error|severe|fatal")
+                        (#match? @method-name "fine|config|debug|info|warn|trace|error|severe|fatal")
                     )
                     ; java.util.logging's log(Level, String, ...) with a constant message
                     (method_invocation
@@ -1155,6 +1189,16 @@ impl SourceLanguage {
                                 arguments: (argument_list
                                     [(string_literal) (raw_string_literal) (concatenated_string)
                                      (binary_expression)] @arguments)
+                            )
+                        )
+                        (#not-match? @fname "snprintf|sprintf")
+                    )
+                    ; A message that is built by another call, like fmt::format("...", x)
+                    (
+                        (expression_statement
+                            (call_expression
+                                function: (_) @fname
+                                arguments: (argument_list (call_expression) @message-call)
                             )
                         )
                         (#not-match? @fname "snprintf|sprintf")
@@ -2074,6 +2118,72 @@ fn main() {
 """#;
 
     #[test]
+    fn test_extract_java_wrapped_message() {
+        let code = CodeSource::from_string(
+            &PathBuf::from("in-mem.java"),
+            r#"
+class Main {
+  void run(String name, int count, Exception e) {
+    LOG.info(String.format("Session '%s' expired after %d ms.%n", name, count));
+    LOGGER.log(Level.WARNING, String.format(Locale.ROOT, "Cannot parse %s, 100%%", name), e);
+    LOGGER.fine(() -> "sending " + name);
+    LOGGER.log(Level.SEVERE, e, () -> "Uncaught exception in thread " + name);
+    LOGGER.log(Level.FINER, () -> String.format("Jar file cache hit %16X", count));
+    LOGGER.log(Level.CONFIG, "JAR Cache is not defined for channel {0}", name);
+    LOG.info(name.toString());
+    LOG.info(String.format("a " + name + " %s", count));
+  }
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let found: Vec<(&str, LogLevel)> = src_refs
+            .iter()
+            .map(|s| (s.pattern().as_str(), s.level))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "(?s)^Session '(.*)' expired after (.*) ms\\.\\s*$",
+                    LogLevel::Info
+                ),
+                ("(?s)^Cannot parse (.*), 100%$", LogLevel::Warn),
+                ("(?s)^sending (.*)$", LogLevel::Debug),
+                ("(?s)^Uncaught exception in thread (.*)$", LogLevel::Error),
+                ("(?s)^Jar file cache hit (.*)$", LogLevel::Trace),
+                (
+                    "(?s)^JAR Cache is not defined for channel (.*)$",
+                    LogLevel::Info
+                ),
+            ]
+        );
+        assert_eq!(src_refs[0].vars, vec!["name", "count"]);
+        assert_eq!(src_refs[1].vars, vec!["name"]);
+
+        let line = "Session 'abc' expired after 10 ms.\n";
+        let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+        assert_eq!(
+            extract_variables(&log_ref, &src_refs[0]),
+            vec![
+                VariablePair {
+                    expr: "name".to_string(),
+                    value: "abc".to_string(),
+                    ambiguous: false,
+                },
+                VariablePair {
+                    expr: "count".to_string(),
+                    value: "10".to_string(),
+                    ambiguous: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn test_extract_java_concatenation() {
         let code = CodeSource::from_string(&PathBuf::from("in-mem.java"), TEST_JAVA_CONCAT_SRC);
         let src_refs = extract_logging(&[code], &ProgressTracker::new())
@@ -2917,6 +3027,45 @@ void connect() {
         assert_eq!(src_refs[1].level, LogLevel::Error);
         assert_eq!(src_refs[2].level, LogLevel::Warn);
         assert_eq!(src_refs[2].vars, vec!["count"]);
+    }
+
+    #[test]
+    fn test_cpp_wrapped_message() {
+        let code = CodeSource::from_string(
+            &PathBuf::from("in-mem.cc"),
+            r#"
+void connect() {
+    tr_logAddInfo(fmt::format("Cached {} global address {}", family, addr));
+    tr_logAddError(_("Couldn't obtain source address"));
+    tr_logAddWarn(fmt::format(fmt::runtime(_("Couldn't read '{path}'")), fmt::arg("path", name)));
+    tr_logAddDebugTor(tor, fmt::format("Verifying {} pieces", count));
+    tr_logAddTraceHand(this, "sending vc");
+    label->setText(tr("not a log message"));
+    auto msg = fmt::format("not logged {}", count);
+    report(fmt::format("not a log message {}", count));
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let found: Vec<(&str, LogLevel)> = src_refs
+            .iter()
+            .map(|s| (s.pattern().as_str(), s.level))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("(?s)^Cached (.*) global address (.*)$", LogLevel::Info),
+                ("(?s)^Couldn't obtain source address$", LogLevel::Error),
+                ("(?s)^Couldn't read '(.*)'$", LogLevel::Warn),
+                ("(?s)^Verifying (.*) pieces$", LogLevel::Debug),
+                ("(?s)^sending vc$", LogLevel::Trace),
+            ]
+        );
+        assert_eq!(src_refs[0].vars, vec!["family", "addr"]);
+        assert_eq!(src_refs[3].vars, vec!["count"]);
     }
 
     const CPP_SPLIT_ELSE_SOURCE: &str = r#"
@@ -4452,6 +4601,9 @@ int main(int argc, char* argv[]) {
     spdlog::critical("critical message");
     log_debug("lnav debug message");
     log_warning("lnav warn message");
+    log_warn_once("suffix warn message");
+    logger.warning_once("qualified suffix message");
+    on_error_log("not a suffix log message");
     syslog(LOG_ERR, "syslog error message");
     spdlog::log(spdlog::level::trace, "spdlog trace message");
     report_error("not a log message");
@@ -4479,6 +4631,12 @@ int main(int argc, char* argv[]) {
                 ("\"critical message\"".to_string(), LogLevel::Fatal),
                 ("\"lnav debug message\"".to_string(), LogLevel::Debug),
                 ("\"lnav warn message\"".to_string(), LogLevel::Warn),
+                ("\"suffix warn message\"".to_string(), LogLevel::Warn),
+                ("\"qualified suffix message\"".to_string(), LogLevel::Warn),
+                (
+                    "\"not a suffix log message\"".to_string(),
+                    LogLevel::Unknown
+                ),
                 ("\"syslog error message\"".to_string(), LogLevel::Error),
                 ("\"spdlog trace message\"".to_string(), LogLevel::Trace),
                 ("\"not a log message\"".to_string(), LogLevel::Unknown),
