@@ -59,6 +59,16 @@ impl LogLevel {
         // one of the other words needs to look logging related so that something like
         // `report_error` is not treated as a log statement.
         if !words.is_empty() {
+            // Qt's `qWarning` and `qCDebug` and GLib's `g_warning` and `g_message` have a short
+            // prefix instead of a logging word.
+            let prefix: Vec<&str> = words.iter().map(String::as_str).collect();
+            if segments.is_empty() {
+                match (&prefix[..], last.as_str()) {
+                    (["g"], "message") => return Some(LogLevel::Info),
+                    (["q"] | ["q", "c"] | ["g"], _) => return Self::from_word(&last),
+                    _ => {}
+                }
+            }
             return if words.iter().any(|w| is_logging_word(w)) {
                 Self::from_word(&last)
             } else {
