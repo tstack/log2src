@@ -41,7 +41,7 @@ interface SourceRef {
     lineNumber: number,
     column: number,
     name: string,
-    level?: string,
+    level: string,
 }
 
 interface ILaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {

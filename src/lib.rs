@@ -789,7 +789,7 @@ impl<'a> LogRef<'a> {
     /// message is preferred.
     fn compare_candidates(&self, lhs: &SourceRef, rhs: &SourceRef) -> std::cmp::Ordering {
         let level = self.level();
-        let level_matches = |src_ref: &SourceRef| level.is_some() && src_ref.level == level;
+        let level_matches = |src_ref: &SourceRef| level == Some(src_ref.level);
         rhs.quality
             .cmp(&lhs.quality)
             .then_with(|| level_matches(rhs).cmp(&level_matches(lhs)))
@@ -1222,7 +1222,7 @@ processing \started -- {args[0]}""")
         );
     }
 
-    fn extract_levels(path: &str, source: &str) -> Vec<(String, Option<LogLevel>)> {
+    fn extract_levels(path: &str, source: &str) -> Vec<(String, LogLevel)> {
         let code = CodeSource::from_string(&Path::new(path), source);
         extract_logging(&[code], &ProgressTracker::new())
             .pop()
@@ -1255,15 +1255,15 @@ fn main() {
         assert_eq!(
             levels,
             vec![
-                ("\"trace message\"".to_string(), Some(LogLevel::Trace)),
-                ("\"debug message\"".to_string(), Some(LogLevel::Debug)),
-                ("\"info message\"".to_string(), Some(LogLevel::Info)),
-                ("\"warn message\"".to_string(), Some(LogLevel::Warn)),
-                ("\"error message\"".to_string(), Some(LogLevel::Error)),
-                ("\"plain message\"".to_string(), None),
-                ("\"log macro message\"".to_string(), Some(LogLevel::Warn)),
-                ("\"event macro message\"".to_string(), Some(LogLevel::Info)),
-                ("\"level variable message\"".to_string(), None),
+                ("\"trace message\"".to_string(), LogLevel::Trace),
+                ("\"debug message\"".to_string(), LogLevel::Debug),
+                ("\"info message\"".to_string(), LogLevel::Info),
+                ("\"warn message\"".to_string(), LogLevel::Warn),
+                ("\"error message\"".to_string(), LogLevel::Error),
+                ("\"plain message\"".to_string(), LogLevel::Unknown),
+                ("\"log macro message\"".to_string(), LogLevel::Warn),
+                ("\"event macro message\"".to_string(), LogLevel::Info),
+                ("\"level variable message\"".to_string(), LogLevel::Unknown),
             ]
         );
     }
@@ -1291,15 +1291,15 @@ class Main {
         assert_eq!(
             levels,
             vec![
-                ("\"trace message\"".to_string(), Some(LogLevel::Trace)),
-                ("\"debug message\"".to_string(), Some(LogLevel::Debug)),
-                ("\"info message\"".to_string(), Some(LogLevel::Info)),
-                ("\"warn message\"".to_string(), Some(LogLevel::Warn)),
-                ("\"error message\"".to_string(), Some(LogLevel::Error)),
-                ("\"severe message\"".to_string(), Some(LogLevel::Error)),
-                ("\"fatal message\"".to_string(), Some(LogLevel::Fatal)),
-                ("\"finest message\"".to_string(), Some(LogLevel::Trace)),
-                ("\"level arg message\"".to_string(), Some(LogLevel::Warn)),
+                ("\"trace message\"".to_string(), LogLevel::Trace),
+                ("\"debug message\"".to_string(), LogLevel::Debug),
+                ("\"info message\"".to_string(), LogLevel::Info),
+                ("\"warn message\"".to_string(), LogLevel::Warn),
+                ("\"error message\"".to_string(), LogLevel::Error),
+                ("\"severe message\"".to_string(), LogLevel::Error),
+                ("\"fatal message\"".to_string(), LogLevel::Fatal),
+                ("\"finest message\"".to_string(), LogLevel::Trace),
+                ("\"level arg message\"".to_string(), LogLevel::Warn),
             ]
         );
     }
@@ -1330,27 +1330,24 @@ int main(int argc, char* argv[]) {
         assert_eq!(
             levels,
             vec![
-                ("\"info message\"".to_string(), Some(LogLevel::Info)),
-                ("\"warn message\"".to_string(), Some(LogLevel::Warn)),
-                ("\"error message\"".to_string(), Some(LogLevel::Error)),
-                ("\"critical message\"".to_string(), Some(LogLevel::Fatal)),
-                ("\"lnav debug message\"".to_string(), Some(LogLevel::Debug)),
-                ("\"lnav warn message\"".to_string(), Some(LogLevel::Warn)),
+                ("\"info message\"".to_string(), LogLevel::Info),
+                ("\"warn message\"".to_string(), LogLevel::Warn),
+                ("\"error message\"".to_string(), LogLevel::Error),
+                ("\"critical message\"".to_string(), LogLevel::Fatal),
+                ("\"lnav debug message\"".to_string(), LogLevel::Debug),
+                ("\"lnav warn message\"".to_string(), LogLevel::Warn),
+                ("\"syslog error message\"".to_string(), LogLevel::Error),
+                ("\"spdlog trace message\"".to_string(), LogLevel::Trace),
+                ("\"not a log message\"".to_string(), LogLevel::Unknown),
+                ("\"plain message\"".to_string(), LogLevel::Unknown),
+                ("\"conn error\"".to_string(), LogLevel::Info),
+                ("\"second message\"".to_string(), LogLevel::Info),
+                ("\"variable arg message\"".to_string(), LogLevel::Info),
+                ("\"camel message\"".to_string(), LogLevel::Info),
                 (
-                    "\"syslog error message\"".to_string(),
-                    Some(LogLevel::Error)
+                    "\"not a log message either\"".to_string(),
+                    LogLevel::Unknown
                 ),
-                (
-                    "\"spdlog trace message\"".to_string(),
-                    Some(LogLevel::Trace)
-                ),
-                ("\"not a log message\"".to_string(), None),
-                ("\"plain message\"".to_string(), None),
-                ("\"conn error\"".to_string(), Some(LogLevel::Info)),
-                ("\"second message\"".to_string(), Some(LogLevel::Info)),
-                ("\"variable arg message\"".to_string(), Some(LogLevel::Info)),
-                ("\"camel message\"".to_string(), Some(LogLevel::Info)),
-                ("\"not a log message either\"".to_string(), None),
             ]
         );
     }
@@ -1377,17 +1374,17 @@ def main():
         assert_eq!(
             levels,
             vec![
-                ("\"debug message\"".to_string(), Some(LogLevel::Debug)),
-                ("\"info message\"".to_string(), Some(LogLevel::Info)),
-                ("\"warn message\"".to_string(), Some(LogLevel::Warn)),
-                ("\"error message\"".to_string(), Some(LogLevel::Error)),
-                ("\"exception message\"".to_string(), Some(LogLevel::Error)),
-                ("\"critical message\"".to_string(), Some(LogLevel::Fatal)),
-                ("\"plain message\"".to_string(), None),
-                ("\"deprecated message\"".to_string(), None),
-                ("\"bad arg message\"".to_string(), None),
-                ("\"level arg message\"".to_string(), Some(LogLevel::Warn)),
-                ("\"level variable message\"".to_string(), None),
+                ("\"debug message\"".to_string(), LogLevel::Debug),
+                ("\"info message\"".to_string(), LogLevel::Info),
+                ("\"warn message\"".to_string(), LogLevel::Warn),
+                ("\"error message\"".to_string(), LogLevel::Error),
+                ("\"exception message\"".to_string(), LogLevel::Error),
+                ("\"critical message\"".to_string(), LogLevel::Fatal),
+                ("\"plain message\"".to_string(), LogLevel::Unknown),
+                ("\"deprecated message\"".to_string(), LogLevel::Unknown),
+                ("\"bad arg message\"".to_string(), LogLevel::Unknown),
+                ("\"level arg message\"".to_string(), LogLevel::Warn),
+                ("\"level variable message\"".to_string(), LogLevel::Unknown),
             ]
         );
     }
@@ -1415,7 +1412,7 @@ fn main() {
             let log_ref =
                 LogRefBuilder::new().build_from_captures(log_format.captures(line).unwrap(), line);
             let result = link_to_source(&log_ref, &src_refs).unwrap();
-            assert_eq!(result.level, Some(expected), "{line}");
+            assert_eq!(result.level, expected, "{line}");
         }
     }
 

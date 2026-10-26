@@ -20,6 +20,9 @@ pub enum LogLevel {
     Warn,
     Error,
     Fatal,
+    /// The level could not be determined, which also means the statement might not be logging
+    /// at all, like a `printf()` or a call that just happens to take a string.
+    Unknown,
 }
 
 impl LogLevel {
@@ -145,8 +148,7 @@ pub struct SourceRef {
     pub column: usize,
     pub name: String,
     pub text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub level: Option<LogLevel>,
+    pub level: LogLevel,
     pub quality: usize,
     #[serde(skip_serializing)]
     pub(crate) matcher: Regex,
@@ -194,7 +196,8 @@ impl SourceRef {
                 .leading_args
                 .iter()
                 .find_map(|arg| LogLevel::from_level_arg(arg))
-                .or_else(|| result.call_name.as_deref().and_then(LogLevel::from_name));
+                .or_else(|| result.call_name.as_deref().and_then(LogLevel::from_name))
+                .unwrap_or(LogLevel::Unknown);
             if !result.args.is_empty() {
                 args = result.args;
             }
