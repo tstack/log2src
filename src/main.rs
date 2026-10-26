@@ -66,6 +66,9 @@ enum Command {
     Match(MatchArgs),
     /// Print the log statements found in the source directories
     Statements(StatementsArgs),
+    /// Print the logging functions/macros/methods called by the statements that have a level,
+    /// for each source directory
+    Calls,
     /// Find the source file for a path, like one from a stack trace
     Locate(LocateArgs),
     /// Manage the cache of log statements
@@ -115,13 +118,8 @@ struct StatementsArgs {
     file: Option<PathBuf>,
 
     /// Print the number of statements by language and level instead of the statements
-    #[arg(long, conflicts_with = "calls")]
-    summary: bool,
-
-    /// Print the logging functions/macros/methods called by the statements that have a level,
-    /// for each source root, instead of the statements
     #[arg(long)]
-    calls: bool,
+    summary: bool,
 }
 
 #[derive(Args)]
@@ -537,23 +535,6 @@ fn run_match(cli: &Cli, args: &MatchArgs) -> miette::Result<()> {
 fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
     let log_matcher = load_log_matcher(cli, CacheMode::ReadWrite, true)?;
 
-    if args.calls {
-        for (root, log_calls) in log_matcher.log_calls() {
-            for (name, log_call) in log_calls {
-                let result = json!({
-                    "root": root.to_string_lossy(),
-                    "name": name,
-                    "statements": log_call.statements,
-                    "levels": log_call.levels,
-                });
-                if !print_json(&result) {
-                    return Ok(());
-                }
-            }
-        }
-        return Ok(());
-    }
-
     let mut statements: Vec<&SourceRef> = match &args.file {
         Some(path) => {
             let Some(found) = log_matcher.find_file(path) else {
@@ -604,6 +585,26 @@ fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
     for stmt in statements {
         if !print_json(stmt) {
             break;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_calls(cli: &Cli) -> miette::Result<()> {
+    let log_matcher = load_log_matcher(cli, CacheMode::ReadWrite, true)?;
+
+    for (root, log_calls) in log_matcher.log_calls() {
+        for (name, log_call) in log_calls {
+            let result = json!({
+                "root": root.to_string_lossy(),
+                "name": name,
+                "statements": log_call.statements,
+                "levels": log_call.levels,
+            });
+            if !print_json(&result) {
+                return Ok(());
+            }
         }
     }
 
@@ -767,6 +768,7 @@ fn main() -> miette::Result<()> {
     match &cli.command {
         Command::Match(args) => run_match(&cli, args),
         Command::Statements(args) => run_statements(&cli, args),
+        Command::Calls => run_calls(&cli),
         Command::Locate(args) => run_locate(&cli, args),
         Command::Cache(command) => run_cache(&cli, command),
     }
