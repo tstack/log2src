@@ -45,6 +45,8 @@ pub(crate) struct MessageRef {
     /// The reference as written in the source, like `Messages.LOG_STARTING`.
     pub text: String,
     pub level: LogLevel,
+    /// The name of the logging method that was called, like `logger.info`.
+    pub call_name: Option<String>,
     pub vars: Vec<String>,
     /// The kind of value produced by each expression in `vars`.
     pub var_kinds: Vec<ValueKind>,

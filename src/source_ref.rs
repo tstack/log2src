@@ -15,7 +15,9 @@ pub enum FormatArgument {
 }
 
 /// The normalized level of a log statement, derived from the name of the logging call.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq, clap::ValueEnum)]
+#[derive(
+    Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, clap::ValueEnum,
+)]
 pub enum LogLevel {
     Trace,
     Debug,
@@ -306,6 +308,10 @@ pub struct SourceRef {
     pub block_id: u32,
     pub text: String,
     pub level: LogLevel,
+    /// The name of the logging function/macro/method that was called, as written in the source,
+    /// like `ws_debug`, `logger.info`, or `syslog`.
+    #[serde(rename(serialize = "callName"))]
+    pub call_name: Option<String>,
     pub quality: usize,
     #[serde(with = "serde_regex")]
     pub(crate) pattern: Regex,
@@ -351,6 +357,7 @@ impl SourceRef {
     pub(crate) fn new(code: &CodeSource, result: QueryResult) -> Option<SourceRef> {
         let range = result.range;
         let level = result.level();
+        let call_name = result.call_name.clone();
         let source = code.buffer.as_str();
         let text = source[range.start_byte..range.end_byte].to_string();
         let line_no = range.start_point.row + 1;
@@ -393,6 +400,7 @@ impl SourceRef {
                 block_id: result.block_id,
                 text,
                 level,
+                call_name,
                 quality,
                 pattern_str: matcher.as_str().to_string(),
                 pattern: matcher,
@@ -438,6 +446,7 @@ impl SourceRef {
             block_id: message_ref.block_id,
             text: message_ref.text.clone(),
             level: message_ref.level,
+            call_name: message_ref.call_name.clone(),
             quality,
             pattern_str: matcher.as_str().to_string(),
             pattern: matcher,

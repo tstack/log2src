@@ -7,7 +7,7 @@ use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -153,7 +153,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "29")]
+    #[serde(rename = "30")]
     Current,
 }
 
@@ -243,6 +243,21 @@ pub struct SourceTree {
     /// whenever the statements change.
     #[serde(skip)]
     line_cache: RwLock<LineCache>,
+    /// The logging functions/macros/methods called by the statements under this root, keyed by
+    /// the name of the call.  Rebuilt after loading/extracting.
+    #[serde(skip)]
+    pub log_calls: BTreeMap<String, LogCall>,
+}
+
+/// A logging function/macro/method, like `ws_debug` or `logger.info`, and the levels of the
+/// statements that call it.
+#[derive(Debug, Default, Serialize)]
+pub struct LogCall {
+    /// The number of statements that call it.
+    pub statements: usize,
+    /// The number of statements with each level.  The level usually comes from the name of
+    /// the call, but it can also come from an argument, like `syslog(LOG_ERR, ...)`.
+    pub levels: BTreeMap<LogLevel, usize>,
 }
 
 /// Maps a file name and line number from a log message to the statements that matched it.
@@ -285,6 +300,27 @@ impl SourceTree {
             }
         }
         summary
+    }
+
+    /// Collect the calls of the statements that have a level, which are the ones identified as
+    /// logging.
+    fn collect_log_calls(&mut self) {
+        self.log_calls.clear();
+        let stmts = self
+            .files_with_statements
+            .values()
+            .flat_map(|sif| sif.statements());
+        for stmt in stmts {
+            let Some(call_name) = &stmt.call_name else {
+                continue;
+            };
+            if stmt.level == LogLevel::Unknown {
+                continue;
+            }
+            let log_call = self.log_calls.entry(call_name.clone()).or_default();
+            log_call.statements += 1;
+            *log_call.levels.entry(stmt.level).or_default() += 1;
+        }
     }
 
     fn rebuild_prefilter(&mut self) {
@@ -604,6 +640,7 @@ impl LogMatcher {
             });
         }
         decoded_root.resolve_message_refs();
+        decoded_root.collect_log_calls();
         decoded_root.rebuild_prefilter();
         Ok(decoded_root)
     }
@@ -736,6 +773,7 @@ impl LogMatcher {
                     file_name_to_sources: HashMap::new(),
                     prefilter: None,
                     line_cache: RwLock::default(),
+                    log_calls: BTreeMap::new(),
                 });
         }
         Ok(())
@@ -848,6 +886,7 @@ impl LogMatcher {
             ref_summary.resolved += summary.resolved;
             ref_summary.not_found += summary.not_found;
             ref_summary.no_text += summary.no_text;
+            coll.collect_log_calls();
             coll.rebuild_prefilter();
         });
         let mut found = format!("{} found", self.statements().count());
@@ -884,6 +923,13 @@ impl LogMatcher {
         self.roots
             .values_mut()
             .for_each(SourceTree::rebuild_prefilter);
+    }
+
+    /// Iterate over the logging calls found under each root.
+    pub fn log_calls(&self) -> impl Iterator<Item = (&PathBuf, &BTreeMap<String, LogCall>)> {
+        self.roots
+            .iter()
+            .map(|(root, coll)| (root, &coll.log_calls))
     }
 
     /// Iterate over all of the log statements that were found.
@@ -1825,6 +1871,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                             block_id: result.block_id,
                             text: text.to_string(),
                             level,
+                            call_name: result.call_name.clone(),
                             vars: vec![],
                             var_kinds: vec![],
                             candidates: symbols.candidates(text, range.start_byte),
@@ -4867,6 +4914,53 @@ def main(x, t, pct):
             .into_iter()
             .map(|src_ref| (src_ref.text, src_ref.level))
             .collect()
+    }
+
+    #[test]
+    fn test_collect_log_calls() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.c"),
+            r#"
+int main(int argc, char *argv[]) {
+    log_debug("first debug message %d", argc);
+    log_debug("second debug message");
+    syslog(LOG_ERR, "syslog error message");
+    syslog(LOG_INFO, "syslog info message");
+    printf("plain message\n");
+}
+"#,
+        );
+        let mut tree = SourceTree {
+            tree: SourceHierTree::from(Path::new("in-mem")),
+            files_with_statements: HashMap::new(),
+            file_name_to_sources: HashMap::new(),
+            prefilter: None,
+            line_cache: RwLock::default(),
+            log_calls: BTreeMap::new(),
+        };
+        for sif in extract_logging(&[code], &ProgressTracker::new()) {
+            tree.files_with_statements.insert(sif.id, sif);
+        }
+        tree.collect_log_calls();
+        let found: Vec<(&str, usize, Vec<(LogLevel, usize)>)> = tree
+            .log_calls
+            .iter()
+            .map(|(name, log_call)| {
+                (
+                    name.as_str(),
+                    log_call.statements,
+                    log_call.levels.clone().into_iter().collect(),
+                )
+            })
+            .collect();
+        // `printf` has no level, so it is not identified as logging.
+        assert_eq!(
+            found,
+            vec![
+                ("log_debug", 2, vec![(LogLevel::Debug, 2)]),
+                ("syslog", 2, vec![(LogLevel::Info, 1), (LogLevel::Error, 1)]),
+            ]
+        );
     }
 
     #[test]

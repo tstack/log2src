@@ -115,8 +115,13 @@ struct StatementsArgs {
     file: Option<PathBuf>,
 
     /// Print the number of statements by language and level instead of the statements
-    #[arg(long)]
+    #[arg(long, conflicts_with = "calls")]
     summary: bool,
+
+    /// Print the logging functions/macros/methods called by the statements that have a level,
+    /// for each source root, instead of the statements
+    #[arg(long)]
+    calls: bool,
 }
 
 #[derive(Args)]
@@ -531,6 +536,23 @@ fn run_match(cli: &Cli, args: &MatchArgs) -> miette::Result<()> {
 
 fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
     let log_matcher = load_log_matcher(cli, CacheMode::ReadWrite, true)?;
+
+    if args.calls {
+        for (root, log_calls) in log_matcher.log_calls() {
+            for (name, log_call) in log_calls {
+                let result = json!({
+                    "root": root.to_string_lossy(),
+                    "name": name,
+                    "statements": log_call.statements,
+                    "levels": log_call.levels,
+                });
+                if !print_json(&result) {
+                    return Ok(());
+                }
+            }
+        }
+        return Ok(());
+    }
 
     let mut statements: Vec<&SourceRef> = match &args.file {
         Some(path) => {

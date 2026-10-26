@@ -43,6 +43,7 @@ log2src match -d ~/src/app --message 'Connected to db after 3 retries'
 log2src statements -d ~/src/app --level warn,error --lang java
 log2src statements -d ~/src/app --file Database.java
 log2src statements -d ~/src/app --summary
+log2src statements -d ~/src/app --calls
 
 # Find the source file for a path, like one in a stack trace
 log2src locate -d ~/src/app 'C:\build\App\Program.cs'
