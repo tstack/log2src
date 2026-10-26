@@ -81,11 +81,13 @@ impl LogLevel {
                     .rev()
                     .find_map(|w| Self::from_word(w));
             }
-            // A level followed by OpenSSH's suffixes, like `fatal_fr` and `debug3_f`, which add
-            // the function name and the error code.
+            // A level followed by OpenSSH's suffixes, like `fatal_fr`, `error_r`, and
+            // `debug3_f`, which add the function name and the error code.
             if segments.is_empty()
                 && !require_qualifier
-                && words[1..].iter().all(|w| matches!(w.as_str(), "f" | "fr"))
+                && words[1..]
+                    .iter()
+                    .all(|w| matches!(w.as_str(), "f" | "r" | "fr"))
             {
                 if let Some(level) = Self::from_word(&words[0]) {
                     return Some(level);
@@ -888,6 +890,7 @@ mod tests {
             ("err2", None),
             ("info1", None),
             ("debug2_fr", Some(LogLevel::Debug)),
+            ("error_r", Some(LogLevel::Error)),
             ("err", Some(LogLevel::Fatal)),
             ("errx", Some(LogLevel::Fatal)),
             ("logger.err", Some(LogLevel::Error)),
