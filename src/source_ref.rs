@@ -15,7 +15,9 @@ pub enum FormatArgument {
 }
 
 /// The normalized level of a log statement, derived from the name of the logging call.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq, clap::ValueEnum)]
+#[derive(
+    Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, clap::ValueEnum,
+)]
 pub enum LogLevel {
     Trace,
     Debug,
@@ -30,10 +32,50 @@ pub enum LogLevel {
 
 impl LogLevel {
     /// Map the name of a logging function/macro/method, like `log::warn`, `logger.warning`,
-    /// `spdlog::info`, `log_debug`, `logInfo`, or `SPDLOG_ERROR`, to a level.  Returns `None`
-    /// for names that don't indicate a level, like `println`, `printf`, or `parser.error`.
+    /// `spdlog::info`, `log_debug`, `logInfo`, `SPDLOG_ERROR`, or `ws_warning`, to a level.
+    /// Returns `None` for names that don't indicate a level, like `println`, `printf`, or
+    /// `parser.error`.  An unqualified name that ends in a level after a prefix that isn't
+    /// logging related, like `ws_warning` or `report_error`, is given a level too.  Whether
+    /// such a prefix is really a logger is decided later, across all of the calls in a source
+    /// tree, using [`LogLevel::call_family`].
     pub fn from_name(name: &str) -> Option<LogLevel> {
+        Self::from_known_name(name)
+            .or_else(|| Self::from_prefixed_name(name).map(|(level, _)| level))
+    }
+
+    /// Like [`LogLevel::from_name`], but only for names that are known to be logging on their
+    /// own, without the names with a prefix that might not be a logger.
+    fn from_known_name(name: &str) -> Option<LogLevel> {
         Self::classify(name, false)
+    }
+
+    /// The family of a call whose level only comes from a prefix that might not be a logger,
+    /// which is the prefix, like `ws` for `ws_warning` and `report` for `reportError`.  Returns
+    /// `None` for names that are known to be logging, or don't indicate a level.
+    pub fn call_family(name: &str) -> Option<String> {
+        if Self::from_known_name(name).is_some() {
+            return None;
+        }
+        Self::from_prefixed_name(name).map(|(_, family)| family)
+    }
+
+    /// The level and prefix of an unqualified name that ends in a level, like `ws_warning`.
+    /// "message" is taken as `Info` here, like GLib's `g_message`, since the family check
+    /// does not count `Info`.
+    fn from_prefixed_name(name: &str) -> Option<(LogLevel, String)> {
+        if name.contains(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            return None;
+        }
+        let mut words = split_words(name);
+        let last = words.pop()?;
+        if words.is_empty() {
+            return None;
+        }
+        let level = match last.as_str() {
+            "message" => Some(LogLevel::Info),
+            _ => Self::from_word(&last),
+        };
+        level.map(|level| (level, words.join("_")))
     }
 
     /// Map an argument that is passed to a logging call, like `LOG_ERR`, `logging.WARNING`, or
@@ -306,6 +348,10 @@ pub struct SourceRef {
     pub block_id: u32,
     pub text: String,
     pub level: LogLevel,
+    /// The name of the logging function/macro/method that was called, as written in the source,
+    /// like `ws_debug`, `logger.info`, or `syslog`.
+    #[serde(rename(serialize = "callName"))]
+    pub call_name: Option<String>,
     pub quality: usize,
     #[serde(with = "serde_regex")]
     pub(crate) pattern: Regex,
@@ -351,6 +397,7 @@ impl SourceRef {
     pub(crate) fn new(code: &CodeSource, result: QueryResult) -> Option<SourceRef> {
         let range = result.range;
         let level = result.level();
+        let call_name = result.call_name.clone();
         let source = code.buffer.as_str();
         let text = source[range.start_byte..range.end_byte].to_string();
         let line_no = range.start_point.row + 1;
@@ -393,6 +440,7 @@ impl SourceRef {
                 block_id: result.block_id,
                 text,
                 level,
+                call_name,
                 quality,
                 pattern_str: matcher.as_str().to_string(),
                 pattern: matcher,
@@ -438,6 +486,7 @@ impl SourceRef {
             block_id: message_ref.block_id,
             text: message_ref.text.clone(),
             level: message_ref.level,
+            call_name: message_ref.call_name.clone(),
             quality,
             pattern_str: matcher.as_str().to_string(),
             pattern: matcher,
@@ -864,12 +913,12 @@ mod tests {
             ("println", None),
             ("printf", None),
             ("print", None),
-            ("report_error", None),
+            ("report_error", Some(LogLevel::Error)),
             ("logInfo", Some(LogLevel::Info)),
             ("LogWarning", Some(LogLevel::Warn)),
             ("m_logger->logError", Some(LogLevel::Error)),
             ("LOGError", Some(LogLevel::Error)),
-            ("reportError", None),
+            ("reportError", Some(LogLevel::Error)),
             ("tracing::error", Some(LogLevel::Error)),
             ("spdlog::get(\"app\")->warn", Some(LogLevel::Warn)),
             ("warnings.warn", None),
@@ -882,7 +931,7 @@ mod tests {
             ("fatalx", Some(LogLevel::Fatal)),
             ("warnx", Some(LogLevel::Warn)),
             ("verbose_f", Some(LogLevel::Debug)),
-            ("set_verbose", None),
+            ("set_verbose", Some(LogLevel::Debug)),
             ("trace_on", None),
             ("debug_fn", None),
             ("error_no", None),
@@ -894,11 +943,31 @@ mod tests {
             ("err", Some(LogLevel::Fatal)),
             ("errx", Some(LogLevel::Fatal)),
             ("logger.err", Some(LogLevel::Error)),
-            ("error_message", None),
+            ("error_message", Some(LogLevel::Info)),
             ("info_get", None),
         ];
         for (name, expected) in cases {
             assert_eq!(LogLevel::from_name(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_call_family() {
+        let cases = [
+            ("ws_warning", Some("ws")),
+            ("reportError", Some("report")),
+            ("zbee_append_info", Some("zbee_append")),
+            ("luaL_error", Some("lua_l")),
+            ("log_debug", None),
+            ("g_warning", None),
+            ("error", None),
+            ("logger.error", None),
+            ("parser.error", None),
+            ("ws_log", None),
+            ("ws_message", Some("ws")),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(LogLevel::call_family(name).as_deref(), expected, "{name}");
         }
     }
 

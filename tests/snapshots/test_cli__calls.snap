@@ -1,0 +1,22 @@
+---
+source: tests/test_cli.rs
+info:
+  program: log2src
+  args:
+    - calls
+    - "-d"
+    - examples
+  env:
+    APPDATA: /tmp/.tmpj3rqXc
+    COLS: "1000"
+    HOME: /tmp/.tmpj3rqXc
+    LOCALAPPDATA: /tmp/.tmpj3rqXc
+    USERPROFILE: /tmp/.tmpj3rqXc
+    XDG_CONFIG_HOME: /tmp/.tmpj3rqXc
+---
+success: true
+exit_code: 0
+----- stdout -----
+{"root":"{example_dir}","name":"debug","statements":19,"levels":{"Debug":19},"pruned":false}
+
+----- stderr -----

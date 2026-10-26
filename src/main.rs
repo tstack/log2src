@@ -3,12 +3,13 @@ use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser as ClapParse
 use colored_json::{ColoredFormatter, CompactFormatter, Styler};
 use indicatif::{ProgressBar, ProgressStyle};
 use log2src::{
-    Cache, LogError, LogFormat, LogLevel, LogMapping, LogMatchOptions, LogMatcher, LogRef,
+    Cache, LogCall, LogError, LogFormat, LogLevel, LogMapping, LogMatchOptions, LogMatcher, LogRef,
     LogRefBuilder, ProgressTracker, ProgressUpdate, Revision, SourceLanguage, SourceRef,
 };
 use miette::{miette, IntoDiagnostic, MietteHandlerOpts, Report};
 use serde::Serialize;
 use serde_json::json;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{stdout, BufRead, BufReader, Write};
 use std::path::Path;
@@ -66,6 +67,9 @@ enum Command {
     Match(MatchArgs),
     /// Print the log statements found in the source directories
     Statements(StatementsArgs),
+    /// Print the logging functions/macros/methods called by the statements that have a level,
+    /// for each source directory
+    Calls,
     /// Find the source file for a path, like one from a stack trace
     Locate(LocateArgs),
     /// Manage the cache of log statements
@@ -588,6 +592,34 @@ fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
     Ok(())
 }
 
+/// A line of output from the `calls` sub-command.
+#[derive(Serialize)]
+struct CallOutput<'a> {
+    root: Cow<'a, str>,
+    name: &'a str,
+    #[serde(flatten)]
+    log_call: &'a LogCall,
+}
+
+fn run_calls(cli: &Cli) -> miette::Result<()> {
+    let log_matcher = load_log_matcher(cli, CacheMode::ReadWrite, true)?;
+
+    for (root, log_calls) in log_matcher.log_calls() {
+        for (name, log_call) in log_calls {
+            let result = CallOutput {
+                root: root.to_string_lossy(),
+                name,
+                log_call,
+            };
+            if !print_json(&result) {
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn run_locate(cli: &Cli, args: &LocateArgs) -> miette::Result<()> {
     let log_matcher = load_log_matcher(cli, CacheMode::ReadWrite, false)?;
 
@@ -745,6 +777,7 @@ fn main() -> miette::Result<()> {
     match &cli.command {
         Command::Match(args) => run_match(&cli, args),
         Command::Statements(args) => run_statements(&cli, args),
+        Command::Calls => run_calls(&cli),
         Command::Locate(args) => run_locate(&cli, args),
         Command::Cache(command) => run_cache(&cli, command),
     }

@@ -44,11 +44,16 @@ impl QueryResult {
     /// The level of the log call.  A level constant passed as an argument, like
     /// `syslog(LOG_ERR, ...)`, takes precedence over the name of the call.
     pub fn level(&self) -> LogLevel {
+        self.arg_level()
+            .or_else(|| self.call_name.as_deref().and_then(LogLevel::from_name))
+            .unwrap_or(LogLevel::Unknown)
+    }
+
+    /// The level from a level constant passed as an argument, if there is one.
+    pub fn arg_level(&self) -> Option<LogLevel> {
         self.leading_args
             .iter()
             .find_map(|arg| LogLevel::from_level_arg(arg))
-            .or_else(|| self.call_name.as_deref().and_then(LogLevel::from_name))
-            .unwrap_or(LogLevel::Unknown)
     }
 }
 

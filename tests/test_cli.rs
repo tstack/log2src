@@ -38,6 +38,15 @@ fn statements_by_level() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn calls() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = common_settings::CommandGuard::new("calls")?;
+    cmd.arg("-d").arg("examples");
+
+    assert_cmd_snapshot!(cmd.cmd);
+    Ok(())
+}
+
+#[test]
 fn statements_missing_file() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = common_settings::CommandGuard::new("statements")?;
     cmd.arg("-d").arg("examples").arg("--file").arg("nope.rs");

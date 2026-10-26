@@ -44,6 +44,9 @@ log2src statements -d ~/src/app --level warn,error --lang java
 log2src statements -d ~/src/app --file Database.java
 log2src statements -d ~/src/app --summary
 
+# List the logging functions/macros/methods that the statements call
+log2src calls -d ~/src/app
+
 # Find the source file for a path, like one in a stack trace
 log2src locate -d ~/src/app 'C:\build\App\Program.cs'
 

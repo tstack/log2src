@@ -7,6 +7,7 @@ use tempfile::TempDir;
 pub fn enable_filters(home_path: &Path) -> insta::internals::SettingsBindDropGuard {
     let mut settings = insta::Settings::clone_current();
     settings.add_filter(r#""[^"]*examples(?:/|\\\\?)"#, "\"{example_dir}/");
+    settings.add_filter(r#""[^"]*examples""#, "\"{example_dir}\"");
     settings.add_filter(r#""[^"]*tests(?:/|\\\\?)java(?:/|\\\\?)"#, "\"{java_dir}/");
     settings.add_filter(
         r#""[^"]*tests(?:/|\\\\?)kotlin(?:/|\\\\?)"#,
