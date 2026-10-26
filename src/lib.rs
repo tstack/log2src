@@ -1415,6 +1415,46 @@ impl SourceLanguage {
                         )
                         (#match? @macro-name "(^|::)(log|event)$")
                     )
+                    ; PROTOTYPE: error-message sources
+                    ; `write!(f, "...")` in a `Display` impl
+                    (macro_invocation macro: (_) @macro-name
+                        (token_tree . (identifier) . (string_literal) @log)
+                        (#match? @macro-name "^(write|writeln)$")
+                    )
+                    ; `.context("...")`, `.expect("...")`
+                    (call_expression
+                        function: (field_expression field: (field_identifier) @macro-name)
+                        arguments: (arguments . (string_literal) @log)
+                        (#match? @macro-name "^(context|with_context|expect|ok_or)$")
+                    )
+                    ; `.context(format!("..."))`, `Err(format!("..."))`
+                    (call_expression
+                        function: [
+                            (field_expression field: (field_identifier) @macro-name)
+                            (identifier) @macro-name
+                        ]
+                        arguments: (arguments .
+                            (macro_invocation macro: (identifier) @_fmt
+                                (token_tree . (string_literal) @log)))
+                        (#eq? @_fmt "format")
+                        (#match? @macro-name "^(context|ok_or|Err)$")
+                    )
+                    ; `.with_context(|| format!("..."))`, `.map_err(|e| format!("..."))`
+                    (call_expression
+                        function: (field_expression field: (field_identifier) @macro-name)
+                        arguments: (arguments .
+                            (closure_expression body:
+                                (macro_invocation macro: (identifier) @_fmt
+                                    (token_tree . (string_literal) @log))))
+                        (#eq? @_fmt "format")
+                        (#match? @macro-name "^(with_context|map_err|ok_or_else|unwrap_or_else)$")
+                    )
+                    ; thiserror's `#[error("...")]`
+                    (attribute
+                        (identifier) @macro-name
+                        arguments: (token_tree . (string_literal) @log)
+                        (#eq? @macro-name "error")
+                    )
                 "#
             }
             SourceLanguage::Java => JAVA_QUERY.as_str(),
