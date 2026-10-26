@@ -4156,6 +4156,8 @@ int main(int argc, char* argv[]) {
     g_message("glib message");
     g_warning("glib warn message");
     q_tool("not a qt log message");
+    on_error("not a log message handler");
+    x_y_debug("single letter prefix message");
 }
 "#,
         );
@@ -4185,6 +4187,14 @@ int main(int argc, char* argv[]) {
                 ("\"glib message\"".to_string(), LogLevel::Info),
                 ("\"glib warn message\"".to_string(), LogLevel::Warn),
                 ("\"not a qt log message\"".to_string(), LogLevel::Unknown),
+                (
+                    "\"not a log message handler\"".to_string(),
+                    LogLevel::Unknown
+                ),
+                (
+                    "\"single letter prefix message\"".to_string(),
+                    LogLevel::Debug
+                ),
             ]
         );
     }
