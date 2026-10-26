@@ -182,6 +182,37 @@ impl<'a> SourceQuery<'a> {
                     }
                     kind = "message_ref";
                 }
+                let mut raw = false;
+                if self.source_language == SourceLanguage::Cpp && kind == "raw_string_literal" {
+                    // The contents of a raw string, like `R"(...)"`, are used as-is.
+                    let mut cursor = child.walk();
+                    let content = child
+                        .named_children(&mut cursor)
+                        .find(|piece| piece.kind() == "raw_string_content")
+                        .map_or("", |piece| &self.source[piece.byte_range()]);
+                    concat_pattern = Some(content.to_string());
+                    raw = true;
+                    kind = "string_literal";
+                }
+                if self.source_language == SourceLanguage::Python
+                    && matches!(kind, "binary_operator" | "call")
+                    && query.capture_names()[capture.index as usize] == "args"
+                {
+                    // A message that is formatted before it is logged, like `"..." % args`.
+                    // Strings are built like this for all sorts of calls, so only keep the
+                    // ones passed to a logging call.
+                    if !self.has_level(call_name.as_deref(), child) {
+                        break;
+                    }
+                    match self.python_expr_pattern(child, Self::has_python_format_args(child)) {
+                        Some((pattern, args)) => {
+                            concat_pattern = Some(pattern);
+                            concat_args = args;
+                        }
+                        None => break,
+                    }
+                    kind = "string";
+                }
                 match kind {
                     "message_ref" => {
                         got_string_literal = true;
@@ -215,7 +246,7 @@ impl<'a> SourceQuery<'a> {
                         }
                         if child.kind() == "binary_expression"
                             && self.source_language == SourceLanguage::Cpp
-                            && call_name.as_deref().and_then(LogLevel::from_name).is_none()
+                            && !self.has_level(call_name.as_deref(), child)
                         {
                             // C++ strings are concatenated for all sorts of calls, like paths
                             // and option names, so only keep the ones passed to a logging call.
@@ -261,7 +292,7 @@ impl<'a> SourceQuery<'a> {
                         block_id: self.block_id(anchor),
                         pattern: concat_pattern.take(),
                         args: std::mem::take(&mut concat_args),
-                        raw: false,
+                        raw,
                         value_kind: ValueKind::Any,
                         call_name: call_name.clone(),
                         leading_args: self.leading_args(child),
@@ -423,6 +454,17 @@ impl<'a> SourceQuery<'a> {
     /// there are any, the returned arguments list every placeholder in order.  If there are no
     /// `format_args`, a `%` in the string is literal text.
     fn python_pattern(&self, node: Node, format_args: bool) -> (String, Vec<Arg>) {
+        let (pattern, mut args, interpolated) = self.python_template(node, format_args);
+        if !interpolated {
+            // The placeholders will be found when building the matcher.
+            args.clear();
+        }
+        (pattern, args)
+    }
+
+    /// Convert a Python string into a pattern and the arguments for all of its placeholders.
+    /// Also returns whether the string has any interpolations.
+    fn python_template(&self, node: Node, format_args: bool) -> (String, Vec<Arg>, bool) {
         let mut pattern = String::new();
         let mut args = Vec::new();
         let mut counter = ArgCounter::default();
@@ -514,11 +556,196 @@ impl<'a> SourceQuery<'a> {
                 }
             }
         }
+        (pattern, args, interpolated)
+    }
+
+    /// Convert a Python message that is formatted before being logged into a pattern, like
+    /// `"user %s" % name`, `"user " + name`, or `"user {}".format(name)`.  The expressions
+    /// are the arguments of the placeholders.  Returns None for anything else, like arithmetic.
+    fn python_expr_pattern(&self, node: Node, format_args: bool) -> Option<(String, Vec<Arg>)> {
+        match node.kind() {
+            "binary_operator" => match node.child_by_field_name("operator")?.kind() {
+                "%" => self.python_percent_pattern(node),
+                "+" => self.python_concat_pattern(node, format_args),
+                _ => None,
+            },
+            "call" => self.python_format_pattern(node, format_args),
+            _ => None,
+        }
+    }
+
+    fn is_python_string(node: Node) -> bool {
+        matches!(node.kind(), "string" | "concatenated_string")
+    }
+
+    /// Convert `"user %s has %d items" % (name, count)` into a pattern.
+    fn python_percent_pattern(&self, node: Node) -> Option<(String, Vec<Arg>)> {
+        let left = node.child_by_field_name("left")?;
+        let right = node.child_by_field_name("right")?;
+        // Mapping keys, like `%(name)s`, are not supported.
+        if !Self::is_python_string(left) || self.source[left.byte_range()].contains("%(") {
+            return None;
+        }
+        let (pattern, placeholders, interpolated) = self.python_template(left, true);
+        if interpolated {
+            return None;
+        }
+        let values: Vec<Node> = if right.kind() == "tuple" {
+            let mut cursor = right.walk();
+            right
+                .named_children(&mut cursor)
+                .filter(|n| n.kind() != "comment")
+                .collect()
+        } else {
+            vec![right]
+        };
+        if values
+            .iter()
+            .any(|v| matches!(v.kind(), "dictionary" | "list_splat"))
+        {
+            return None;
+        }
+        // A single value for several placeholders is a tuple, like `"(%s, %s)" % pair`.
+        let tuple_var = (values.len() == 1 && right.kind() != "tuple" && placeholders.len() > 1)
+            .then(|| self.source[right.byte_range()].trim());
+        let mut next = 0;
+        let mut args = Vec::new();
+        for (arg, _) in placeholders {
+            let index = match arg {
+                FormatArgument::Placeholder => {
+                    next += 1;
+                    next - 1
+                }
+                FormatArgument::Positional(index) => index,
+                FormatArgument::Named(_) => return None,
+            };
+            if let Some(var) = tuple_var {
+                args.push((
+                    FormatArgument::Named(format!("{var}[{index}]")),
+                    ValueKind::Any,
+                ));
+                continue;
+            }
+            let value = values.get(index)?;
+            args.push((self.python_arg(*value), self.value_kind(*value)));
+        }
+        Some((pattern, args))
+    }
+
+    /// Convert `"user " + name + " logged in"` into a pattern.
+    fn python_concat_pattern(&self, node: Node, format_args: bool) -> Option<(String, Vec<Arg>)> {
+        let mut operands = vec![];
+        let mut pending = vec![node];
+        while let Some(curr) = pending.pop() {
+            let is_plus = curr.kind() == "binary_operator"
+                && curr
+                    .child_by_field_name("operator")
+                    .is_some_and(|op| op.kind() == "+");
+            if is_plus {
+                pending.push(curr.child_by_field_name("right")?);
+                pending.push(curr.child_by_field_name("left")?);
+            } else {
+                operands.push(curr);
+            }
+        }
+        if !operands.iter().any(|n| Self::is_python_string(*n)) {
+            return None;
+        }
+        let mut pattern = String::new();
+        let mut args = Vec::new();
+        let mut interpolated = false;
+        for operand in operands {
+            if Self::is_python_string(operand) {
+                let (piece, piece_args, piece_interpolated) =
+                    self.python_template(operand, format_args);
+                pattern.push_str(&piece);
+                args.extend(piece_args);
+                interpolated |= piece_interpolated;
+            } else {
+                pattern.push_str("%s");
+                args.push((self.python_arg(operand), self.value_kind(operand)));
+                interpolated = true;
+            }
+        }
         if !interpolated {
-            // The placeholders will be found when building the matcher.
             args.clear();
         }
-        (pattern, args)
+        Some((pattern, args))
+    }
+
+    /// Convert `"user {} has {count} items".format(name, count=n)` into a pattern.
+    fn python_format_pattern(&self, node: Node, format_args: bool) -> Option<(String, Vec<Arg>)> {
+        static FIELD_REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\{\{|\}\}|\{([^{}]*)\}|[{}]").unwrap());
+        let string = node
+            .child_by_field_name("function")?
+            .child_by_field_name("object")?;
+        let (text, placeholders, interpolated) = self.python_template(string, format_args);
+        if interpolated || (format_args && !placeholders.is_empty()) {
+            return None;
+        }
+        let mut positional = vec![];
+        let mut keywords = vec![];
+        let arguments = node.child_by_field_name("arguments")?;
+        let mut cursor = arguments.walk();
+        for arg in arguments.named_children(&mut cursor) {
+            match arg.kind() {
+                "comment" => {}
+                "keyword_argument" => {
+                    let name = arg.child_by_field_name("name")?;
+                    keywords.push((
+                        &self.source[name.byte_range()],
+                        arg.child_by_field_name("value")?,
+                    ));
+                }
+                "list_splat" | "dictionary_splat" => return None,
+                _ => positional.push(arg),
+            }
+        }
+        let mut pattern = String::new();
+        let mut args = Vec::new();
+        let mut next = 0;
+        let mut last_end = 0;
+        for cap in FIELD_REGEX.captures_iter(&text) {
+            let whole = cap.get(0).unwrap();
+            pattern.push_str(&text[last_end..whole.start()]);
+            last_end = whole.end();
+            let Some(field) = cap.get(1) else {
+                match whole.as_str() {
+                    "{{" => pattern.push('{'),
+                    "}}" => pattern.push('}'),
+                    // A lone brace is a nested format spec or an error.
+                    _ => return None,
+                }
+                continue;
+            };
+            // Drop the conversion and format spec, like the `!r` and `:>10` in `{0!r:>10}`.
+            let field = field.as_str().split(['!', ':']).next().unwrap_or("");
+            let split = field.find(['.', '[']).unwrap_or(field.len());
+            let (name, rest) = field.split_at(split);
+            let value = if name.is_empty() {
+                next += 1;
+                positional.get(next - 1).copied()
+            } else if let Ok(index) = name.parse::<usize>() {
+                positional.get(index).copied()
+            } else {
+                keywords.iter().find(|(kw, _)| *kw == name).map(|(_, v)| *v)
+            }?;
+            pattern.push_str("%s");
+            let expr = format!("{}{}", self.source[value.byte_range()].trim(), rest);
+            let kind = if rest.is_empty() {
+                self.value_kind(value)
+            } else {
+                ValueKind::Any
+            };
+            args.push((FormatArgument::Named(expr), kind));
+        }
+        pattern.push_str(&text[last_end..]);
+        Some((pattern, args))
+    }
+
+    fn python_arg(&self, node: Node) -> FormatArgument {
+        FormatArgument::Named(self.source[node.byte_range()].trim().to_string())
     }
 
     /// Convert a Kotlin string-literal, like `"Hello $name, {}"`, into the contents of a single
@@ -762,6 +989,15 @@ impl<'a> SourceQuery<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Check if the call that `message` is passed to has a log level, either from the name of
+    /// the call or from an argument before the message.
+    fn has_level(&self, call_name: Option<&str>, message: Node) -> bool {
+        self.leading_args(message)
+            .iter()
+            .any(|arg| LogLevel::from_level_arg(arg).is_some())
+            || call_name.and_then(LogLevel::from_name).is_some()
     }
 
     fn in_function_body(node: Node) -> bool {
