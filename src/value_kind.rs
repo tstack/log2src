@@ -744,7 +744,9 @@ mod tests {
                 "value_arguments",
             ),
             SourceLanguage::Rust => (format!("fn f() {{ f(\"x\", {expr}); }}"), "arguments"),
-            SourceLanguage::Cpp => (format!("void f() {{ f(\"x\", {expr}); }}"), "argument_list"),
+            SourceLanguage::C | SourceLanguage::Cpp => {
+                (format!("void f() {{ f(\"x\", {expr}); }}"), "argument_list")
+            }
             SourceLanguage::Python => (format!("f(\"x\", {expr})\n"), "argument_list"),
         };
         let mut parser = tree_sitter::Parser::new();

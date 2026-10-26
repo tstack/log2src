@@ -81,6 +81,15 @@ impl LogLevel {
                     .rev()
                     .find_map(|w| Self::from_word(w));
             }
+            // A level followed by short suffixes, like OpenSSH's `fatal_fr` and `debug3_f`.
+            if segments.is_empty()
+                && !require_qualifier
+                && words[1..].iter().all(|w| w.chars().count() <= 2)
+            {
+                if let Some(level) = Self::from_word(&words[0]) {
+                    return Some(level);
+                }
+            }
             let qualified = segments
                 .iter()
                 .flat_map(|seg| split_words(seg))
@@ -108,13 +117,16 @@ impl LogLevel {
     }
 
     fn from_word(word: &str) -> Option<LogLevel> {
+        // A verbosity, like the `2` in OpenSSH's `debug2`.
+        let word = word.trim_end_matches(|c: char| c.is_ascii_digit());
         match word {
             "trace" | "finer" | "finest" => Some(LogLevel::Trace),
             "debug" | "dbg" | "fine" => Some(LogLevel::Debug),
             "info" | "notice" => Some(LogLevel::Info),
-            "warn" | "warning" => Some(LogLevel::Warn),
-            "error" | "err" | "exception" | "severe" => Some(LogLevel::Error),
-            "fatal" | "critical" | "crit" | "alert" | "emerg" => Some(LogLevel::Fatal),
+            // The BSD `err.h` functions and OpenBSD's `fatalx` do not append `errno`.
+            "warn" | "warning" | "warnx" => Some(LogLevel::Warn),
+            "error" | "err" | "errx" | "exception" | "severe" => Some(LogLevel::Error),
+            "fatal" | "fatalx" | "critical" | "crit" | "alert" | "emerg" => Some(LogLevel::Fatal),
             _ => None,
         }
     }
@@ -146,7 +158,8 @@ fn is_logging_word(word: &str) -> bool {
         "prolog",
     ];
     (word.contains("log") && !word.contains("ology") && !NOT_LOGGING.contains(&word))
-        || matches!(word, "level" | "lvl" | "tracing")
+        // `ll` is short for "log level", like Redis's `LL_WARNING`.
+        || matches!(word, "level" | "lvl" | "ll" | "tracing")
 }
 
 /// Split an identifier into lowercase words on underscores and case changes, so `log_debug`,
@@ -722,9 +735,15 @@ fn literal_to_regex(raw: bool, language: SourceLanguage, segment: &str) -> Strin
             't' => Some('\t'),
             'a' if language != SourceLanguage::Rust => Some('\x07'),
             'b' if language != SourceLanguage::Rust => Some('\x08'),
-            'e' if language == SourceLanguage::Cpp => Some('\x1B'),
+            'e' if language.is_c_family() => Some('\x1B'),
             'f' if language != SourceLanguage::Rust => Some('\x0C'),
-            'v' if matches!(language, SourceLanguage::Cpp | SourceLanguage::Python) => Some('\x0B'),
+            'v' if matches!(
+                language,
+                SourceLanguage::C | SourceLanguage::Cpp | SourceLanguage::Python
+            ) =>
+            {
+                Some('\x0B')
+            }
             's' if language == SourceLanguage::Java => Some(' '),
             '0' if language == SourceLanguage::Rust => Some('\0'),
             '0'..='7' => {
@@ -741,12 +760,8 @@ fn literal_to_regex(raw: bool, language: SourceLanguage, segment: &str) -> Strin
                 char::from_u32(value)
             }
             'x' if language != SourceLanguage::Java => {
-                // C++ hex escapes consume as many digits as are present.
-                let max = if language == SourceLanguage::Cpp {
-                    8
-                } else {
-                    2
-                };
+                // C and C++ hex escapes consume as many digits as are present.
+                let max = if language.is_c_family() { 8 } else { 2 };
                 take_hex(&mut chars, max).and_then(char::from_u32)
             }
             'u' if language == SourceLanguage::Rust => {
@@ -762,7 +777,11 @@ fn literal_to_regex(raw: bool, language: SourceLanguage, segment: &str) -> Strin
                 }
             }
             'u' => take_utf16_escape(&mut chars),
-            'U' if matches!(language, SourceLanguage::Cpp | SourceLanguage::Python) => {
+            'U' if matches!(
+                language,
+                SourceLanguage::C | SourceLanguage::Cpp | SourceLanguage::Python
+            ) =>
+            {
                 take_hex(&mut chars, 8).and_then(char::from_u32)
             }
             'N' if language == SourceLanguage::Python && chars.clone().next() == Some('{') => {
@@ -836,6 +855,14 @@ mod tests {
             ("warnings.warn", None),
             ("parser.error", None),
             ("errors.error", None),
+            ("debug2", Some(LogLevel::Debug)),
+            ("debug3_f", Some(LogLevel::Debug)),
+            ("fatal_fr", Some(LogLevel::Fatal)),
+            ("error_f", Some(LogLevel::Error)),
+            ("fatalx", Some(LogLevel::Fatal)),
+            ("warnx", Some(LogLevel::Warn)),
+            ("error_message", None),
+            ("info_get", None),
         ];
         for (name, expected) in cases {
             assert_eq!(LogLevel::from_name(name), expected, "{name}");
@@ -855,6 +882,9 @@ mod tests {
             ("info", None),
             ("level", None),
             ("errors.error", None),
+            ("LL_WARNING", Some(LogLevel::Warn)),
+            ("LL_DEBUG", Some(LogLevel::Debug)),
+            ("NGX_LOG_ERR", Some(LogLevel::Error)),
         ];
         for (name, expected) in cases {
             assert_eq!(LogLevel::from_level_arg(name), expected, "{name}");

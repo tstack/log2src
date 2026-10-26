@@ -62,7 +62,7 @@ impl<'a> SourceQuery<'a> {
             .unwrap_or_else(|_| panic!("Error loading {:?} grammar", language));
         let source = code.buffer.as_str();
         let mut tree = parser.parse(source, None).expect("source is parsable");
-        if code.info.language == SourceLanguage::Cpp && tree.root_node().has_error() {
+        if code.info.language.is_c_family() && tree.root_node().has_error() {
             // Masking the conditionals can also break code that parses fine as-is, like
             // alternate function signatures in each branch, so it is only a fallback.
             if let Some(masked_source) = Self::mask_preproc_conditionals(source, &tree) {
@@ -198,7 +198,7 @@ impl<'a> SourceQuery<'a> {
                     args_anchor = Some(wrapped.args_anchor);
                     printf = wrapped.printf;
                     kind = child.kind();
-                } else if self.source_language == SourceLanguage::Cpp
+                } else if self.source_language.is_c_family()
                     && self.follows_message(outer, |arg| self.unwrap_message_call(arg).is_some())
                 {
                     // An argument for a wrapped message, like the `"file.txt"` in
@@ -235,7 +235,7 @@ impl<'a> SourceQuery<'a> {
                     }
                     kind = "string_literal";
                 }
-                if self.source_language == SourceLanguage::Cpp && kind == "raw_string_literal" {
+                if self.source_language.is_c_family() && kind == "raw_string_literal" {
                     // Raw strings are used for all sorts of things, like JSON and usage text,
                     // so only keep the ones passed to a logging call.
                     let leading = leading_args.get_or_insert_with(|| self.leading_args(outer));
@@ -277,15 +277,13 @@ impl<'a> SourceQuery<'a> {
                         got_string_literal = true;
                     }
                     "string_literal" | "string" | "concatenated_string" | "binary_expression" => {
-                        if self.source_language == SourceLanguage::Cpp
-                            && !Self::in_function_body(child)
-                        {
+                        if self.source_language.is_c_family() && !Self::in_function_body(child) {
                             // Calls at file scope are macros like TEST_CASE("...") or
                             // _Pragma("...") and not log statements.
                             break;
                         }
                         if child.kind() == "concatenated_string"
-                            && self.source_language == SourceLanguage::Cpp
+                            && self.source_language.is_c_family()
                         {
                             match self.concatenated_pattern(child) {
                                 Some(pattern) => concat_pattern = Some(pattern),
@@ -304,7 +302,7 @@ impl<'a> SourceQuery<'a> {
                             }
                         }
                         if child.kind() == "binary_expression"
-                            && self.source_language == SourceLanguage::Cpp
+                            && self.source_language.is_c_family()
                             && !Self::has_level(
                                 call_name.as_deref(),
                                 leading_args.get_or_insert_with(|| self.leading_args(outer)),
@@ -1042,12 +1040,16 @@ impl<'a> SourceQuery<'a> {
     /// placeholders whose argument is the operand's expression.  Returns None if the expression
     /// is not a concatenation involving a string-literal.
     fn concat_pattern(&self, node: Node) -> Option<(String, Vec<Arg>)> {
+        // In C, adding to a string-literal is always pointer arithmetic.
+        if self.source_language == SourceLanguage::C {
+            return None;
+        }
         let mut pieces = Vec::new();
         if !self.flatten_concat(node, &mut pieces) {
             return None;
         }
         // In C++, adding a number to a string-literal is pointer arithmetic, like `"abc" + 1`.
-        if self.source_language == SourceLanguage::Cpp
+        if self.source_language.is_c_family()
             && pieces.iter().any(|piece| {
                 matches!(piece, ConcatPiece::Expr(expr)
                     if matches!(expr.kind(), "number_literal" | "char_literal"))
@@ -1130,12 +1132,12 @@ impl<'a> SourceQuery<'a> {
     fn string_contents(&self, node: Node) -> Option<Cow<'a, str>> {
         let text = &self.source[node.start_byte()..node.end_byte()];
         match (self.source_language, node.kind()) {
-            (SourceLanguage::Cpp, "string_literal") => {
+            (SourceLanguage::C | SourceLanguage::Cpp, "string_literal") => {
                 let start = text.find('"')? + 1;
                 let end = text.rfind('"')?;
                 text.get(start..end).map(Cow::Borrowed)
             }
-            (SourceLanguage::Cpp, "concatenated_string") => {
+            (SourceLanguage::C | SourceLanguage::Cpp, "concatenated_string") => {
                 self.concatenated_pattern(node).map(Cow::Owned)
             }
             (_, "string_literal") if !text.starts_with("\"\"\"") && text.len() >= 2 => {
@@ -1182,7 +1184,7 @@ impl<'a> SourceQuery<'a> {
                 };
                 (kind, call.child_by_field_name("arguments")?)
             }
-            (SourceLanguage::Cpp, "call_expression") => {
+            (SourceLanguage::C | SourceLanguage::Cpp, "call_expression") => {
                 let function = &self.source[call.child_by_field_name("function")?.byte_range()];
                 let kind = match function {
                     "format" | "fmt::format" | "std::format" => MessageCall::Format,
@@ -1212,7 +1214,7 @@ impl<'a> SourceQuery<'a> {
             first = named.next()?;
         }
         let literal_kinds: &[&str] = match self.source_language {
-            SourceLanguage::Cpp => &[
+            SourceLanguage::C | SourceLanguage::Cpp => &[
                 "string_literal",
                 "concatenated_string",
                 "raw_string_literal",
@@ -1321,7 +1323,7 @@ impl<'a> SourceQuery<'a> {
                 "switch_rule",
                 "lambda_expression",
             ],
-            SourceLanguage::Cpp => &["compound_statement", "case_statement"],
+            SourceLanguage::C | SourceLanguage::Cpp => &["compound_statement", "case_statement"],
             SourceLanguage::Python => &["block"],
             SourceLanguage::Kotlin => &["block", "lambda_literal", "when_entry"],
         };
@@ -1438,20 +1440,22 @@ impl<'a> SourceQuery<'a> {
                     in_class = true;
                     field(parent, "name")
                 }
-                (SourceLanguage::Cpp, "function_definition") => self.cpp_function_name(parent),
+                (SourceLanguage::C | SourceLanguage::Cpp, "function_definition") => {
+                    self.cpp_function_name(parent)
+                }
                 // A variable at namespace scope, like one initialized by a lambda.
-                (SourceLanguage::Cpp, "declaration")
+                (SourceLanguage::C | SourceLanguage::Cpp, "declaration")
                     if parent.parent().is_some_and(|scope| {
                         matches!(scope.kind(), "translation_unit" | "declaration_list")
                     }) =>
                 {
                     self.cpp_declaration_name(parent)
                 }
-                (SourceLanguage::Cpp, "namespace_definition") => Some(
+                (SourceLanguage::C | SourceLanguage::Cpp, "namespace_definition") => Some(
                     field(parent, "name").unwrap_or_else(|| "(anonymous namespace)".to_string()),
                 ),
                 (
-                    SourceLanguage::Cpp,
+                    SourceLanguage::C | SourceLanguage::Cpp,
                     "class_specifier" | "struct_specifier" | "union_specifier",
                 ) => field(parent, "name"),
                 (SourceLanguage::Python, "function_definition") => {
@@ -1481,9 +1485,9 @@ impl<'a> SourceQuery<'a> {
             };
             if name.is_none() {
                 name = match (self.source_language, parent.kind()) {
-                    (SourceLanguage::Cpp, "function_definition") => parent
+                    (SourceLanguage::C | SourceLanguage::Cpp, "function_definition") => parent
                         .child_by_field_name("declarator")
-                        .map(|decl| self.source[decl.byte_range()].to_string()),
+                        .map(|decl| self.normalized_text(decl)),
                     _ => component.clone(),
                 };
             }
@@ -1516,7 +1520,7 @@ impl<'a> SourceQuery<'a> {
         }
         components.reverse();
         let separator = match self.source_language {
-            SourceLanguage::Rust | SourceLanguage::Cpp => "::",
+            SourceLanguage::Rust | SourceLanguage::C | SourceLanguage::Cpp => "::",
             SourceLanguage::Java | SourceLanguage::Python | SourceLanguage::Kotlin => ".",
         };
         let name = name.unwrap_or_else(|| match self.source_language {
