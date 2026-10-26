@@ -297,7 +297,7 @@ impl SourceRef {
             segments,
         }) = build_matcher(result.raw, &unquoted, code.info.language)
         {
-            let name = source[result.name_range].to_string();
+            let name = result.name;
             let arg_kinds = if result.args.is_empty() {
                 vec![ValueKind::Any; args.len()]
             } else {

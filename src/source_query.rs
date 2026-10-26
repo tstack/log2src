@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::ops::Range;
 use std::path::Path;
 use tree_sitter::{
     Language, Node, Parser, Point, Query, QueryCursor, Range as TSRange, StreamingIterator, Tree,
@@ -25,7 +24,7 @@ pub(crate) type Arg = (FormatArgument, ValueKind);
 pub(crate) struct QueryResult {
     pub kind: String,
     pub range: TSRange,
-    pub name_range: Range<usize>,
+    pub name: String,
     pub qualified_name: String,
     pub block_id: u32,
     pub pattern: Option<String>,
@@ -185,6 +184,14 @@ impl<'a> SourceQuery<'a> {
                     kind = "message_ref";
                 }
                 let mut raw = false;
+                if self.source_language == SourceLanguage::Rust && kind == "token_tree" {
+                    // The arguments of a `concat!` used as the format string.
+                    match self.rust_concat_pattern(child) {
+                        Some(pattern) => concat_pattern = Some(pattern),
+                        None => break,
+                    }
+                    kind = "string_literal";
+                }
                 if self.source_language == SourceLanguage::Cpp && kind == "raw_string_literal" {
                     // Raw strings are used for all sorts of things, like JSON and usage text,
                     // so only keep the ones passed to a logging call.
@@ -295,13 +302,15 @@ impl<'a> SourceQuery<'a> {
 
                 if filter_idx.is_none() || filter_idx.is_some_and(|f| f == capture.index) {
                     let anchor = Self::statement_anchor(child);
+                    let (name, qualified_name) = self.names(anchor);
+                    let block_id = self.block_id(anchor);
                     let qr_index = results.len();
                     results.push(QueryResult {
                         kind: kind.to_string(),
                         range: capture.node.range(),
-                        name_range: Self::find_fn_range(anchor),
-                        qualified_name: self.qualified_name(anchor),
-                        block_id: self.block_id(anchor),
+                        name: name.clone(),
+                        qualified_name: qualified_name.clone(),
+                        block_id,
                         pattern: concat_pattern.take(),
                         args: std::mem::take(&mut concat_args),
                         raw,
@@ -353,9 +362,9 @@ impl<'a> SourceQuery<'a> {
                                             end_byte: next_child.start_byte(),
                                             end_point: next_child.start_position(),
                                         },
-                                        name_range: Self::find_fn_range(anchor),
-                                        qualified_name: self.qualified_name(anchor),
-                                        block_id: self.block_id(anchor),
+                                        name: name.clone(),
+                                        qualified_name: qualified_name.clone(),
+                                        block_id,
                                         pattern: None,
                                         args: vec![],
                                         raw: false,
@@ -1138,62 +1147,6 @@ impl<'a> SourceQuery<'a> {
         args
     }
 
-    fn find_fn_range(node: Node) -> Range<usize> {
-        // println!("node.kind()={:?}", node.kind());
-        match node.kind() {
-            "function_item" => {
-                let range = node.child_by_field_name("name").unwrap().range();
-                range.start_byte..range.end_byte
-            }
-            "function_definition" => {
-                let range = if let Some(decl) = node.child_by_field_name("declarator") {
-                    decl.range()
-                } else if let Some(name) = node.child_by_field_name("name") {
-                    name.range()
-                } else {
-                    unreachable!();
-                };
-                range.start_byte..range.end_byte
-            }
-            "method_declaration" | "function_declaration" | "object_declaration" => {
-                let range = node.child_by_field_name("name").unwrap().range();
-                range.start_byte..range.end_byte
-            }
-            "constructor_declaration" => {
-                let range = node.child_by_field_name("name").unwrap().range();
-                range.start_byte..range.end_byte
-            }
-            "class_declaration" => {
-                let range = node.child_by_field_name("name").unwrap().range();
-                range.start_byte..range.end_byte
-            }
-            "secondary_constructor" | "anonymous_initializer" => {
-                // Named after the class, like a Java constructor.
-                match node.parent().and_then(|body| body.parent()) {
-                    Some(class) => Self::find_fn_range(class),
-                    None => node.byte_range(),
-                }
-            }
-            "declaration_list" | "static_item" | "attribute_item" => {
-                let range = node.range();
-                range.start_byte..range.end_byte
-            }
-            _ => {
-                if let Some(parent) = node.parent() {
-                    if parent.kind() == "translation_unit" {
-                        let range = parent.range();
-                        return range.start_byte..range.end_byte;
-                    }
-                    Self::find_fn_range(parent)
-                } else {
-                    let range = node.range();
-
-                    range.start_byte..range.end_byte
-                }
-            }
-        }
-    }
-
     /// Get an ID for the innermost lexical block enclosing the given node, which is the block's
     /// start byte.  A statement that is the body of an `if`, loop, etc. without braces is
     /// treated as its own block.  A `finally` block gets the ID of its `try` body.  A node that
@@ -1264,19 +1217,38 @@ impl<'a> SourceQuery<'a> {
         0
     }
 
-    /// Get the name of the function enclosing the given node, qualified by the namespaces,
-    /// classes, and modules that contain it, like `net::Server::handle` in C++ or
-    /// `com.example.Server.handle` in Java.
-    fn qualified_name(&self, node: Node) -> String {
+    /// Get the name of the function, or other item, that contains the given node, along with
+    /// its name qualified by the namespaces, classes, and modules that contain it, like
+    /// `net::Server::handle` in C++ or `com.example.Server.handle` in Java.  The name is the
+    /// innermost component of the qualified name, except for C++ functions, which are named by
+    /// their whole declarator.
+    fn names(&self, node: Node) -> (String, String) {
         let field = |node: Node, name: &str| {
             node.child_by_field_name(name)
                 .map(|child| self.normalized_text(child))
         };
         // The components from the innermost outward.
         let mut components = Vec::new();
+        let mut name = None;
         let mut in_class = false;
         let mut curr = node.parent();
         while let Some(parent) = curr {
+            if parent.kind() == "attribute_item" {
+                // An attribute is a sibling of the item it is attached to.
+                let mut item = parent.next_named_sibling();
+                while let Some(next) = item.filter(|next| {
+                    matches!(
+                        next.kind(),
+                        "attribute_item" | "line_comment" | "block_comment"
+                    )
+                }) {
+                    item = next.next_named_sibling();
+                }
+                if item.is_some() {
+                    curr = item;
+                    continue;
+                }
+            }
             let component = match (self.source_language, parent.kind()) {
                 (
                     SourceLanguage::Rust,
@@ -1307,6 +1279,14 @@ impl<'a> SourceQuery<'a> {
                     field(parent, "name")
                 }
                 (SourceLanguage::Cpp, "function_definition") => self.cpp_function_name(parent),
+                // A variable at namespace scope, like one initialized by a lambda.
+                (SourceLanguage::Cpp, "declaration")
+                    if parent.parent().is_some_and(|scope| {
+                        matches!(scope.kind(), "translation_unit" | "declaration_list")
+                    }) =>
+                {
+                    self.cpp_declaration_name(parent)
+                }
                 (SourceLanguage::Cpp, "namespace_definition") => Some(
                     field(parent, "name").unwrap_or_else(|| "(anonymous namespace)".to_string()),
                 ),
@@ -1339,6 +1319,14 @@ impl<'a> SourceQuery<'a> {
                 }
                 _ => None,
             };
+            if name.is_none() {
+                name = match (self.source_language, parent.kind()) {
+                    (SourceLanguage::Cpp, "function_definition") => parent
+                        .child_by_field_name("declarator")
+                        .map(|decl| self.source[decl.byte_range()].to_string()),
+                    _ => component.clone(),
+                };
+            }
             components.extend(component);
             curr = parent.parent();
         }
@@ -1371,7 +1359,42 @@ impl<'a> SourceQuery<'a> {
             SourceLanguage::Rust | SourceLanguage::Cpp => "::",
             SourceLanguage::Java | SourceLanguage::Python | SourceLanguage::Kotlin => ".",
         };
-        components.join(separator)
+        let name = name.unwrap_or_else(|| match self.source_language {
+            SourceLanguage::Python => "<module>".to_string(),
+            // Nothing encloses the statement, so name it after the file.
+            _ => Path::new(self.filename)
+                .file_stem()
+                .map_or(String::new(), |stem| stem.to_string_lossy().to_string()),
+        });
+        (name, components.join(separator))
+    }
+
+    /// Get the name of the variable declared by a C++ declaration, like `init` in
+    /// `auto init = [] { ... };`.
+    fn cpp_declaration_name(&self, node: Node) -> Option<String> {
+        let mut curr = node.child_by_field_name("declarator")?;
+        while let Some(next) = curr.child_by_field_name("declarator") {
+            curr = next;
+        }
+        Some(self.normalized_text(curr))
+    }
+
+    /// Combine the string literals passed to `concat!`, like `("a ", "{}")`, into the contents
+    /// of a single string literal.  Returns None if there is anything other than literals.
+    fn rust_concat_pattern(&self, token_tree: Node) -> Option<String> {
+        let mut retval = String::new();
+        let mut cursor = token_tree.walk();
+        for token in token_tree.children(&mut cursor) {
+            match token.kind() {
+                "(" | ")" | "," => {}
+                "string_literal" => {
+                    let text = &self.source[token.byte_range()];
+                    retval.push_str(text.strip_prefix('"')?.strip_suffix('"')?);
+                }
+                _ => return None,
+            }
+        }
+        Some(retval)
     }
 
     /// Get the name of a C++ function from its declarator, without the parameters or
