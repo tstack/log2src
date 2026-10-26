@@ -1043,13 +1043,21 @@ static JAVA_QUERY: LazyLock<String> = LazyLock::new(|| {
 static JAVA_PLACEHOLDER_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"\{[^{}]*}|\\\{([^}]*)}"#).unwrap());
 
+/// A printf-style conversion, like `%-5d`, `%'.2f`, `%1$s`, or glibc's `%m`, followed by the
+/// conversion characters that are accepted.  There are no capture groups since the other
+/// placeholders in a language's regex are identified by their group.
+const PRINTF_CONVERSION: &str = r#"%(?:\d+\$)?[-+ #0']*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*"#;
+const C_CONVERSIONS: &str = "[diuoxXfFeEgGaAcspnm%]";
+
 /// C only has printf-style placeholders.
-static C_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*[diuoxXfFeEgGaAcspn%]"#).unwrap()
-});
+static C_PLACEHOLDER_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!("{PRINTF_CONVERSION}{C_CONVERSIONS}")).unwrap());
 
 static CPP_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*[diuoxXfFeEgGaAcspn%]|\{\{|\}\}|\{(?:([a-zA-Z_][a-zA-Z0-9_.]*)|(\d+))?\s*(?::[^}]*)?}"#).unwrap()
+    Regex::new(&format!(
+        r#"{PRINTF_CONVERSION}{C_CONVERSIONS}|\{{\{{|\}}\}}|\{{(?:([a-zA-Z_][a-zA-Z0-9_.]*)|(\d+))?\s*(?::[^}}]*)?}}"#
+    ))
+    .unwrap()
 });
 
 /// SLF4J-style placeholders.  String templates are converted to these placeholders, too.
@@ -1058,6 +1066,46 @@ static KOTLIN_PLACEHOLDER_REGEX: LazyLock<Regex> =
 
 static PYTHON_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*[diuoxXfFeEgGaAcrspn%]"#).unwrap()
+});
+
+/// Calls that take string-literals but are not logging, like `snprintf` or `strcpy`.
+const C_NOT_LOGGING_CALLS: &str = "snprintf|sprintf|(^|::)(strcpy|strncpy|strcat|strncat|strcmp|strncmp|strcasecmp|strncasecmp|strstr|strchr|strrchr|strdup|strtok|setenv|getenv|fopen|open|access|stat)$";
+
+/// The query for C and C++ calls with a message, where `literals` are the kinds of nodes that
+/// are messages.
+fn c_family_query(literals: &str) -> String {
+    format!(
+        r#"
+            (
+                (expression_statement
+                    (call_expression
+                        function: (_) @fname
+                        arguments: (argument_list [{literals}] @arguments)
+                    )
+                )
+                (#not-match? @fname "{C_NOT_LOGGING_CALLS}")
+            )
+            ; A message that is built by another call, like fmt::format("...", x) or _("...")
+            (
+                (expression_statement
+                    (call_expression
+                        function: (_) @fname
+                        arguments: (argument_list (call_expression) @message-call)
+                    )
+                )
+                (#not-match? @fname "{C_NOT_LOGGING_CALLS}")
+            )
+        "#
+    )
+}
+
+/// Like C++, but without raw strings, and `+` on a string-literal is never a concatenation.
+static C_QUERY: LazyLock<String> =
+    LazyLock::new(|| c_family_query("(string_literal) (concatenated_string)"));
+static CPP_QUERY: LazyLock<String> = LazyLock::new(|| {
+    c_family_query(
+        "(string_literal) (raw_string_literal) (concatenated_string) (binary_expression)",
+    )
 });
 
 static PATH_TO_NAME_REGEX: LazyLock<Regex> =
@@ -1151,6 +1199,24 @@ impl SourceLanguage {
         }
     }
 
+    /// The language of a source file, using its contents for a `.h` header, which could be C
+    /// or C++.  A C header parsed as C++ breaks on identifiers that are C++ keywords, like
+    /// `new` or `class`.
+    pub(crate) fn from_contents(path: &Path, language: Self, contents: &str) -> Self {
+        static CPP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r"(?m)\bclass\s+\w+\s*[:{;]|\bnamespace\b|\btemplate\s*<|^\s*(public|private|protected)\s*:|::|\b(virtual|nullptr|constexpr|operator|typename)\b|^\s*#\s*include\s*<\w+>",
+            )
+            .unwrap()
+        });
+        let is_header = path.extension().is_some_and(|ext| ext == "h");
+        if language == Self::Cpp && is_header && !CPP_REGEX.is_match(contents) {
+            Self::C
+        } else {
+            language
+        }
+    }
+
     fn from_path(path: &Path) -> Option<Self> {
         match path.extension() {
             Some(extension) => Self::from_extension(extension),
@@ -1203,57 +1269,8 @@ impl SourceLanguage {
                 "#
             }
             SourceLanguage::Java => JAVA_QUERY.as_str(),
-            // Like C++, but without raw strings, and `+` on a string-literal is never a
-            // concatenation.
-            SourceLanguage::C => {
-                r#"
-                    (
-                        (expression_statement
-                            (call_expression
-                                function: (_) @fname
-                                arguments: (argument_list
-                                    [(string_literal) (concatenated_string)] @arguments)
-                            )
-                        )
-                        (#not-match? @fname "snprintf|sprintf")
-                    )
-                    ; A message that is built by another call, like gettext's _("...")
-                    (
-                        (expression_statement
-                            (call_expression
-                                function: (_) @fname
-                                arguments: (argument_list (call_expression) @message-call)
-                            )
-                        )
-                        (#not-match? @fname "snprintf|sprintf")
-                    )
-                "#
-            }
-            SourceLanguage::Cpp => {
-                r#"
-                    (
-                        (expression_statement
-                            (call_expression
-                                function: (_) @fname
-                                arguments: (argument_list
-                                    [(string_literal) (raw_string_literal) (concatenated_string)
-                                     (binary_expression)] @arguments)
-                            )
-                        )
-                        (#not-match? @fname "snprintf|sprintf")
-                    )
-                    ; A message that is built by another call, like fmt::format("...", x)
-                    (
-                        (expression_statement
-                            (call_expression
-                                function: (_) @fname
-                                arguments: (argument_list (call_expression) @message-call)
-                            )
-                        )
-                        (#not-match? @fname "snprintf|sprintf")
-                    )
-                "#
-            }
+            SourceLanguage::C => C_QUERY.as_str(),
+            SourceLanguage::Cpp => CPP_QUERY.as_str(),
             SourceLanguage::Python => {
                 r#"
                 (
@@ -3403,7 +3420,7 @@ node_insert(struct node *list, const char *class, uint64_t size)
         );
         assert_eq!(
             src_refs[0].name,
-            "* node_insert(struct node *list, const char *class, uint64_t size)"
+            "node_insert(struct node *list, const char *class, uint64_t size)"
         );
         assert_eq!(src_refs[0].vars, vec!["class".to_string()]);
         assert_eq!(
@@ -3428,6 +3445,95 @@ node_insert(struct node *list, const char *class, uint64_t size)
                     ambiguous: false,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn test_c_header_language() {
+        let c_header = "static inline void push(struct node *new, const char *class) {\n    log_info(\"push %s\", class);\n}\n";
+        let code = CodeSource::from_string(Path::new("list.h"), c_header);
+        assert_eq!(code.info.language, SourceLanguage::C);
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        assert_eq!(src_refs.len(), 1);
+        assert_eq!(
+            src_refs[0].name,
+            "push(struct node *new, const char *class)"
+        );
+        assert_eq!(src_refs[0].language, SourceLanguage::C);
+
+        for cpp_header in [
+            "namespace net { void f(); }",
+            "class Server : public Base {};",
+            "template <typename T> T max(T a, T b);",
+            "#include <string>\n",
+            "void f() { std::cout << 1; }",
+        ] {
+            let code = CodeSource::from_string(Path::new("x.h"), cpp_header);
+            assert_eq!(code.info.language, SourceLanguage::Cpp, "{cpp_header}");
+        }
+        let code = CodeSource::from_string(Path::new("x.hpp"), "int x;");
+        assert_eq!(code.info.language, SourceLanguage::Cpp);
+    }
+
+    #[test]
+    fn test_c_printf_extensions() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.c"),
+            r#"
+void f(const char *path, int a, int b, long total) {
+    syslog(LOG_ERR, "open %s failed: %m", path);
+    printf("%2$d before %1$d\n", a, b);
+    log_info("total %'ld bytes", total);
+    strcpy(buf, "default");
+    strcat(path, "/");
+    setenv("LANG", "C", 1);
+    vsnprintf(buf, sizeof(buf), "not logged %d", a);
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
+        assert_eq!(
+            patterns,
+            vec![
+                "(?s)^open (.*) failed: (.*)$",
+                r"(?s)^(.*) before (.*?)\s*$",
+                "(?s)^total (.*) bytes$",
+            ]
+        );
+        let pairs = |index: usize, line: &str| -> Vec<(String, String)> {
+            let log_ref = LogRefBuilder::new().build(line);
+            extract_variables(&log_ref, &src_refs[index])
+                .into_iter()
+                .map(|pair| (pair.expr, pair.value))
+                .collect()
+        };
+        assert_eq!(
+            pairs(0, "open /etc/x failed: No such file or directory"),
+            vec![
+                ("path".to_string(), "/etc/x".to_string()),
+                (
+                    "strerror(errno)".to_string(),
+                    "No such file or directory".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            pairs(1, "2 before 1\n"),
+            vec![
+                ("b".to_string(), "2".to_string()),
+                ("a".to_string(), "1".to_string()),
+            ]
+        );
+        assert_eq!(
+            pairs(2, "total 1,024 bytes"),
+            vec![("total".to_string(), "1,024".to_string())]
         );
     }
 
@@ -3657,8 +3763,8 @@ Server &Server::self() {
             pairs(&[
                 ("helper()", "net::(anonymous namespace)::helper"),
                 ("handle()", "net::Server::handle"),
-                ("*Server::name(int x) const", "net::Server::name"),
-                ("&Server::self()", "net::Server::self"),
+                ("Server::name(int x) const", "net::Server::name"),
+                ("Server::self()", "net::Server::self"),
             ])
         );
     }

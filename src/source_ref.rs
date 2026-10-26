@@ -81,10 +81,11 @@ impl LogLevel {
                     .rev()
                     .find_map(|w| Self::from_word(w));
             }
-            // A level followed by short suffixes, like OpenSSH's `fatal_fr` and `debug3_f`.
+            // A level followed by OpenSSH's suffixes, like `fatal_fr` and `debug3_f`, which add
+            // the function name and the error code.
             if segments.is_empty()
                 && !require_qualifier
-                && words[1..].iter().all(|w| w.chars().count() <= 2)
+                && words[1..].iter().all(|w| matches!(w.as_str(), "f" | "fr"))
             {
                 if let Some(level) = Self::from_word(&words[0]) {
                     return Some(level);
@@ -107,7 +108,10 @@ impl LogLevel {
             .iter()
             .flat_map(|seg| split_words(seg))
             .any(|w| is_logging_word(&w));
-        if qualified || (segments.is_empty() && !require_qualifier) {
+        if segments.is_empty() && !require_qualifier && matches!(last.as_str(), "err" | "errx") {
+            // The BSD `err.h` functions that exit the process, unlike `warn` and `warnx`.
+            Some(LogLevel::Fatal)
+        } else if qualified || (segments.is_empty() && !require_qualifier) {
             // A java.util.logging level can also be a whole name, like the `config` method or
             // `Level.CONFIG`.
             Self::from_word(&last).or_else(|| Self::from_jul_word(&last))
@@ -118,7 +122,10 @@ impl LogLevel {
 
     fn from_word(word: &str) -> Option<LogLevel> {
         // A verbosity, like the `2` in OpenSSH's `debug2`.
-        let word = word.trim_end_matches(|c: char| c.is_ascii_digit());
+        let word = match word.trim_end_matches(|c: char| c.is_ascii_digit()) {
+            "debug" => "debug",
+            _ => word,
+        };
         match word {
             "trace" | "finer" | "finest" => Some(LogLevel::Trace),
             // `verbose` is below the default level in OpenSSH and Redis, like debug.
@@ -126,7 +133,7 @@ impl LogLevel {
             "info" | "notice" => Some(LogLevel::Info),
             // The BSD `err.h` functions and OpenBSD's `fatalx` do not append `errno`.
             "warn" | "warning" | "warnx" => Some(LogLevel::Warn),
-            "error" | "err" | "errx" | "exception" | "severe" => Some(LogLevel::Error),
+            "error" | "err" | "exception" | "severe" => Some(LogLevel::Error),
             "fatal" | "fatalx" | "critical" | "crit" | "alert" | "emerg" => Some(LogLevel::Fatal),
             _ => None,
         }
@@ -241,6 +248,16 @@ impl ArgCounter {
         if let Some(spec) = text.strip_prefix('%') {
             if spec.ends_with('%') {
                 return Substitution::Literal('%');
+            }
+            if language.is_c_family() && spec.ends_with('m') {
+                // glibc's `%m` prints the message for `errno` without using an argument.
+                return Substitution::Value(FormatArgument::Named("strerror(errno)".to_string()));
+            }
+            if let Some((index, _)) = spec.split_once('$') {
+                // An explicit argument, like `%2$s`, which is 1-based.
+                if let Some(index) = index.parse::<usize>().ok().and_then(|i| i.checked_sub(1)) {
+                    return Substitution::Value(FormatArgument::Positional(index));
+                }
             }
             // A `*` width or precision is taken from an argument.
             self.used += spec.matches('*').count();
@@ -864,6 +881,16 @@ mod tests {
             ("warnx", Some(LogLevel::Warn)),
             ("verbose_f", Some(LogLevel::Debug)),
             ("set_verbose", None),
+            ("trace_on", None),
+            ("debug_fn", None),
+            ("error_no", None),
+            ("alert_ok", None),
+            ("err2", None),
+            ("info1", None),
+            ("debug2_fr", Some(LogLevel::Debug)),
+            ("err", Some(LogLevel::Fatal)),
+            ("errx", Some(LogLevel::Fatal)),
+            ("logger.err", Some(LogLevel::Error)),
             ("error_message", None),
             ("info_get", None),
         ];

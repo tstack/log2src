@@ -235,7 +235,7 @@ impl<'a> SourceQuery<'a> {
                     }
                     kind = "string_literal";
                 }
-                if self.source_language.is_c_family() && kind == "raw_string_literal" {
+                if self.source_language == SourceLanguage::Cpp && kind == "raw_string_literal" {
                     // Raw strings are used for all sorts of things, like JSON and usage text,
                     // so only keep the ones passed to a logging call.
                     let leading = leading_args.get_or_insert_with(|| self.leading_args(outer));
@@ -1049,7 +1049,7 @@ impl<'a> SourceQuery<'a> {
             return None;
         }
         // In C++, adding a number to a string-literal is pointer arithmetic, like `"abc" + 1`.
-        if self.source_language.is_c_family()
+        if self.source_language == SourceLanguage::Cpp
             && pieces.iter().any(|piece| {
                 matches!(piece, ConcatPiece::Expr(expr)
                     if matches!(expr.kind(), "number_literal" | "char_literal"))
@@ -1451,11 +1451,11 @@ impl<'a> SourceQuery<'a> {
                 {
                     self.cpp_declaration_name(parent)
                 }
-                (SourceLanguage::C | SourceLanguage::Cpp, "namespace_definition") => Some(
+                (SourceLanguage::Cpp, "namespace_definition") => Some(
                     field(parent, "name").unwrap_or_else(|| "(anonymous namespace)".to_string()),
                 ),
                 (
-                    SourceLanguage::C | SourceLanguage::Cpp,
+                    SourceLanguage::Cpp,
                     "class_specifier" | "struct_specifier" | "union_specifier",
                 ) => field(parent, "name"),
                 (SourceLanguage::Python, "function_definition") => {
@@ -1485,9 +1485,16 @@ impl<'a> SourceQuery<'a> {
             };
             if name.is_none() {
                 name = match (self.source_language, parent.kind()) {
-                    (SourceLanguage::C | SourceLanguage::Cpp, "function_definition") => parent
-                        .child_by_field_name("declarator")
-                        .map(|decl| self.normalized_text(decl)),
+                    // Named by the function declarator, without the pointer or reference for the
+                    // return type, like the `*` in `struct node *insert(...)`.
+                    (SourceLanguage::C | SourceLanguage::Cpp, "function_definition") => {
+                        let decl = parent.child_by_field_name("declarator");
+                        decl.map(|decl| {
+                            self.normalized_text(
+                                Self::cpp_function_declarator(decl).unwrap_or(decl),
+                            )
+                        })
+                    }
                     _ => component.clone(),
                 };
             }
@@ -1565,25 +1572,28 @@ impl<'a> SourceQuery<'a> {
     /// qualifiers, like `Foo::bar` from `*Foo::bar(int x) const`.
     fn cpp_function_name(&self, node: Node) -> Option<String> {
         let decl = node.child_by_field_name("declarator")?;
-        let mut curr = decl;
-        loop {
-            if curr.kind() == "function_declarator" {
-                return curr
-                    .child_by_field_name("declarator")
-                    .map(|name| self.normalized_text(name));
-            }
-            // Pointer and reference declarators wrap the function declarator.
-            match curr
+        if let Some(func) = Self::cpp_function_declarator(decl) {
+            return func
                 .child_by_field_name("declarator")
-                .or_else(|| curr.named_child(curr.named_child_count().checked_sub(1)?))
-            {
-                Some(next) => curr = next,
-                None => break,
-            }
+                .map(|name| self.normalized_text(name));
         }
         // Something unusual, like a conversion operator, so use everything before the parameters.
         let text = self.normalized_text(decl);
         Some(text.split('(').next().unwrap_or(&text).trim().to_string())
+    }
+
+    /// Find the function declarator in the declarator of a function definition.  Pointer and
+    /// reference declarators for the return type wrap it.
+    fn cpp_function_declarator(decl: Node) -> Option<Node> {
+        let mut curr = decl;
+        loop {
+            if curr.kind() == "function_declarator" {
+                return Some(curr);
+            }
+            curr = curr
+                .child_by_field_name("declarator")
+                .or_else(|| curr.named_child(curr.named_child_count().checked_sub(1)?))?;
+        }
     }
 
     /// Get the package declared in a Java or Kotlin file, like `com.example`.

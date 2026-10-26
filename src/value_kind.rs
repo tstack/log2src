@@ -89,6 +89,10 @@ impl ValueKind {
     /// Derive the kind from the text of a placeholder in a format string, like `%5d` or `{:#x}`.
     pub fn from_placeholder(language: SourceLanguage, placeholder: &str) -> ValueKind {
         if let Some(spec) = placeholder.strip_prefix('%') {
+            if spec.contains('\'') {
+                // The digits are grouped, like `1,000`.
+                return ValueKind::Any;
+            }
             return match spec.chars().last() {
                 Some('d' | 'i' | 'u') => ValueKind::Integer,
                 Some('x' | 'X') => ValueKind::Hex,
