@@ -89,6 +89,10 @@ impl ValueKind {
     /// Derive the kind from the text of a placeholder in a format string, like `%5d` or `{:#x}`.
     pub fn from_placeholder(language: SourceLanguage, placeholder: &str) -> ValueKind {
         if let Some(spec) = placeholder.strip_prefix('%') {
+            if spec.contains('\'') {
+                // The digits are grouped, like `1,000`.
+                return ValueKind::Any;
+            }
             return match spec.chars().last() {
                 Some('d' | 'i' | 'u') => ValueKind::Integer,
                 Some('x' | 'X') => ValueKind::Hex,
@@ -744,7 +748,9 @@ mod tests {
                 "value_arguments",
             ),
             SourceLanguage::Rust => (format!("fn f() {{ f(\"x\", {expr}); }}"), "arguments"),
-            SourceLanguage::Cpp => (format!("void f() {{ f(\"x\", {expr}); }}"), "argument_list"),
+            SourceLanguage::C | SourceLanguage::Cpp => {
+                (format!("void f() {{ f(\"x\", {expr}); }}"), "argument_list")
+            }
             SourceLanguage::Python => (format!("f(\"x\", {expr})\n"), "argument_list"),
         };
         let mut parser = tree_sitter::Parser::new();
