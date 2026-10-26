@@ -3271,13 +3271,33 @@ class Server:
         def inner():
             logger.info("inner")
 "#;
-        let names: Vec<String> = qualified_names("in-mem.py", source)
-            .into_iter()
-            .map(|(_, qname)| qname)
-            .collect();
         assert_eq!(
-            names,
-            vec!["<module>", "Server.handle", "Server.handle.<locals>.inner"]
+            qualified_names("in-mem.py", source),
+            pairs(&[
+                ("", "<module>"),
+                ("handle", "Server.handle"),
+                ("inner", "Server.handle.<locals>.inner"),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_name_outside_function() {
+        // Statements outside of a function should not be named after the whole file.
+        let source = r#"
+const VERSION: &str = env!("VERSION");
+static DEFAULTS: &str = include_str!("defaults.toml");
+mod net {
+    const NAME: &str = env!("NAME");
+}
+"#;
+        assert_eq!(
+            qualified_names("in-mem.rs", source),
+            pairs(&[
+                ("VERSION", "VERSION"),
+                ("DEFAULTS", "DEFAULTS"),
+                ("NAME", "net::NAME"),
+            ])
         );
     }
 

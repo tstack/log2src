@@ -1174,23 +1174,20 @@ impl<'a> SourceQuery<'a> {
                     None => node.byte_range(),
                 }
             }
-            "declaration_list" | "static_item" | "attribute_item" => {
+            "static_item" | "const_item" => {
+                let range = node.child_by_field_name("name").unwrap().range();
+                range.start_byte..range.end_byte
+            }
+            "attribute_item" => {
                 let range = node.range();
                 range.start_byte..range.end_byte
             }
-            _ => {
-                if let Some(parent) = node.parent() {
-                    if parent.kind() == "translation_unit" {
-                        let range = parent.range();
-                        return range.start_byte..range.end_byte;
-                    }
-                    Self::find_fn_range(parent)
-                } else {
-                    let range = node.range();
-
-                    range.start_byte..range.end_byte
-                }
-            }
+            _ => match node.parent() {
+                Some(parent) => Self::find_fn_range(parent),
+                // Nothing names the top level of the file, so leave the name empty instead of
+                // using the text of the whole file.
+                None => node.start_byte()..node.start_byte(),
+            },
         }
     }
 
