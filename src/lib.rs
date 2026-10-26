@@ -1139,7 +1139,7 @@ impl SourceLanguage {
                             (call_expression
                                 function: (_) @fname
                                 arguments: (argument_list
-                                    [(string_literal) (concatenated_string)] @arguments)
+                                    [(string_literal) (concatenated_string) (binary_expression)] @arguments)
                             )
                         )
                         (#not-match? @fname "snprintf|sprintf")
@@ -2646,6 +2646,43 @@ class Same {
         assert_eq!(src_refs[1].vars, vec!["size"]);
     }
 
+    #[test]
+    fn test_cpp_plus_concatenation() {
+        let code = CodeSource::from_string(
+            &PathBuf::from("in-mem.cc"),
+            r#"
+void connect() {
+    spdlog::error("Failed to create proxy: " + std::string(error->message));
+    spdlog::error(
+        "server does not support the events; the "
+        "module will be disabled" +
+        std::to_string(version));
+    spdlog::warn("{} retries " + name + " left", count);
+    foo("abc" + 1);
+    spdlog::info("abc" + 1);
+    add_path("prefix-" + name);
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
+        assert_eq!(
+            patterns,
+            vec![
+                "(?s)^Failed to create proxy: (.*)$",
+                "(?s)^server does not support the events; the module will be disabled(.*)$",
+                "(?s)^(.*) retries (.*) left$",
+            ]
+        );
+        assert_eq!(src_refs[0].level, LogLevel::Error);
+        assert_eq!(src_refs[1].level, LogLevel::Error);
+        assert_eq!(src_refs[2].level, LogLevel::Warn);
+        assert_eq!(src_refs[2].vars, vec!["count"]);
+    }
+
     const CPP_SPLIT_ELSE_SOURCE: &str = r#"
     bool load(int fd) {
         int rc = 0;
@@ -4114,6 +4151,13 @@ int main(int argc, char* argv[]) {
     logger->info(err, "variable arg message");
     logInfo("camel message");
     errors.error("not a log message either");
+    qWarning("qt warn message");
+    qCritical("qt critical message");
+    g_message("glib message");
+    g_warning("glib warn message");
+    q_tool("not a qt log message");
+    on_error("not a log message handler");
+    x_y_debug("single letter prefix message");
 }
 "#,
         );
@@ -4137,6 +4181,19 @@ int main(int argc, char* argv[]) {
                 (
                     "\"not a log message either\"".to_string(),
                     LogLevel::Unknown
+                ),
+                ("\"qt warn message\"".to_string(), LogLevel::Warn),
+                ("\"qt critical message\"".to_string(), LogLevel::Fatal),
+                ("\"glib message\"".to_string(), LogLevel::Info),
+                ("\"glib warn message\"".to_string(), LogLevel::Warn),
+                ("\"not a qt log message\"".to_string(), LogLevel::Unknown),
+                (
+                    "\"not a log message handler\"".to_string(),
+                    LogLevel::Unknown
+                ),
+                (
+                    "\"single letter prefix message\"".to_string(),
+                    LogLevel::Debug
                 ),
             ]
         );

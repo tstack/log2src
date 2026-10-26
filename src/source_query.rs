@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ops::Range;
 use std::path::Path;
 use tree_sitter::{
@@ -212,10 +213,18 @@ impl<'a> SourceQuery<'a> {
                                 None => break,
                             }
                         }
+                        if child.kind() == "binary_expression"
+                            && self.source_language == SourceLanguage::Cpp
+                            && call_name.as_deref().and_then(LogLevel::from_name).is_none()
+                        {
+                            // C++ strings are concatenated for all sorts of calls, like paths
+                            // and option names, so only keep the ones passed to a logging call.
+                            break;
+                        }
                         if child.kind() == "binary_expression" {
                             let concat = match self.source_language {
                                 SourceLanguage::Kotlin => self.kotlin_concat_pattern(child),
-                                _ => self.java_concat_pattern(child),
+                                _ => self.concat_pattern(child),
                             };
                             match concat {
                                 Some((pattern, args)) => {
@@ -346,7 +355,7 @@ impl<'a> SourceQuery<'a> {
             .is_some_and(|next| match next.kind() {
                 "string_literal" => true,
                 // Only a concatenation with a string, not arithmetic like `MAX - count`.
-                "binary_expression" => self.java_concat_pattern(next).is_some(),
+                "binary_expression" => self.concat_pattern(next).is_some(),
                 _ => false,
             });
         is_constant_name && !next_is_literal
@@ -356,11 +365,11 @@ impl<'a> SourceQuery<'a> {
     /// initializer for `static final String MSG = "abc " + "def";`.
     pub(crate) fn java_literal_value(&self, node: Node<'a>) -> Option<String> {
         let mut pieces = Vec::new();
-        self.flatten_java_concat(node, &mut pieces);
+        self.flatten_concat(node, &mut pieces);
         let mut retval = String::new();
         for piece in pieces {
             match piece {
-                ConcatPiece::Literal(text) => retval.push_str(text),
+                ConcatPiece::Literal(text) => retval.push_str(&text),
                 ConcatPiece::Expr(_) => return None,
             }
         }
@@ -647,13 +656,22 @@ impl<'a> SourceQuery<'a> {
         }
     }
 
-    /// Convert a Java string concatenation, like `"user " + name + " logged in"`, into the
-    /// contents of a single string-literal.  The non-literal operands are replaced with
+    /// Convert a Java or C++ string concatenation, like `"user " + name + " logged in"`, into
+    /// the contents of a single string-literal.  The non-literal operands are replaced with
     /// placeholders whose argument is the operand's expression.  Returns None if the expression
     /// is not a concatenation involving a string-literal.
-    fn java_concat_pattern(&self, node: Node) -> Option<(String, Vec<Arg>)> {
+    fn concat_pattern(&self, node: Node) -> Option<(String, Vec<Arg>)> {
         let mut pieces = Vec::new();
-        if !self.flatten_java_concat(node, &mut pieces) {
+        if !self.flatten_concat(node, &mut pieces) {
+            return None;
+        }
+        // In C++, adding a number to a string-literal is pointer arithmetic, like `"abc" + 1`.
+        if self.source_language == SourceLanguage::Cpp
+            && pieces.iter().any(|piece| {
+                matches!(piece, ConcatPiece::Expr(expr)
+                    if matches!(expr.kind(), "number_literal" | "char_literal"))
+            })
+        {
             return None;
         }
         let mut pattern = String::new();
@@ -662,10 +680,10 @@ impl<'a> SourceQuery<'a> {
             match piece {
                 ConcatPiece::Literal(text) => {
                     let language = self.source_language;
-                    for cap in language.get_placeholder_regex().captures_iter(text) {
+                    for cap in language.get_placeholder_regex().captures_iter(&text) {
                         args.push((language.captures_to_format_arg(&cap), ValueKind::Any));
                     }
-                    pattern.push_str(text);
+                    pattern.push_str(&text);
                 }
                 ConcatPiece::Expr(expr) => {
                     pattern.push_str("{}");
@@ -683,8 +701,8 @@ impl<'a> SourceQuery<'a> {
 
     /// Split a tree of `+` expressions into its pieces.  Returns true if any piece is a
     /// string-literal.
-    fn flatten_java_concat(&self, node: Node<'a>, pieces: &mut Vec<ConcatPiece<'a>>) -> bool {
-        if let Some(text) = self.java_string_contents(node) {
+    fn flatten_concat(&self, node: Node<'a>, pieces: &mut Vec<ConcatPiece<'a>>) -> bool {
+        if let Some(text) = self.string_contents(node) {
             pieces.push(ConcatPiece::Literal(text));
             return true;
         }
@@ -707,18 +725,18 @@ impl<'a> SourceQuery<'a> {
         // could be numeric addition, like `a + b + " total"`.  In that case, the left side has
         // to be treated as a single value.
         let mut left_pieces = Vec::new();
-        if self.flatten_java_concat(left, &mut left_pieces) {
+        if self.flatten_concat(left, &mut left_pieces) {
             pieces.append(&mut left_pieces);
         } else {
             pieces.push(ConcatPiece::Expr(left));
-            if self.java_string_contents(right).is_none() {
+            if self.string_contents(right).is_none() {
                 // Neither side is a string, so this is just addition.
                 pieces.pop();
                 pieces.push(ConcatPiece::Expr(node));
                 return false;
             }
         }
-        match self.java_string_contents(right) {
+        match self.string_contents(right) {
             Some(text) => pieces.push(ConcatPiece::Literal(text)),
             None => pieces.push(ConcatPiece::Expr(right)),
         }
@@ -726,16 +744,24 @@ impl<'a> SourceQuery<'a> {
     }
 
     /// The contents of a regular Java string-literal, without the quotes.  Text blocks are not
-    /// supported since their indentation is stripped by the compiler.
-    fn java_string_contents(&self, node: Node) -> Option<&'a str> {
-        if node.kind() != "string_literal" {
-            return None;
-        }
+    /// supported since their indentation is stripped by the compiler.  For C++, this is a
+    /// string-literal without its prefix, like `u8`, or adjacent string-literals.
+    fn string_contents(&self, node: Node) -> Option<Cow<'a, str>> {
         let text = &self.source[node.start_byte()..node.end_byte()];
-        if text.starts_with("\"\"\"") || text.len() < 2 {
-            return None;
+        match (self.source_language, node.kind()) {
+            (SourceLanguage::Cpp, "string_literal") => {
+                let start = text.find('"')? + 1;
+                let end = text.rfind('"')?;
+                text.get(start..end).map(Cow::Borrowed)
+            }
+            (SourceLanguage::Cpp, "concatenated_string") => {
+                self.concatenated_pattern(node).map(Cow::Owned)
+            }
+            (_, "string_literal") if !text.starts_with("\"\"\"") && text.len() >= 2 => {
+                Some(Cow::Borrowed(&text[1..text.len() - 1]))
+            }
+            _ => None,
         }
-        Some(&text[1..text.len() - 1])
     }
 
     fn in_function_body(node: Node) -> bool {
@@ -1125,7 +1151,7 @@ impl<'a> SourceQuery<'a> {
 }
 
 enum ConcatPiece<'a> {
-    Literal(&'a str),
+    Literal(Cow<'a, str>),
     Expr(Node<'a>),
 }
 
