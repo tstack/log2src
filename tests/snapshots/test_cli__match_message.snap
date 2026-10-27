@@ -19,6 +19,6 @@ info:
 success: true
 exit_code: 0
 ----- stdout -----
-{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"foo","qualifiedName":"foo","blockId":186,"text":"\"Hello from foo i={}\"","level":"Debug","callName":"debug","quality":14,"pattern":"(?s)^Hello from foo i=(.*)$","args":["Placeholder"],"argKinds":["Any"],"vars":["i"],"varKinds":["Any"],"kinds":["Any"],"segments":["Hello from foo i=",""]},"variables":[{"expr":"i","value":"42"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/basic.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"foo","qualifiedName":"foo","blockId":186,"text":"\"Hello from foo i={}\"","level":"Debug","category":"Log","callName":"debug","quality":14,"pattern":"(?s)^Hello from foo i=(.*)$","args":["Placeholder"],"argKinds":["Any"],"vars":["i"],"varKinds":["Any"],"kinds":["Any"],"segments":["Hello from foo i=",""]},"variables":[{"expr":"i","value":"42"}]}
 
 ----- stderr -----

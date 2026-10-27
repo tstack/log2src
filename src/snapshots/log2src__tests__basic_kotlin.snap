@@ -12,6 +12,7 @@ expression: src_refs
   blockId: 89
   text: "\"Started {} with {} threads\""
   level: Info
+  category: Log
   callName: info
   quality: 18
   pattern: (?s)^Started (.*) with (.*) threads$
@@ -44,6 +45,7 @@ expression: src_refs
   blockId: 89
   text: "\"Hello $user, you have ${user.messages.size} messages\""
   level: Info
+  category: Log
   callName: info
   quality: 21
   pattern: "(?s)^Hello (.*), you have (.*) messages$"
@@ -72,6 +74,7 @@ expression: src_refs
   blockId: 89
   text: "\"Mixed {} and $count \\$5\\ttab\""
   level: Debug
+  category: Log
   callName: debug
   quality: 16
   pattern: "(?s)^Mixed (.*) and (.*) \\$5\\ttab$"
@@ -102,6 +105,7 @@ expression: src_refs
   blockId: 89
   text: "\"Lazy ${user.id}\""
   level: Info
+  category: Log
   callName: info
   quality: 4
   pattern: (?s)^Lazy (.*)$
@@ -126,6 +130,7 @@ expression: src_refs
   blockId: 89
   text: "\"Failed for $user\""
   level: Error
+  category: Log
   callName: error
   quality: 9
   pattern: (?s)^Failed for (.*)$
@@ -150,6 +155,7 @@ expression: src_refs
   blockId: 89
   text: "\"Concat \" + count + \" items\""
   level: Warn
+  category: Log
   callName: warn
   quality: 11
   pattern: (?s)^Concat (.*) items$
@@ -174,6 +180,7 @@ expression: src_refs
   blockId: 89
   text: "\"Failed [count=${user.messages.size}] \" +\n                \"after ${count / 1000.0} sec, \" + count + \" left\""
   level: Warn
+  category: Log
   callName: warn
   quality: 29
   pattern: "(?s)^Failed \\[count=(.*)\\] after (.*) sec, (.*) left$"

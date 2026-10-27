@@ -45,7 +45,7 @@ pub use progress::ProgressUpdate;
 pub use progress::WorkInfo;
 use source_query::QueryResult;
 pub use source_query::SourceQuery;
-pub use source_ref::{LogLevel, SourceRef};
+pub use source_ref::{LogLevel, MessageCategory, SourceRef};
 
 #[derive(Error, Debug, Diagnostic, Clone, Default)]
 pub enum LogError {
@@ -153,7 +153,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "31")]
+    #[serde(rename = "32")]
     Current,
 }
 
@@ -281,7 +281,7 @@ pub struct LogCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
     /// True if the family does not look like logging, so the statements that got their level
-    /// from the name of this call were changed to `Unknown`.
+    /// from the name of this call were changed to `Unknown` and `MessageCategory::Other`.
     pub pruned: bool,
 }
 
@@ -291,7 +291,8 @@ pub struct LogCall {
 /// prefix have at least two levels other than `Info`.  A logger has several levels, but
 /// something like `luaL_error` raises an error and `append_info` adds text to the packet info.
 /// "info" and "message" are not counted since they are usually nouns.  The statements in a
-/// family that fails the check have their level changed to `Unknown`.
+/// family that fails the check have their level changed to `Unknown` and their category changed
+/// to `MessageCategory::Other`.
 ///
 /// The statements are paired with whether their level came from an argument.  Pruning can be
 /// done again, like after a file changes, since a statement whose call name has a level is
@@ -356,6 +357,7 @@ fn prune_log_calls(mut stmts: Vec<(&mut SourceRef, bool)>) -> BTreeMap<String, L
             .is_some_and(|family| pruned_families.contains(family));
     }
     for (stmt, from_arg) in stmts.iter_mut() {
+        stmt.category = MessageCategory::Log;
         // A level from an argument, like `syslog(LOG_ERR, ...)`, is kept.
         if *from_arg {
             continue;
@@ -367,6 +369,7 @@ fn prune_log_calls(mut stmts: Vec<(&mut SourceRef, bool)>) -> BTreeMap<String, L
             .is_some_and(|log_call| log_call.pruned);
         if pruned {
             stmt.level = LogLevel::Unknown;
+            stmt.category = MessageCategory::Other;
         }
     }
     log_calls
@@ -520,7 +523,9 @@ impl SourceTree {
 /// only matches with an empty value for a placeholder is passed over for a later candidate that
 /// matches without one, even a lower quality one, since a missing value is less likely than the
 /// line coming from a different statement.  The exception is when the statement is closer to
-/// the line number in the log message, which is better evidence than the values.
+/// the line number in the log message, which is better evidence than the values.  The
+/// candidates are ordered by [`MessageCategory::match_priority`] first, and a later tier is only
+/// searched when nothing in an earlier tier matched, even with an empty value.
 fn first_match<'a, T>(
     candidates: impl IntoIterator<Item = T>,
     body: &str,
@@ -530,6 +535,11 @@ fn first_match<'a, T>(
     let mut with_empty_value: Option<T> = None;
     for candidate in candidates {
         let stmt = src_ref(&candidate);
+        if with_empty_value.as_ref().is_some_and(|prior| {
+            src_ref(prior).category.match_priority() < stmt.category.match_priority()
+        }) {
+            break;
+        }
         if !stmt.pattern.is_match(body) {
             continue;
         }
@@ -559,7 +569,8 @@ fn line_distance(src_ref: &SourceRef, lineno: Option<usize>) -> usize {
     })
 }
 
-/// Order the candidate statements for a log message from best to worst.  Higher quality is
+/// Order the candidate statements for a log message from best to worst.  `Log` statements are
+/// better than the other categories, so those are only a fallback.  Then, higher quality is
 /// better and, for the same quality, a statement with the same level as the log message, and
 /// then one closer to the line number in the log message.  The line number is only a
 /// tie-breaker since it is not always the line of the log call, like for a message built in a
@@ -574,8 +585,10 @@ fn compare_candidates(
 ) -> Ordering {
     let distance = |src_ref: &SourceRef| line_distance(src_ref, lineno);
     let level_matches = |src_ref: &SourceRef| level == Some(src_ref.level);
-    rhs.quality
-        .cmp(&lhs.quality)
+    lhs.category
+        .match_priority()
+        .cmp(&rhs.category.match_priority())
+        .then_with(|| rhs.quality.cmp(&lhs.quality))
         .then_with(|| level_matches(rhs).cmp(&level_matches(lhs)))
         .then_with(|| distance(lhs).cmp(&distance(rhs)))
         // A placeholder can be empty, so a message like "Done" matches both "Done" and "Done{}".
@@ -5123,33 +5136,79 @@ void dissect(void) {
                 ("ws_warning", vec![(LogLevel::Warn, 2)], Some("ws"), false),
             ]
         );
-        let mut levels: Vec<(&str, LogLevel)> = tree
+        let mut levels: Vec<(&str, LogLevel, MessageCategory)> = tree
             .files_with_statements
             .values()
             .flat_map(|sif| sif.statements())
-            .map(|stmt| (stmt.text.as_str(), stmt.level))
+            .map(|stmt| (stmt.text.as_str(), stmt.level, stmt.category))
             .collect();
         levels.sort();
+        use MessageCategory::{Log, Other};
         assert_eq!(
             levels,
             vec![
-                ("\"dissect error message\"", LogLevel::Unknown),
-                ("\"dissect info message\"", LogLevel::Unknown),
+                ("\"dissect error message\"", LogLevel::Unknown, Other),
+                ("\"dissect info message\"", LogLevel::Unknown, Other),
                 // The level from `LOG_ERR` is kept, although the family is pruned.
-                ("\"dissect syslog message\"", LogLevel::Error),
-                ("\"first debug message %d\"", LogLevel::Debug),
-                ("\"lua error message\"", LogLevel::Unknown),
-                ("\"plain message\\n\"", LogLevel::Unknown),
-                ("\"syslog error message\"", LogLevel::Error),
-                ("\"syslog info message\"", LogLevel::Info),
-                ("\"ws debug message\"", LogLevel::Debug),
-                ("\"ws info message\"", LogLevel::Info),
-                ("\"ws warn message\"", LogLevel::Warn),
+                ("\"dissect syslog message\"", LogLevel::Error, Log),
+                ("\"first debug message %d\"", LogLevel::Debug, Log),
+                ("\"lua error message\"", LogLevel::Unknown, Other),
+                ("\"plain message\\n\"", LogLevel::Unknown, Log),
+                ("\"syslog error message\"", LogLevel::Error, Log),
+                ("\"syslog info message\"", LogLevel::Info, Log),
+                ("\"ws debug message\"", LogLevel::Debug, Log),
+                ("\"ws info message\"", LogLevel::Info, Log),
+                ("\"ws warn message\"", LogLevel::Warn, Log),
                 // A wrapped message is found for a family that is only known to be logging
                 // after pruning.
-                ("\"ws wrapped message\"", LogLevel::Warn),
+                ("\"ws wrapped message\"", LogLevel::Warn, Log),
             ]
         );
+    }
+
+    #[test]
+    fn test_match_prefers_log_category() {
+        let code = CodeSource::from_string(
+            Path::new("a.c"),
+            r#"
+int main(int argc, char *argv[]) {
+    luaL_error(L, "cannot open file %s", argv[0]);
+    log_warn("cannot open %s", argv[0]);
+    luaL_error(L, "cannot parse %s", argv[0]);
+    log_warn("server ready%s", argv[0]);
+    luaL_error(L, "server ready");
+}
+"#,
+        );
+        let mut tree = SourceTree {
+            tree: SourceHierTree::from(Path::new("in-mem")),
+            files_with_statements: HashMap::new(),
+            file_name_to_sources: HashMap::new(),
+            prefilter: None,
+            line_cache: RwLock::default(),
+            log_calls: BTreeMap::new(),
+        };
+        for sif in extract_logging(&[code], &ProgressTracker::new()) {
+            tree.files_with_statements.insert(sif.id, sif);
+        }
+        tree.prune_log_calls();
+        tree.rebuild_prefilter();
+        let best = |line: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+            tree.find_best_match(&log_ref)
+                .map(|src_ref| (src_ref.line_no, src_ref.category))
+        };
+        // The `luaL` family is pruned, so the log statement wins although the other one has
+        // more literal text.
+        assert_eq!(
+            best("cannot open file foo"),
+            Some((4, MessageCategory::Log))
+        );
+        // The other categories are still matched when no log statement does.
+        assert_eq!(best("cannot parse foo"), Some((5, MessageCategory::Other)));
+        // A log statement is used even if it only matches with an empty value and the other
+        // statement matches without one.
+        assert_eq!(best("server ready"), Some((6, MessageCategory::Log)));
     }
 
     #[test]
