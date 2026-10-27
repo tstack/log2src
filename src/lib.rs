@@ -5441,6 +5441,66 @@ fn load(path: &str) -> Result<()> {
     }
 
     #[test]
+    fn test_find_message_fragments() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.rs"),
+            r#"
+fn load(path: &str) -> Result<()> {
+    let store = Store::open(path).context("failed to load the cache")?;
+    bail!("cannot open the settings file at {}", path);
+    warn!("Unable to read file: {}", err);
+}
+"#,
+        );
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        // The text, line of the best candidate, and whether it is partial, for each source.
+        let find = |message: &str| -> Vec<(String, Option<usize>, bool)> {
+            find_message_sources(sif.statements(), message)
+                .iter()
+                .map(|source| {
+                    (
+                        source.text.clone(),
+                        source.candidates.first().map(|stmt| stmt.line_no),
+                        source.partial,
+                    )
+                })
+                .collect()
+        };
+
+        // A message that was wrapped differently in a GUI.
+        assert_eq!(
+            find("cannot open the settings\n  file at /etc/app.toml"),
+            vec![(
+                "cannot open the settings file at /etc/app.toml".to_string(),
+                Some(4),
+                false
+            )]
+        );
+        // A message with text put in front of it.
+        assert_eq!(
+            find("Error: failed to load the cache"),
+            vec![
+                ("Error".to_string(), None, false),
+                ("failed to load the cache".to_string(), Some(3), false),
+            ]
+        );
+        // Only part of a message was copied.
+        assert_eq!(
+            find("open the settings file"),
+            vec![("open the settings file".to_string(), Some(4), true)]
+        );
+        // The end of one literal part and some of a value.
+        assert_eq!(
+            find("to read file: permission den"),
+            vec![("to read file: permission den".to_string(), Some(5), true)]
+        );
+        // Too little in common.
+        assert_eq!(find("the cache"), vec![]);
+    }
+
+    #[test]
     fn test_find_message_sources_like_match() {
         let code = CodeSource::from_string(
             Path::new("in-mem.rs"),
