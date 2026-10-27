@@ -23,6 +23,7 @@ The current version is still an early prototype that only works with simple prog
 - Maps log lines back onto the source code to aid debugging by easing cognitive burden.
 - Tries to reconstruct a portion of the program state by providing values of expressions & variables.
 - Infer the call stack when possible based on an analysis of the source code.
+- Find where any message came from, like an error copied from a GUI, including the errors and formatted strings whose text ended up in it.
 - At the moment a subset of the Rust, Java, Kotlin, C, C++ and Python programming languages are supported, but intending to try and work with most popular languages.
 - A VS Code extension using the debug adapter protocol.
 
@@ -49,6 +50,10 @@ log2src calls -d ~/src/app
 
 # Find the source file for a path, like one in a stack trace
 log2src locate -d ~/src/app 'C:\build\App\Program.cs'
+
+# Find the statements that could have produced a message, like one copied from a log, a
+# screenshot, or a dialog, and the statements that produced the values in it, like an error
+log2src find -d ~/src/app 'Unable to start: failed to load the cache: Permission denied'
 
 # Manage the cache of log statements
 log2src cache path

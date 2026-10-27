@@ -24,6 +24,7 @@ use tree_sitter::Language;
 mod code_source;
 mod java_symbols;
 mod log_format;
+mod message_source;
 mod prefilter;
 mod progress;
 mod source_hier;
@@ -40,6 +41,7 @@ use crate::source_ref::{CallSite, FormatArgument};
 use crate::value_kind::SplitOrder;
 pub use code_source::CodeSource;
 pub use log_format::LogFormat;
+pub use message_source::{find_message_sources, MessageSource};
 pub use progress::ProgressTracker;
 pub use progress::ProgressUpdate;
 pub use progress::WorkInfo;
@@ -1070,6 +1072,13 @@ impl LogMatcher {
             .values()
             .flat_map(|coll| coll.files_with_statements.values())
             .flat_map(|sif| sif.statements())
+    }
+
+    /// Find the statements that could have produced a message, like one copied from a log, a
+    /// screenshot, or a GUI, and the sources of the values in it.  See
+    /// [`find_message_sources`].
+    pub fn find_message_sources(&self, message: &str) -> Vec<MessageSource<'_>> {
+        find_message_sources(self.statements(), message)
     }
 
     fn to_log_mapping<'a, 's>(
@@ -5354,6 +5363,81 @@ fn main() -> Result<()> {
                 ("\"custom message {}\"", Some("custom_macro"), Other),
             ]
         );
+    }
+
+    #[test]
+    fn test_find_message_sources() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.rs"),
+            r#"
+#[derive(thiserror::Error, Debug)]
+enum StoreError {
+    #[error("cannot open store at {0}")]
+    Open(String),
+}
+
+fn load(path: &str) -> Result<()> {
+    let store = Store::open(path).context("failed to load the cache")?;
+    warn!("Unable to read file: {}", err);
+    eprintln!("tool: error: {}", e);
+    let key = format!("{}/{}", dir, name);
+}
+"#,
+        );
+        let mut sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        prune_log_calls(sif.statements_for_pruning().collect());
+        // The text of each source with the line of its best candidate, and its causes.
+        fn summary(sources: &[MessageSource]) -> Vec<(String, Option<usize>, Vec<String>)> {
+            sources
+                .iter()
+                .map(|source| {
+                    (
+                        source.text.clone(),
+                        source.candidates.first().map(|stmt| stmt.line_no),
+                        source
+                            .causes
+                            .iter()
+                            .map(|cause| {
+                                let line = cause.candidates.first().map(|stmt| stmt.line_no);
+                                format!("{} @ {:?}", cause.text, line)
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        }
+        let find = |message: &str| summary(&find_message_sources(sif.statements(), message));
+
+        // The value in a log message is found in an error that was made somewhere else.
+        assert_eq!(
+            find("Unable to read file: cannot open store at /var/cache"),
+            vec![(
+                "Unable to read file: cannot open store at /var/cache".to_string(),
+                Some(10),
+                vec!["cannot open store at /var/cache @ Some(4)".to_string()],
+            )]
+        );
+        // A chain of errors, like anyhow's `{:#}`, is split when no statement matches it all.
+        // The formatted message has too little literal text to be a source.
+        assert_eq!(
+            find("failed to load the cache: Permission denied (os error 13)"),
+            vec![
+                ("failed to load the cache".to_string(), Some(9), vec![]),
+                ("Permission denied (os error 13)".to_string(), None, vec![]),
+            ]
+        );
+        // The message of an error that is printed by itself.
+        assert_eq!(
+            find("tool: error: failed to load the cache"),
+            vec![(
+                "tool: error: failed to load the cache".to_string(),
+                Some(11),
+                vec!["failed to load the cache @ Some(9)".to_string()],
+            )]
+        );
+        assert_eq!(find("nothing like this"), vec![]);
     }
 
     #[test]

@@ -72,6 +72,9 @@ enum Command {
     Calls,
     /// Find the source file for a path, like one from a stack trace
     Locate(LocateArgs),
+    /// Find the statements that could have produced a message, like one copied from a log, a
+    /// screenshot, or a GUI, and the sources of the values in it
+    Find(FindArgs),
     /// Manage the cache of log statements
     #[command(subcommand)]
     Cache(CacheCommand),
@@ -121,6 +124,13 @@ struct StatementsArgs {
     /// Print the number of statements by language and level instead of the statements
     #[arg(long)]
     summary: bool,
+}
+
+#[derive(Args)]
+struct FindArgs {
+    /// The messages to find
+    #[arg(required = true, value_name = "MESSAGE")]
+    messages: Vec<String>,
 }
 
 #[derive(Args)]
@@ -637,6 +647,22 @@ fn run_locate(cli: &Cli, args: &LocateArgs) -> miette::Result<()> {
     Ok(())
 }
 
+fn run_find(cli: &Cli, args: &FindArgs) -> miette::Result<()> {
+    let log_matcher = load_log_matcher(cli, CacheMode::ReadWrite, false)?;
+
+    for message in &args.messages {
+        let result = json!({
+            "message": message,
+            "sources": log_matcher.find_message_sources(message),
+        });
+        if !print_json(&result) {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 /// Read the JSON header on the first line of a cache entry.
 fn read_entry_header(entry_path: &Path) -> serde_json::Value {
     fs::File::open(entry_path)
@@ -779,6 +805,7 @@ fn main() -> miette::Result<()> {
         Command::Statements(args) => run_statements(&cli, args),
         Command::Calls => run_calls(&cli),
         Command::Locate(args) => run_locate(&cli, args),
+        Command::Find(args) => run_find(&cli, args),
         Command::Cache(command) => run_cache(&cli, command),
     }
 }
