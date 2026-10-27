@@ -153,7 +153,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "34")]
+    #[serde(rename = "35")]
     Current,
 }
 
@@ -1214,6 +1214,17 @@ static JAVA_QUERY: LazyLock<String> = LazyLock::new(|| {
                         (#match? @object-name "{JAVA_LOGGER_OBJECT}")
                         (#eq? @method-name "log")
                     )
+                    ; An exception, like throw new IllegalStateException("...") or
+                    ; throw new IOException(String.format("...", x))
+                    (throw_statement
+                        (object_creation_expression
+                            type: (_) @exception-name
+                            arguments: [
+                                (argument_list . [(string_literal) (binary_expression)] @arguments)
+                                (argument_list . (method_invocation) @message-call)
+                            ]
+                        )
+                    )
                 "#
     )
 });
@@ -1544,6 +1555,30 @@ impl SourceLanguage {
                     )
                     (#eq? @_format "format")
                     (#match? @func "(^|\\.)log$")
+                )
+                ; an exception, like `raise ValueError(f"...")`
+                (raise_statement
+                  (call
+                    function: (_) @func
+                    arguments: (argument_list .
+                      [(string) (concatenated_string) (binary_operator)] @args
+                    )
+                  )
+                )
+                ; `raise ValueError("{} failed".format(name))`
+                (
+                  (raise_statement
+                    (call
+                      function: (_) @func
+                      arguments: (argument_list .
+                        (call
+                          function: (attribute
+                            object: [(string) (concatenated_string)]
+                            attribute: (identifier) @_format)) @args
+                      )
+                    )
+                  )
+                  (#eq? @_format "format")
                 )
                 "#
             }
@@ -5317,6 +5352,150 @@ fn main() -> Result<()> {
                 ("\"too many values in {}\"", Some("Err"), Error),
                 ("\"unreachable state {}\"", Some("panic"), Error),
                 ("\"custom message {}\"", Some("custom_macro"), Other),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_categories_python() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.py"),
+            r#"
+def load(path, count):
+    logger.info("loading %s", path)
+    logger.log(level, "level variable message")
+    print("plain output", count)
+    if count < 0:
+        raise ValueError(f"negative count {count}")
+    if count > 100:
+        raise ConfigError("too many entries in {}".format(path)) from None
+    if not path:
+        raise RuntimeError("no path given for %s" % name)
+    raise errors.LoadError("cannot load file")
+"#,
+        );
+        let mut sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        prune_log_calls(sif.statements_for_pruning().collect());
+        let found: Vec<(&str, Option<&str>, LogLevel, MessageCategory)> = sif
+            .statements()
+            .map(|stmt| {
+                (
+                    stmt.pattern().as_str(),
+                    stmt.call_name.as_deref(),
+                    stmt.level,
+                    stmt.category,
+                )
+            })
+            .collect();
+        use MessageCategory::*;
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "(?s)^loading (.*)$",
+                    Some("logger.info"),
+                    LogLevel::Info,
+                    Log
+                ),
+                (
+                    "(?s)^level variable message$",
+                    Some("logger.log"),
+                    LogLevel::Unknown,
+                    Log
+                ),
+                (
+                    "(?s)^plain output$",
+                    Some("print"),
+                    LogLevel::Unknown,
+                    Other
+                ),
+                (
+                    "(?s)^negative count (.*)$",
+                    Some("raise ValueError"),
+                    LogLevel::Unknown,
+                    Error
+                ),
+                (
+                    "(?s)^too many entries in (.*)$",
+                    Some("raise ConfigError"),
+                    LogLevel::Unknown,
+                    Error
+                ),
+                (
+                    "(?s)^no path given for (.*)$",
+                    Some("raise RuntimeError"),
+                    LogLevel::Unknown,
+                    Error
+                ),
+                (
+                    "(?s)^cannot load file$",
+                    Some("raise errors.LoadError"),
+                    LogLevel::Unknown,
+                    Error
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_categories_java() {
+        let code = CodeSource::from_string(
+            Path::new("Loader.java"),
+            r#"
+class Loader {
+    void load(String path, int count) throws IOException {
+        log.info("loading {}", path);
+        if (count < 0) {
+            throw new IllegalArgumentException("negative count " + count);
+        }
+        if (count > 100) {
+            throw new IOException(String.format("too many entries in %s", path));
+        }
+        throw new java.io.UncheckedIOException("cannot load file", cause);
+    }
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let found: Vec<(&str, Option<&str>, LogLevel, MessageCategory)> = src_refs
+            .iter()
+            .map(|stmt| {
+                (
+                    stmt.pattern().as_str(),
+                    stmt.call_name.as_deref(),
+                    stmt.level,
+                    stmt.category,
+                )
+            })
+            .collect();
+        use MessageCategory::*;
+        assert_eq!(
+            found,
+            vec![
+                ("(?s)^loading (.*)$", Some("info"), LogLevel::Info, Log),
+                (
+                    "(?s)^negative count (.*)$",
+                    Some("throw IllegalArgumentException"),
+                    LogLevel::Unknown,
+                    Error
+                ),
+                (
+                    "(?s)^too many entries in (.*)$",
+                    Some("throw IOException"),
+                    LogLevel::Unknown,
+                    Error
+                ),
+                (
+                    "(?s)^cannot load file$",
+                    Some("throw java.io.UncheckedIOException"),
+                    LogLevel::Unknown,
+                    Error
+                ),
             ]
         );
     }

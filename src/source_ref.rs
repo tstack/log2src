@@ -39,9 +39,9 @@ impl LogLevel {
     /// such a prefix is really a logger is decided later, across all of the calls in a source
     /// tree, using [`LogLevel::call_family`].
     pub fn from_name(name: &str) -> Option<LogLevel> {
-        // An attribute, like thiserror's `#[error("...")]`, or a C++ `throw` is not a logging
-        // call.
-        if name.starts_with('#') || name.starts_with("throw ") {
+        // An attribute, like thiserror's `#[error("...")]`, or a `throw` or `raise` of an
+        // exception is not a logging call.
+        if name.starts_with('#') || MessageCategory::is_exception_call(name) {
             return None;
         }
         Self::from_known_name(name)
@@ -368,8 +368,7 @@ impl MessageCategory {
     /// The category of a statement that is not in a pruned family.  A call that is known not to
     /// be logging, like `bail!` or `.context()`, has a category from its name, even if the name
     /// looks like it has a level, like `Err`.  Otherwise, a statement with a level is `Log`.
-    /// Only Rust, C, and C++ are classified for now, so the statements in other languages are
-    /// `Log`.
+    /// Only Kotlin is not classified yet, so its statements are `Log`.
     pub(crate) fn classify(src_ref: &SourceRef) -> MessageCategory {
         if let Some(category) = Self::from_call(src_ref) {
             return category;
@@ -384,20 +383,27 @@ impl MessageCategory {
                 _ => MessageCategory::Other,
             },
             SourceLanguage::C | SourceLanguage::Cpp => MessageCategory::Other,
-            _ => MessageCategory::Log,
+            SourceLanguage::Python => match Self::short_call_name(src_ref) {
+                // a level that is not known until runtime, like `logger.log(lvl, "...")`
+                "log" => MessageCategory::Log,
+                _ => MessageCategory::Other,
+            },
+            // The Java query only finds calls on a logger.
+            SourceLanguage::Java | SourceLanguage::Kotlin => MessageCategory::Log,
         }
     }
 
     /// The category of a call that is known not to be logging, from its name and the function
     /// it is in.
     pub(crate) fn from_call(src_ref: &SourceRef) -> Option<MessageCategory> {
+        let full_name = src_ref.call_name.as_deref().unwrap_or_default();
         match src_ref.language {
             SourceLanguage::Rust => {}
-            SourceLanguage::C | SourceLanguage::Cpp => {
-                let call_name = src_ref.call_name.as_deref().unwrap_or_default();
-                return Self::from_c_call(call_name);
+            SourceLanguage::C | SourceLanguage::Cpp => return Self::from_c_call(full_name),
+            SourceLanguage::Java | SourceLanguage::Python => {
+                return Self::is_exception_call(full_name).then_some(MessageCategory::Error);
             }
-            _ => return None,
+            SourceLanguage::Kotlin => return None,
         }
         let call_name = Self::short_call_name(src_ref);
         if Self::is_rust_error_call(call_name) {
@@ -427,7 +433,14 @@ impl MessageCategory {
     /// `throw std::runtime_error("...")`, which is named `throw std::runtime_error`, or GLib's
     /// `g_set_error()`.
     pub(crate) fn is_c_error_call(name: &str) -> bool {
-        name.starts_with("throw ") || matches!(name, "g_set_error" | "g_set_error_literal")
+        Self::is_exception_call(name) || matches!(name, "g_set_error" | "g_set_error_literal")
+    }
+
+    /// Check if a call makes an exception with the message, like a C++ or Java
+    /// `throw ...("...")`, which is named `throw ...`, or a Python `raise ...("...")`, which is
+    /// named `raise ...`.
+    pub(crate) fn is_exception_call(name: &str) -> bool {
+        name.starts_with("throw ") || name.starts_with("raise ")
     }
 
     /// Check if a C or C++ call formats the message into a string, like `snprintf()` or
