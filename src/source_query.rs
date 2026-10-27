@@ -229,10 +229,11 @@ impl<'a> SourceQuery<'a> {
                     // `throw`.  A message that is formatted for some other call, like
                     // `report(fmt::format("..."))`, is kept as a message of the format call.
                     let leading = leading_args.get_or_insert_with(|| self.leading_args(outer));
+                    // The message of a C or C++ call that formats or makes an error, like
+                    // `snprintf(buf, n, _("..."), x)` or `throw X(_("..."))`, is kept too.
                     if !Self::has_level(call_name.as_deref(), leading)
-                        && !call_name
-                            .as_deref()
-                            .is_some_and(MessageCategory::is_c_error_call)
+                        && !(self.source_language.is_c_family()
+                            && Self::is_c_message_call(call_name.as_deref()))
                     {
                         match format_call.take() {
                             Some(name) => call_name = Some(name),

@@ -5373,6 +5373,65 @@ void load(const std::string &path, int count) {
     }
 
     #[test]
+    fn test_categories_cpp_translated() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.cc"),
+            r#"
+void load(const char *path, int count) {
+    snprintf(buf, sizeof(buf), _("Could not open the file %s"), path);
+    g_strdup_printf(_("Cannot load the profile %s"), path);
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, _("Failed to read the file %s"), path);
+    throw std::runtime_error(_("bad configuration value"));
+    label->setText(tr("not a message"));
+}
+"#,
+        );
+        let mut sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        prune_log_calls(sif.statements_for_pruning().collect());
+        let found: Vec<(&str, Option<&str>, MessageCategory)> = sif
+            .statements()
+            .map(|stmt| {
+                (
+                    stmt.pattern().as_str(),
+                    stmt.call_name.as_deref(),
+                    stmt.category,
+                )
+            })
+            .collect();
+        use MessageCategory::*;
+        // A translated message is kept for a call that formats or makes an error, but not
+        // for other calls.
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "(?s)^Could not open the file (.*)$",
+                    Some("snprintf"),
+                    Format
+                ),
+                (
+                    "(?s)^Cannot load the profile (.*)$",
+                    Some("g_strdup_printf"),
+                    Format
+                ),
+                (
+                    "(?s)^Failed to read the file (.*)$",
+                    Some("g_set_error"),
+                    Error
+                ),
+                (
+                    "(?s)^bad configuration value$",
+                    Some("throw std::runtime_error"),
+                    Error
+                ),
+            ]
+        );
+        assert_eq!(sif.statements().next().unwrap().vars, vec!["path"]);
+    }
+
+    #[test]
     fn test_format_consumers() {
         let code = CodeSource::from_string(
             Path::new("in-mem.rs"),
