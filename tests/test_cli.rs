@@ -173,10 +173,17 @@ fn main() {
 "#,
     )?;
     let mut cmd = common_settings::CommandGuard::new("find")?;
+    // Only match the name of the temporary directory, since the path that is printed can be
+    // different, like `/private/var/...` for `/var/...` on macOS, or have escaped backslashes on
+    // Windows.
+    let dir_name = source.path().file_name().expect("temp dir has a name");
     let mut settings = insta::Settings::clone_current();
     settings.add_filter(
-        &regex::escape(source.path().to_string_lossy().as_ref()),
-        "{source_dir}",
+        &format!(
+            r#""[^"]*{}(?:/|\\\\?)"#,
+            regex::escape(dir_name.to_string_lossy().as_ref())
+        ),
+        "\"{source_dir}/",
     );
     let _filter_guard = settings.bind_to_scope();
     cmd.arg("-d")
