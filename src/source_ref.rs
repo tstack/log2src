@@ -339,18 +339,14 @@ impl ArgCounter {
 pub enum MessageCategory {
     /// A logging call, whose level is in `SourceRef::level`.
     Log,
-    /// An error message, like `bail!("...")`, `.context("...")`, or thiserror's
-    /// `#[error("...")]`.
+    /// An error or panic message, like `bail!("...")`, `.context("...")`, thiserror's
+    /// `#[error("...")]`, or `.expect("...")`.
     Error,
-    /// A panic message, like `panic!("...")` or `.expect("...")`.
-    Panic,
     /// A message that is formatted and then used somewhere else, like `format!("...")`, or
     /// written by a `Display` impl.
     Format,
-    /// A message written to an output, like `println!("...")` or `write!(out, "...")`.
-    Output,
-    /// Some other use of a message, like a call in a family that `prune_log_calls()` decided
-    /// does not look like logging.
+    /// Some other use of a message, like `println!("...")`, or a call in a family that
+    /// `prune_log_calls()` decided does not look like logging.
     Other,
 }
 
@@ -358,15 +354,13 @@ impl MessageCategory {
     /// The tier that statements in this category are matched in when looking for the source of
     /// a log message, lowest first.  A statement in a later tier is only used when none in an
     /// earlier tier matches.  After the log statements, the order is from the most to the least
-    /// likely to be printed as a line on its own.
+    /// likely to be printed as a line on its own, like a `println!()`.
     pub fn match_priority(&self) -> u8 {
         match self {
             MessageCategory::Log => 0,
-            MessageCategory::Output => 1,
-            MessageCategory::Other => 2,
-            MessageCategory::Error => 3,
-            MessageCategory::Panic => 4,
-            MessageCategory::Format => 5,
+            MessageCategory::Other => 1,
+            MessageCategory::Error => 2,
+            MessageCategory::Format => 3,
         }
     }
 
@@ -396,14 +390,12 @@ impl MessageCategory {
         }
         let category = match Self::short_call_name(src_ref) {
             "bail" | "anyhow" | "ensure" | "eyre" | "context" | "with_context" | "wrap_err"
-            | "wrap_err_with" | "Err" | "ok_or" | "ok_or_else" | "map_err" | "#[error]" => {
-                MessageCategory::Error
-            }
-            "panic" | "unreachable" | "todo" | "unimplemented" | "assert" | "assert_eq"
+            | "wrap_err_with" | "Err" | "ok_or" | "ok_or_else" | "map_err" | "#[error]"
+            | "panic" | "unreachable" | "todo" | "unimplemented" | "assert" | "assert_eq"
             | "assert_ne" | "debug_assert" | "debug_assert_eq" | "debug_assert_ne" | "expect"
-            | "expect_err" => MessageCategory::Panic,
+            | "expect_err" => MessageCategory::Error,
             "format" | "format_args" => MessageCategory::Format,
-            "print" | "println" | "eprint" | "eprintln" => MessageCategory::Output,
+            "print" | "println" | "eprint" | "eprintln" => MessageCategory::Other,
             "write" | "writeln" => Self::classify_write(&src_ref.qualified_name),
             _ => return None,
         };
@@ -418,10 +410,11 @@ impl MessageCategory {
     }
 
     /// A `write!` in `<Type as Display>::fmt` is the message of an error type when the type
-    /// is named like one, `Format` in any other `fmt`, and `Output` everywhere else.
+    /// is named like one, `Format` in any other `fmt`, and `Other` everywhere else, like a
+    /// write to a file.
     fn classify_write(qualified_name: &str) -> MessageCategory {
         let Some(impl_name) = qualified_name.strip_suffix("::fmt") else {
-            return MessageCategory::Output;
+            return MessageCategory::Other;
         };
         // The impl is named like `<Type<T> as fmt::Display>`, after the names of any modules.
         let Some((before_as, _)) = impl_name.rsplit_once(" as ") else {

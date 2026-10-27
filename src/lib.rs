@@ -5273,17 +5273,17 @@ fn main() -> Result<()> {
                 ("\"bad frame {}\"", Some("write"), Error),
                 ("\"starting up\"", Some("info"), Log),
                 ("\"level variable message\"", Some("log"), Log),
-                ("\"plain output {}\"", Some("println"), Output),
-                ("\"written output {}\"", Some("writeln"), Output),
+                ("\"plain output {}\"", Some("println"), Other),
+                ("\"written output {}\"", Some("writeln"), Other),
                 ("\"dir {}\"", Some("format"), Format),
                 ("\"failed to open file\"", Some("context"), Error),
                 // A `format!` is named after the call that consumes the message.
                 ("\"failed to open {}\"", Some("with_context"), Error),
                 ("\"cannot open {}: {}\"", Some("map_err"), Error),
-                ("\"parse must succeed\"", Some("expect"), Panic),
+                ("\"parse must succeed\"", Some("expect"), Error),
                 ("\"no values in {}\"", Some("bail"), Error),
                 ("\"too many values in {}\"", Some("Err"), Error),
-                ("\"unreachable state {}\"", Some("panic"), Panic),
+                ("\"unreachable state {}\"", Some("panic"), Error),
                 ("\"custom message {}\"", Some("custom_macro"), Other),
             ]
         );
