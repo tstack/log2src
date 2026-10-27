@@ -153,7 +153,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "33")]
+    #[serde(rename = "34")]
     Current,
 }
 
@@ -1246,12 +1246,33 @@ static PYTHON_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*[diuoxXfFeEgGaAcrspn%]"#).unwrap()
 });
 
-/// Calls that take string-literals but are not logging, like `snprintf` or `strcpy`.
-const C_NOT_LOGGING_CALLS: &str = "snprintf|sprintf|(^|::)(strcpy|strncpy|strcat|strncat|strcmp|strncmp|strcasecmp|strncasecmp|strstr|strchr|strrchr|strdup|strtok|setenv|getenv|fopen|open|access|stat)$";
+/// Calls that take string-literals that are not messages, like `strcpy` or `getenv`.
+const C_NOT_LOGGING_CALLS: &str = "(^|::)(strcpy|strncpy|strcat|strncat|strcmp|strncmp|strcasecmp|strncasecmp|strstr|strchr|strrchr|strdup|strtok|setenv|getenv|fopen|open|access|stat)$";
 
 /// The query for C and C++ calls with a message, where `literals` are the kinds of nodes that
-/// are messages.
-fn c_family_query(literals: &str) -> String {
+/// are messages.  C++ also has the messages of the exceptions that are thrown, like
+/// `throw std::runtime_error("...")`.
+fn c_family_query(literals: &str, cpp: bool) -> String {
+    let throw = if cpp {
+        format!(
+            r#"
+            (throw_statement
+                (call_expression
+                    function: (_) @fname
+                    arguments: (argument_list . [{literals}] @arguments)
+                )
+            )
+            (throw_statement
+                (call_expression
+                    function: (_) @fname
+                    arguments: (argument_list . (call_expression) @message-call)
+                )
+            )
+            "#
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"
             (
@@ -1273,16 +1294,18 @@ fn c_family_query(literals: &str) -> String {
                 )
                 (#not-match? @fname "{C_NOT_LOGGING_CALLS}")
             )
+            {throw}
         "#
     )
 }
 
 /// Like C++, but without raw strings, and `+` on a string-literal is never a concatenation.
 static C_QUERY: LazyLock<String> =
-    LazyLock::new(|| c_family_query("(string_literal) (concatenated_string)"));
+    LazyLock::new(|| c_family_query("(string_literal) (concatenated_string)", false));
 static CPP_QUERY: LazyLock<String> = LazyLock::new(|| {
     c_family_query(
         "(string_literal) (raw_string_literal) (concatenated_string) (binary_expression)",
+        true,
     )
 });
 
@@ -3419,10 +3442,15 @@ void connect() {
                 ("(?s)^Couldn't read '(.*)'$", LogLevel::Warn),
                 ("(?s)^Verifying (.*) pieces$", LogLevel::Debug),
                 ("(?s)^sending vc$", LogLevel::Trace),
+                ("(?s)^not a log message (.*)$", LogLevel::Unknown),
+                ("(?s)^Bad value (.*)$", LogLevel::Unknown),
                 ("(?s)^Loaded (.*)$", LogLevel::Info),
             ]
         );
-        assert_eq!(src_refs[5].vars, vec!["\"file.txt\""]);
+        assert_eq!(src_refs[5].category, MessageCategory::Format);
+        assert_eq!(src_refs[5].call_name.as_deref(), Some("fmt::format"));
+        assert_eq!(src_refs[6].category, MessageCategory::Format);
+        assert_eq!(src_refs[7].vars, vec!["\"file.txt\""]);
         assert_eq!(src_refs[0].vars, vec!["family", "addr"]);
         assert_eq!(src_refs[3].vars, vec!["count"]);
     }
@@ -3697,7 +3725,7 @@ void f(const char *path, int a, int b, long total) {
     strcpy(buf, "default");
     strcat(path, "/");
     setenv("LANG", "C", 1);
-    vsnprintf(buf, sizeof(buf), "not logged %d", a);
+    vsnprintf(buf, sizeof(buf), "formatted %d", a);
 }
 "#,
         );
@@ -3705,13 +3733,17 @@ void f(const char *path, int a, int b, long total) {
             .pop()
             .unwrap()
             .log_statements;
-        let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
+        let patterns: Vec<(&str, MessageCategory)> = src_refs
+            .iter()
+            .map(|s| (s.pattern().as_str(), s.category))
+            .collect();
         assert_eq!(
             patterns,
             vec![
-                "(?s)^open (.*) failed: (.*)$",
-                r"(?s)^(.*) before (.*?)\s*$",
-                "(?s)^total (.*) bytes$",
+                ("(?s)^open (.*) failed: (.*)$", MessageCategory::Log),
+                (r"(?s)^(.*) before (.*?)\s*$", MessageCategory::Other),
+                ("(?s)^total (.*) bytes$", MessageCategory::Log),
+                ("(?s)^formatted (.*)$", MessageCategory::Format),
             ]
         );
         let pairs = |index: usize, line: &str| -> Vec<(String, String)> {
@@ -5186,7 +5218,7 @@ void dissect(void) {
                 ("\"dissect syslog message\"", LogLevel::Error, Log),
                 ("\"first debug message %d\"", LogLevel::Debug, Log),
                 ("\"lua error message\"", LogLevel::Unknown, Other),
-                ("\"plain message\\n\"", LogLevel::Unknown, Log),
+                ("\"plain message\\n\"", LogLevel::Unknown, Other),
                 ("\"syslog error message\"", LogLevel::Error, Log),
                 ("\"syslog info message\"", LogLevel::Info, Log),
                 ("\"ws debug message\"", LogLevel::Debug, Log),
@@ -5287,6 +5319,116 @@ fn main() -> Result<()> {
                 ("\"custom message {}\"", Some("custom_macro"), Other),
             ]
         );
+    }
+
+    #[test]
+    fn test_categories_cpp() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.cc"),
+            r#"
+void load(const std::string &path, int count) {
+    LOG_INFO("loading %s", path.c_str());
+    printf("plain output %d\n", count);
+    snprintf(buf, sizeof(buf), "%s/cache-%d", path.c_str(), count);
+    report(fmt::format("cannot parse {}", path));
+    if (count < 0) {
+        throw std::runtime_error("negative count");
+    }
+    if (count > 100) {
+        throw ConfigError(fmt::format("too many entries in {}", path));
+    }
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Failed to open %s", path.c_str());
+}
+"#,
+        );
+        let mut sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        prune_log_calls(sif.statements_for_pruning().collect());
+        let found: Vec<(&str, Option<&str>, MessageCategory)> = sif
+            .statements()
+            .map(|stmt| (stmt.text.as_str(), stmt.call_name.as_deref(), stmt.category))
+            .collect();
+        use MessageCategory::*;
+        assert_eq!(
+            found,
+            vec![
+                ("\"loading %s\"", Some("LOG_INFO"), Log),
+                ("\"plain output %d\\n\"", Some("printf"), Other),
+                ("\"%s/cache-%d\"", Some("snprintf"), Format),
+                ("\"cannot parse {}\"", Some("fmt::format"), Format),
+                (
+                    "\"negative count\"",
+                    Some("throw std::runtime_error"),
+                    Error
+                ),
+                (
+                    "\"too many entries in {}\"",
+                    Some("throw ConfigError"),
+                    Error
+                ),
+                ("\"Failed to open %s\"", Some("g_set_error"), Error),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_categories_cpp_translated() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.cc"),
+            r#"
+void load(const char *path, int count) {
+    snprintf(buf, sizeof(buf), _("Could not open the file %s"), path);
+    g_strdup_printf(_("Cannot load the profile %s"), path);
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, _("Failed to read the file %s"), path);
+    throw std::runtime_error(_("bad configuration value"));
+    label->setText(tr("not a message"));
+}
+"#,
+        );
+        let mut sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        prune_log_calls(sif.statements_for_pruning().collect());
+        let found: Vec<(&str, Option<&str>, MessageCategory)> = sif
+            .statements()
+            .map(|stmt| {
+                (
+                    stmt.pattern().as_str(),
+                    stmt.call_name.as_deref(),
+                    stmt.category,
+                )
+            })
+            .collect();
+        use MessageCategory::*;
+        // A translated message is kept for a call that formats or makes an error, but not
+        // for other calls.
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "(?s)^Could not open the file (.*)$",
+                    Some("snprintf"),
+                    Format
+                ),
+                (
+                    "(?s)^Cannot load the profile (.*)$",
+                    Some("g_strdup_printf"),
+                    Format
+                ),
+                (
+                    "(?s)^Failed to read the file (.*)$",
+                    Some("g_set_error"),
+                    Error
+                ),
+                (
+                    "(?s)^bad configuration value$",
+                    Some("throw std::runtime_error"),
+                    Error
+                ),
+            ]
+        );
+        assert_eq!(sif.statements().next().unwrap().vars, vec!["path"]);
     }
 
     #[test]

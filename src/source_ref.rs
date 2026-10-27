@@ -39,8 +39,9 @@ impl LogLevel {
     /// such a prefix is really a logger is decided later, across all of the calls in a source
     /// tree, using [`LogLevel::call_family`].
     pub fn from_name(name: &str) -> Option<LogLevel> {
-        // An attribute, like thiserror's `#[error("...")]`, is not a logging call.
-        if name.starts_with('#') {
+        // An attribute, like thiserror's `#[error("...")]`, or a C++ `throw` is not a logging
+        // call.
+        if name.starts_with('#') || name.starts_with("throw ") {
             return None;
         }
         Self::from_known_name(name)
@@ -367,26 +368,36 @@ impl MessageCategory {
     /// The category of a statement that is not in a pruned family.  A call that is known not to
     /// be logging, like `bail!` or `.context()`, has a category from its name, even if the name
     /// looks like it has a level, like `Err`.  Otherwise, a statement with a level is `Log`.
-    /// Only Rust is classified by name for now, so the statements in other languages are `Log`.
+    /// Only Rust, C, and C++ are classified for now, so the statements in other languages are
+    /// `Log`.
     pub(crate) fn classify(src_ref: &SourceRef) -> MessageCategory {
         if let Some(category) = Self::from_call(src_ref) {
             return category;
         }
-        if src_ref.level != LogLevel::Unknown || src_ref.language != SourceLanguage::Rust {
+        if src_ref.level != LogLevel::Unknown {
             return MessageCategory::Log;
         }
-        match Self::short_call_name(src_ref) {
-            // a level that is not known until runtime, like `log!(lvl, "...")`
-            "log" | "event" => MessageCategory::Log,
-            _ => MessageCategory::Other,
+        match src_ref.language {
+            SourceLanguage::Rust => match Self::short_call_name(src_ref) {
+                // a level that is not known until runtime, like `log!(lvl, "...")`
+                "log" | "event" => MessageCategory::Log,
+                _ => MessageCategory::Other,
+            },
+            SourceLanguage::C | SourceLanguage::Cpp => MessageCategory::Other,
+            _ => MessageCategory::Log,
         }
     }
 
     /// The category of a call that is known not to be logging, from its name and the function
     /// it is in.
     pub(crate) fn from_call(src_ref: &SourceRef) -> Option<MessageCategory> {
-        if src_ref.language != SourceLanguage::Rust {
-            return None;
+        match src_ref.language {
+            SourceLanguage::Rust => {}
+            SourceLanguage::C | SourceLanguage::Cpp => {
+                let call_name = src_ref.call_name.as_deref().unwrap_or_default();
+                return Self::from_c_call(call_name);
+            }
+            _ => return None,
         }
         let call_name = Self::short_call_name(src_ref);
         if Self::is_rust_error_call(call_name) {
@@ -399,6 +410,50 @@ impl MessageCategory {
             _ => return None,
         };
         Some(category)
+    }
+
+    /// The category of a C or C++ call that is known not to be logging, from its name.
+    pub(crate) fn from_c_call(name: &str) -> Option<MessageCategory> {
+        if Self::is_c_error_call(name) {
+            Some(MessageCategory::Error)
+        } else if Self::is_c_format_call(name) {
+            Some(MessageCategory::Format)
+        } else {
+            None
+        }
+    }
+
+    /// Check if a C or C++ call makes an error with the message, like a C++
+    /// `throw std::runtime_error("...")`, which is named `throw std::runtime_error`, or GLib's
+    /// `g_set_error()`.
+    pub(crate) fn is_c_error_call(name: &str) -> bool {
+        name.starts_with("throw ") || matches!(name, "g_set_error" | "g_set_error_literal")
+    }
+
+    /// Check if a C or C++ call formats the message into a string, like `snprintf()` or
+    /// `fmt::format()`, by the last part of its name.
+    pub(crate) fn is_c_format_call(name: &str) -> bool {
+        let name = name.rsplit("::").next().unwrap_or(name);
+        matches!(
+            name,
+            "sprintf"
+                | "snprintf"
+                | "vsprintf"
+                | "vsnprintf"
+                | "asprintf"
+                | "vasprintf"
+                | "swprintf"
+                | "vswprintf"
+                | "g_snprintf"
+                | "g_vsnprintf"
+                | "g_strdup_printf"
+                | "g_strdup_vprintf"
+                | "g_string_printf"
+                | "g_string_append_printf"
+                | "format"
+                | "format_to"
+                | "StrFormat"
+        )
     }
 
     /// Check if a Rust call, by the last part of its name, makes an error or panic with the
