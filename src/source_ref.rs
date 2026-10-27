@@ -388,18 +388,50 @@ impl MessageCategory {
         if src_ref.language != SourceLanguage::Rust {
             return None;
         }
-        let category = match Self::short_call_name(src_ref) {
-            "bail" | "anyhow" | "ensure" | "eyre" | "context" | "with_context" | "wrap_err"
-            | "wrap_err_with" | "Err" | "ok_or" | "ok_or_else" | "map_err" | "#[error]"
-            | "panic" | "unreachable" | "todo" | "unimplemented" | "assert" | "assert_eq"
-            | "assert_ne" | "debug_assert" | "debug_assert_eq" | "debug_assert_ne" | "expect"
-            | "expect_err" => MessageCategory::Error,
+        let call_name = Self::short_call_name(src_ref);
+        if Self::is_rust_error_call(call_name) {
+            return Some(MessageCategory::Error);
+        }
+        let category = match call_name {
             "format" | "format_args" => MessageCategory::Format,
             "print" | "println" | "eprint" | "eprintln" => MessageCategory::Other,
             "write" | "writeln" => Self::classify_write(&src_ref.qualified_name),
             _ => return None,
         };
         Some(category)
+    }
+
+    /// Check if a Rust call, by the last part of its name, makes an error or panic with the
+    /// message, like `bail!("...")` or `.context("...")`.
+    pub(crate) fn is_rust_error_call(name: &str) -> bool {
+        matches!(
+            name,
+            "bail"
+                | "anyhow"
+                | "ensure"
+                | "eyre"
+                | "context"
+                | "with_context"
+                | "wrap_err"
+                | "wrap_err_with"
+                | "Err"
+                | "ok_or"
+                | "ok_or_else"
+                | "map_err"
+                | "#[error]"
+                | "panic"
+                | "unreachable"
+                | "todo"
+                | "unimplemented"
+                | "assert"
+                | "assert_eq"
+                | "assert_ne"
+                | "debug_assert"
+                | "debug_assert_eq"
+                | "debug_assert_ne"
+                | "expect"
+                | "expect_err"
+        )
     }
 
     /// The last part of the name of the call, like `context` for `.context()` or `anyhow` for

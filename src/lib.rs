@@ -5290,6 +5290,45 @@ fn main() -> Result<()> {
     }
 
     #[test]
+    fn test_format_consumers() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.rs"),
+            r#"
+fn check(p: &str) -> Result<()> {
+    names.push(format!("failed to open the file {}", p));
+    let path = PathBuf::from(format!("{}/sessions/{}.db", root, p));
+    let f = File::open(p).with_context(|| format!("cannot read {}", p))?;
+    bail!("failed to open the file {}", p);
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let found: Vec<(usize, Option<&str>, MessageCategory)> = src_refs
+            .iter()
+            .map(|stmt| (stmt.line_no, stmt.call_name.as_deref(), stmt.category))
+            .collect();
+        // Only a `format!` passed to an error call is named after that call.
+        assert_eq!(
+            found,
+            vec![
+                (3, Some("format"), MessageCategory::Format),
+                (4, Some("format"), MessageCategory::Format),
+                (5, Some("with_context"), MessageCategory::Error),
+                (6, Some("bail"), MessageCategory::Error),
+            ]
+        );
+        let line = "failed to open the file /x";
+        let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+        assert_eq!(
+            link_to_source(&log_ref, &src_refs).map(|src_ref| src_ref.line_no),
+            Some(6)
+        );
+    }
+
+    #[test]
     fn test_fallback_quality() {
         let code = CodeSource::from_string(
             Path::new("in-mem.rs"),
