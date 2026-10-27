@@ -1,0 +1,23 @@
+---
+source: tests/test_cli.rs
+info:
+  program: log2src
+  args:
+    - find
+    - "-d"
+    - /tmp/.tmpbjOSUO
+    - "Unable to start: failed to load the cache: cannot open store at /var/cache"
+  env:
+    APPDATA: /tmp/.tmp38WYpo
+    COLS: "1000"
+    HOME: /tmp/.tmp38WYpo
+    LOCALAPPDATA: /tmp/.tmp38WYpo
+    USERPROFILE: /tmp/.tmp38WYpo
+    XDG_CONFIG_HOME: /tmp/.tmp38WYpo
+---
+success: true
+exit_code: 0
+----- stdout -----
+{"message":"Unable to start: failed to load the cache: cannot open store at /var/cache","sources":[{"candidates":[{"argKinds":["Any"],"args":["Placeholder"],"blockId":269,"callName":"warn","category":"Log","column":14,"endLineNumber":14,"kinds":["Any"],"language":"Rust","level":"Warn","lineNumber":14,"name":"main","pattern":"(?s)^Unable to start: (.*)$","qualifiedName":"main","quality":14,"segments":["Unable to start: ",""],"sourcePath":"{source_dir}/errors.rs","text":"\"Unable to start: {:#}\"","varKinds":["Any"],"vars":["err"]}],"causes":[{"candidates":[{"argKinds":[],"args":[],"blockId":153,"callName":"context","category":"Error","column":30,"endLineNumber":9,"kinds":[],"language":"Rust","level":"Unknown","lineNumber":9,"name":"load","pattern":"(?s)^failed to load the cache$","qualifiedName":"load","quality":20,"segments":["failed to load the cache"],"sourcePath":"{source_dir}/errors.rs","text":"\"failed to load the cache\"","varKinds":[],"vars":[]}],"text":"failed to load the cache"},{"candidates":[{"argKinds":["Any"],"args":[{"Positional":0}],"blockId":52,"callName":"#[error]","category":"Error","column":12,"endLineNumber":4,"kinds":["Any"],"language":"Rust","level":"Unknown","lineNumber":4,"name":"errors","pattern":"(?s)^cannot open store at (.*)$","qualifiedName":"","quality":17,"segments":["cannot open store at ",""],"sourcePath":"{source_dir}/errors.rs","text":"\"cannot open store at {0}\"","varKinds":[],"vars":[]}],"causes":[{"candidates":[],"text":"/var/cache"}],"text":"cannot open store at /var/cache"}],"text":"Unable to start: failed to load the cache: cannot open store at /var/cache"}]}
+
+----- stderr -----

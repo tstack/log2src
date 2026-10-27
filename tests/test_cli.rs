@@ -148,3 +148,41 @@ fn cache_clear_nested_source() -> Result<(), Box<dyn std::error::Error>> {
     assert!(list.output()?.stdout.is_empty());
     Ok(())
 }
+
+#[test]
+fn find_message() -> Result<(), Box<dyn std::error::Error>> {
+    let source = tempfile::tempdir()?;
+    std::fs::write(
+        source.path().join("errors.rs"),
+        r#"
+#[derive(thiserror::Error, Debug)]
+enum StoreError {
+    #[error("cannot open store at {0}")]
+    Open(String),
+}
+
+fn load(path: &str) -> Result<Store> {
+    Store::open(path).context("failed to load the cache")
+}
+
+fn main() {
+    if let Err(err) = load("/var/cache") {
+        warn!("Unable to start: {:#}", err);
+    }
+}
+"#,
+    )?;
+    let mut cmd = common_settings::CommandGuard::new("find")?;
+    let mut settings = insta::Settings::clone_current();
+    settings.add_filter(
+        &regex::escape(source.path().to_string_lossy().as_ref()),
+        "{source_dir}",
+    );
+    let _filter_guard = settings.bind_to_scope();
+    cmd.arg("-d")
+        .arg(source.path())
+        .arg("Unable to start: failed to load the cache: cannot open store at /var/cache");
+
+    assert_cmd_snapshot!(cmd.cmd);
+    Ok(())
+}
