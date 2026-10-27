@@ -39,6 +39,10 @@ impl LogLevel {
     /// such a prefix is really a logger is decided later, across all of the calls in a source
     /// tree, using [`LogLevel::call_family`].
     pub fn from_name(name: &str) -> Option<LogLevel> {
+        // An attribute, like thiserror's `#[error("...")]`, is not a logging call.
+        if name.starts_with('#') {
+            return None;
+        }
         Self::from_known_name(name)
             .or_else(|| Self::from_prefixed_name(name).map(|(level, _)| level))
     }
@@ -335,19 +339,129 @@ impl ArgCounter {
 pub enum MessageCategory {
     /// A logging call, whose level is in `SourceRef::level`.
     Log,
-    /// Some other use of a message, like a call in a family that `prune_log_calls()` decided
-    /// does not look like logging.
+    /// An error or panic message, like `bail!("...")`, `.context("...")`, thiserror's
+    /// `#[error("...")]`, or `.expect("...")`.
+    Error,
+    /// A message that is formatted and then used somewhere else, like `format!("...")`, or
+    /// written by a `Display` impl.
+    Format,
+    /// Some other use of a message, like `println!("...")`, or a call in a family that
+    /// `prune_log_calls()` decided does not look like logging.
     Other,
 }
 
 impl MessageCategory {
     /// The tier that statements in this category are matched in when looking for the source of
     /// a log message, lowest first.  A statement in a later tier is only used when none in an
-    /// earlier tier matches.
+    /// earlier tier matches.  After the log statements, the order is from the most to the least
+    /// likely to be printed as a line on its own, like a `println!()`.
     pub fn match_priority(&self) -> u8 {
         match self {
             MessageCategory::Log => 0,
             MessageCategory::Other => 1,
+            MessageCategory::Error => 2,
+            MessageCategory::Format => 3,
+        }
+    }
+
+    /// The category of a statement that is not in a pruned family.  A call that is known not to
+    /// be logging, like `bail!` or `.context()`, has a category from its name, even if the name
+    /// looks like it has a level, like `Err`.  Otherwise, a statement with a level is `Log`.
+    /// Only Rust is classified by name for now, so the statements in other languages are `Log`.
+    pub(crate) fn classify(src_ref: &SourceRef) -> MessageCategory {
+        if let Some(category) = Self::from_call(src_ref) {
+            return category;
+        }
+        if src_ref.level != LogLevel::Unknown || src_ref.language != SourceLanguage::Rust {
+            return MessageCategory::Log;
+        }
+        match Self::short_call_name(src_ref) {
+            // a level that is not known until runtime, like `log!(lvl, "...")`
+            "log" | "event" => MessageCategory::Log,
+            _ => MessageCategory::Other,
+        }
+    }
+
+    /// The category of a call that is known not to be logging, from its name and the function
+    /// it is in.
+    pub(crate) fn from_call(src_ref: &SourceRef) -> Option<MessageCategory> {
+        if src_ref.language != SourceLanguage::Rust {
+            return None;
+        }
+        let call_name = Self::short_call_name(src_ref);
+        if Self::is_rust_error_call(call_name) {
+            return Some(MessageCategory::Error);
+        }
+        let category = match call_name {
+            "format" | "format_args" => MessageCategory::Format,
+            "print" | "println" | "eprint" | "eprintln" => MessageCategory::Other,
+            "write" | "writeln" => Self::classify_write(&src_ref.qualified_name),
+            _ => return None,
+        };
+        Some(category)
+    }
+
+    /// Check if a Rust call, by the last part of its name, makes an error or panic with the
+    /// message, like `bail!("...")` or `.context("...")`.
+    pub(crate) fn is_rust_error_call(name: &str) -> bool {
+        matches!(
+            name,
+            "bail"
+                | "anyhow"
+                | "ensure"
+                | "eyre"
+                | "context"
+                | "with_context"
+                | "wrap_err"
+                | "wrap_err_with"
+                | "Err"
+                | "ok_or"
+                | "ok_or_else"
+                | "map_err"
+                | "#[error]"
+                | "panic"
+                | "unreachable"
+                | "todo"
+                | "unimplemented"
+                | "assert"
+                | "assert_eq"
+                | "assert_ne"
+                | "debug_assert"
+                | "debug_assert_eq"
+                | "debug_assert_ne"
+                | "expect"
+                | "expect_err"
+        )
+    }
+
+    /// The last part of the name of the call, like `context` for `.context()` or `anyhow` for
+    /// `anyhow::anyhow!`.
+    fn short_call_name(src_ref: &SourceRef) -> &str {
+        let call_name = src_ref.call_name.as_deref().unwrap_or_default();
+        call_name.rsplit(['.', ':']).next().unwrap_or(call_name)
+    }
+
+    /// A `write!` in `<Type as Display>::fmt` is the message of an error type when the type
+    /// is named like one, `Format` in any other `fmt`, and `Other` everywhere else, like a
+    /// write to a file.
+    fn classify_write(qualified_name: &str) -> MessageCategory {
+        let Some(impl_name) = qualified_name.strip_suffix("::fmt") else {
+            return MessageCategory::Other;
+        };
+        // The impl is named like `<Type<T> as fmt::Display>`, after the names of any modules.
+        let Some((before_as, _)) = impl_name.rsplit_once(" as ") else {
+            return MessageCategory::Format;
+        };
+        let start = match before_as.find("::<") {
+            Some(index) => index + 3,
+            None => usize::from(before_as.starts_with('<')),
+        };
+        let ty = before_as[start..].split('<').next().unwrap_or_default();
+        let ty = ty.rsplit("::").next().unwrap_or(ty);
+        if impl_name.ends_with("Display>") && (ty.ends_with("Error") || ty.ends_with("Err")) {
+            MessageCategory::Error
+        } else {
+            MessageCategory::Format
         }
     }
 }
@@ -456,7 +570,7 @@ impl SourceRef {
                 (args, arg_kinds) = result.args.into_iter().unzip();
                 arg_kinds
             };
-            Some(SourceRef {
+            let mut src_ref = SourceRef {
                 source_path: code.filename.clone(),
                 language: code.info.language,
                 line_no,
@@ -483,7 +597,15 @@ impl SourceRef {
                 lazy_matcher: OnceLock::new(),
                 separators: OnceLock::new(),
                 non_empty_matcher: OnceLock::new(),
-            })
+            };
+            // Redone by `prune_log_calls()`, which can change the level.
+            src_ref.category = MessageCategory::classify(&src_ref);
+            if src_ref.category != MessageCategory::Log {
+                // Only log statements have a level, the name of an error call, like `Err`,
+                // does not mean anything.
+                src_ref.level = LogLevel::Unknown;
+            }
+            Some(src_ref)
         } else {
             None
         }

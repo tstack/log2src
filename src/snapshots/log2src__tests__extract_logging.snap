@@ -87,6 +87,31 @@ expression: src_refs
     - "!"
 - sourcePath: in-mem.rs
   language: Rust
+  lineNumber: 26
+  endLineNumber: 26
+  column: 22
+  name: namedarg
+  qualifiedName: namedarg
+  blockId: 427
+  text: "\"Goodbye, {name}!\""
+  level: Unknown
+  category: Format
+  callName: format
+  quality: 9
+  pattern: "(?s)^Goodbye, (.*)!$"
+  args:
+    - Named: name
+  argKinds:
+    - Any
+  vars: []
+  varKinds: []
+  kinds:
+    - Any
+  segments:
+    - "Goodbye, "
+    - "!"
+- sourcePath: in-mem.rs
+  language: Rust
   lineNumber: 27
   endLineNumber: 27
   column: 11
