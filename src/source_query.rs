@@ -283,9 +283,13 @@ impl<'a> SourceQuery<'a> {
                 {
                     // A message that is formatted before it is logged, like `"..." % args`.
                     // Strings are built like this for all sorts of calls, so only keep the
-                    // ones passed to a logging call.
+                    // ones passed to a logging call or an exception.
                     let leading = leading_args.get_or_insert_with(|| self.leading_args(child));
-                    if !Self::has_level(call_name.as_deref(), leading) {
+                    if !Self::has_level(call_name.as_deref(), leading)
+                        && !call_name
+                            .as_deref()
+                            .is_some_and(MessageCategory::is_exception_call)
+                    {
                         break;
                     }
                     match self.python_expr_pattern(child, Self::has_python_format_args(child)) {
@@ -1587,28 +1591,39 @@ impl<'a> SourceQuery<'a> {
     }
 
     /// The name to use for a call whose name is not the name in the source, see
-    /// `rust_call_name()` and `cpp_call_name()`.
+    /// `rust_call_name()` and `exception_call_name()`.
     fn special_call_name(&self, name: Node) -> Option<String> {
         match self.source_language {
             SourceLanguage::Rust => self.rust_call_name(name),
-            SourceLanguage::Cpp => self.cpp_call_name(name),
+            SourceLanguage::Cpp | SourceLanguage::Java | SourceLanguage::Python => {
+                self.exception_call_name(name)
+            }
             _ => None,
         }
     }
 
-    /// The name to use for a C++ call whose message is used for an exception, like
-    /// `throw std::runtime_error("...")`, which is `throw std::runtime_error`, so it is not
-    /// mistaken for a logging call with an error level.
-    fn cpp_call_name(&self, name: Node) -> Option<String> {
-        let call = name
-            .parent()
-            .filter(|call| call.kind() == "call_expression")?;
-        if call.child_by_field_name("function")? != name
-            || call.parent()?.kind() != "throw_statement"
-        {
+    /// The name to use for a call whose message is used for an exception, like
+    /// `throw std::runtime_error("...")` in C++, `throw new IllegalStateException("...")` in
+    /// Java, or `raise ValueError("...")` in Python, which are named `throw std::runtime_error`,
+    /// `throw IllegalStateException`, and `raise ValueError`, so they are not mistaken for a
+    /// logging call with an error level.
+    fn exception_call_name(&self, name: Node) -> Option<String> {
+        let (call_kind, field, statement, keyword) = match self.source_language {
+            SourceLanguage::Cpp => ("call_expression", "function", "throw_statement", "throw"),
+            SourceLanguage::Java => (
+                "object_creation_expression",
+                "type",
+                "throw_statement",
+                "throw",
+            ),
+            SourceLanguage::Python => ("call", "function", "raise_statement", "raise"),
+            _ => return None,
+        };
+        let call = name.parent().filter(|call| call.kind() == call_kind)?;
+        if call.child_by_field_name(field)? != name || call.parent()?.kind() != statement {
             return None;
         }
-        Some(format!("throw {}", &self.source[name.byte_range()]))
+        Some(format!("{keyword} {}", &self.source[name.byte_range()]))
     }
 
     /// The name to use for a Rust call whose name is not the name in the source.  An attribute,
