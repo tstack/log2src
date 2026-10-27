@@ -5441,6 +5441,57 @@ fn load(path: &str) -> Result<()> {
     }
 
     #[test]
+    fn test_find_message_sources_like_match() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.rs"),
+            r#"
+#[derive(thiserror::Error, Debug)]
+enum StepError {
+    #[error("error in {0}")]
+    In(String),
+}
+
+fn run(a: &str, b: &str) {
+    warn!("{}: {}", a, b);
+    warn!("server ready{}", a);
+    info!("server ready");
+}
+"#,
+        );
+        let mut sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        prune_log_calls(sif.statements_for_pruning().collect());
+        let find = |message: &str| -> Vec<(String, Option<usize>)> {
+            find_message_sources(sif.statements(), message)
+                .iter()
+                .map(|source| {
+                    (
+                        source.text.clone(),
+                        source.candidates.first().map(|stmt| stmt.line_no),
+                    )
+                })
+                .collect()
+        };
+        // A wrapper that only adds the separator does not hide the parts of a chain.
+        assert_eq!(
+            find("error in step0: error in step1: error in step2"),
+            vec![
+                ("error in step0".to_string(), Some(4)),
+                ("error in step1".to_string(), Some(4)),
+                ("error in step2".to_string(), Some(4)),
+            ]
+        );
+        // The best statement is the one that matching a log line would choose, which does not
+        // need an empty value.
+        let line = "server ready";
+        let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+        let matched = link_to_source(&log_ref, &sif.log_statements).map(|stmt| stmt.line_no);
+        assert_eq!(matched, Some(11));
+        assert_eq!(find(line), vec![(line.to_string(), matched)]);
+    }
+
+    #[test]
     fn test_categories_python() {
         let code = CodeSource::from_string(
             Path::new("in-mem.py"),

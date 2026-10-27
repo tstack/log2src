@@ -2,9 +2,8 @@
 //! screenshot, or a dialog in a GUI.  A message is often built out of other messages, like the
 //! error in `"Unable to read file: {}"`, so the values of the placeholders are looked up too.
 
-use crate::{MessageCategory, SourceRef, MIN_FALLBACK_QUALITY};
+use crate::{compare_candidates, first_match, MessageCategory, SourceRef, MIN_FALLBACK_QUALITY};
 use serde::Serialize;
-use std::cmp::Reverse;
 
 /// The statements that could have produced some text in a message.
 #[derive(Debug, Serialize)]
@@ -30,7 +29,9 @@ const MIN_VALUE_LEN: usize = 4;
 /// Find the sources of a message in the given statements.  More than one source is returned
 /// when the message is a chain of messages, like `"outer: inner: leaf"` from anyhow's `{:#}`,
 /// and no statement matches all of it.  The reading of the message that explains the most
-/// literal text wins, since a generic wrapper, like `"Error: {}"`, matches anything.
+/// literal text wins, since a generic wrapper, like `"Error: {}"`, matches anything.  Statements
+/// with too little literal text, like `warn!("{}: {}", a, b)`, are not used, even log
+/// statements, since they would be the source of all sorts of messages.
 pub fn find_message_sources<'s>(
     statements: impl IntoIterator<Item = &'s SourceRef>,
     message: &str,
@@ -38,9 +39,7 @@ pub fn find_message_sources<'s>(
     let finder = Finder {
         statements: statements
             .into_iter()
-            .filter(|stmt| {
-                stmt.category == MessageCategory::Log || stmt.quality >= MIN_FALLBACK_QUALITY
-            })
+            .filter(|stmt| stmt.quality >= MIN_FALLBACK_QUALITY)
             .collect(),
     };
     finder.resolve(message.trim(), 0, true).1
@@ -52,9 +51,10 @@ struct Finder<'s> {
 
 impl<'s> Finder<'s> {
     /// The statements that match all of `text`, best first.  The message itself could have come
-    /// from anywhere, so all categories are used, in the order they are used when matching a
-    /// log.  A value of a placeholder is a message that was made somewhere else, so only the
-    /// errors and formatted messages are used for those.
+    /// from anywhere, so all categories are used.  A value of a placeholder is a message that was
+    /// made somewhere else, so only the errors and formatted messages are used for those.  The
+    /// statements are ordered, and the best one is chosen, the same way as when matching a log
+    /// line, so the answer agrees with `LogMatcher::match_log_statement()`.
     fn candidates(&self, text: &str, top: bool) -> Vec<&'s SourceRef> {
         let mut retval: Vec<&SourceRef> = self
             .statements
@@ -68,12 +68,17 @@ impl<'s> Finder<'s> {
             })
             .filter(|stmt| stmt.pattern.is_match(text))
             .collect();
-        retval.sort_by(|lhs, rhs| {
-            (lhs.category.match_priority(), Reverse(lhs.quality))
-                .cmp(&(rhs.category.match_priority(), Reverse(rhs.quality)))
-                .then_with(|| lhs.source_path.cmp(&rhs.source_path))
-                .then_with(|| lhs.line_no.cmp(&rhs.line_no))
-        });
+        retval.sort_by(|lhs, rhs| compare_candidates(lhs, rhs, None, None));
+        let best = first_match(
+            retval.iter().copied().enumerate(),
+            text,
+            None,
+            |candidate: &(usize, &'s SourceRef)| candidate.1,
+        );
+        if let Some((index, _)) = best {
+            let best = retval.remove(index);
+            retval.insert(0, best);
+        }
         retval
     }
 
@@ -87,18 +92,21 @@ impl<'s> Finder<'s> {
             None => (0, vec![]),
         };
         // A chain of messages, like `"outer: inner: leaf"`, where each part was made separately.
+        // A statement that matches all of the text wins a tie, like `"Unable to start: {:#}"`
+        // with the whole chain in its placeholder.
         for (pos, sep) in text.match_indices(": ") {
             let Some((head_score, head)) = self.source(&text[..pos], depth, top) else {
                 continue;
             };
             let tail_text = &text[pos + sep.len()..];
             let (tail_score, mut tail) = self.resolve(tail_text, depth + 1, false);
-            if head_score + tail_score > best.0 {
+            let score = head_score + tail_score;
+            if score > best.0 {
                 if tail.is_empty() {
                     tail.push(MessageSource::unknown(tail_text));
                 }
                 tail.insert(0, head);
-                best = (head_score + tail_score, tail);
+                best = (score, tail);
             }
         }
         best
