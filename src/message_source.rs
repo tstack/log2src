@@ -2,6 +2,7 @@
 //! screenshot, or a dialog in a GUI.  A message is often built out of other messages, like the
 //! error in `"Unable to read file: {}"`, so the values of the placeholders are looked up too.
 
+use crate::source_ref::regex_literal_pieces;
 use crate::{compare_candidates, first_match, MessageCategory, SourceRef, MIN_FALLBACK_QUALITY};
 use serde::Serialize;
 
@@ -60,9 +61,11 @@ pub fn find_message_sources<'s>(
     }
     // Text copied from a GUI is often wrapped differently than the message.
     let collapsed = collapse_whitespace(message);
-    let sources = finder.resolve(&collapsed, 0, true).1;
-    if !sources.is_empty() {
-        return sources;
+    if collapsed != message {
+        let sources = finder.resolve(&collapsed, 0, true).1;
+        if !sources.is_empty() {
+            return sources;
+        }
     }
     // A message with some text in front of it, like `"Error: "` added by a dialog.
     let mut best = (0, vec![]);
@@ -218,8 +221,13 @@ fn shared_literal_len(stmt: &SourceRef, text: &str) -> usize {
     let non_ws = |s: &str| s.chars().filter(|c| !c.is_whitespace()).count();
     let mut contained = 0;
     let mut overlap = 0;
-    for segment in &stmt.segments {
-        let segment = collapse_whitespace(segment);
+    // The segments are regexes, so they are turned back into the literal text.
+    for segment in stmt
+        .segments
+        .iter()
+        .flat_map(|segment| regex_literal_pieces(segment))
+    {
+        let segment = collapse_whitespace(&segment);
         if segment.is_empty() {
             continue;
         }

@@ -5449,6 +5449,7 @@ fn load(path: &str) -> Result<()> {
     let store = Store::open(path).context("failed to load the cache")?;
     bail!("cannot open the settings file at {}", path);
     warn!("Unable to read file: {}", err);
+    bail!("cannot open config.toml (read-only) at {}", path);
 }
 "#,
         );
@@ -5495,6 +5496,15 @@ fn load(path: &str) -> Result<()> {
         assert_eq!(
             find("to read file: permission den"),
             vec![("to read file: permission den".to_string(), Some(5), true)]
+        );
+        // Text with characters that are special in a regex.
+        assert_eq!(
+            find("open config.toml (read-only)"),
+            vec![("open config.toml (read-only)".to_string(), Some(6), true)]
+        );
+        assert_eq!(
+            find("config.toml (read-only) at"),
+            vec![("config.toml (read-only) at".to_string(), Some(6), true)]
         );
         // Too little in common.
         assert_eq!(find("the cache"), vec![]);
