@@ -360,7 +360,10 @@ impl<'a> SourceQuery<'a> {
                             // remember the name of the logging call so the log level can be
                             // derived from it.
                             let range = capture.node.byte_range();
-                            call_name = Some(self.source[range].to_string());
+                            call_name = Some(
+                                self.rust_call_name(capture.node)
+                                    .unwrap_or_else(|| self.source[range].to_string()),
+                            );
                             continue;
                         }
                     }
@@ -1553,6 +1556,46 @@ impl<'a> SourceQuery<'a> {
             curr = next;
         }
         Some(self.normalized_text(curr))
+    }
+
+    /// The name to use for a Rust call whose name is not the name in the source.  An attribute,
+    /// like thiserror's `#[error("...")]`, is named `#[error]` so it is not mistaken for the
+    /// `error!` macro.  A `format!` that is the first argument of a call, like
+    /// `.context(format!("..."))` or `.with_context(|| format!("..."))`, is named after the call
+    /// that consumes the message.
+    fn rust_call_name(&self, name: Node) -> Option<String> {
+        if self.source_language != SourceLanguage::Rust {
+            return None;
+        }
+        let text = &self.source[name.byte_range()];
+        let parent = name.parent()?;
+        if parent.kind() == "attribute" {
+            return Some(format!("#[{text}]"));
+        }
+        if text != "format" || parent.kind() != "macro_invocation" {
+            return None;
+        }
+        let mut node = parent;
+        let mut outer = node.parent()?;
+        if outer.kind() == "block" && outer.parent()?.kind() == "closure_expression" {
+            node = outer;
+            outer = node.parent()?;
+        }
+        if outer.kind() == "closure_expression" {
+            node = outer;
+            outer = node.parent()?;
+        }
+        if outer.kind() != "arguments" || outer.named_child(0)? != node {
+            return None;
+        }
+        let function = outer.parent()?.child_by_field_name("function")?;
+        let consumer = match function.kind() {
+            "field_expression" => function.child_by_field_name("field")?,
+            "scoped_identifier" => function.child_by_field_name("name")?,
+            "identifier" => function,
+            _ => return None,
+        };
+        Some(self.source[consumer.byte_range()].to_string())
     }
 
     /// Combine the string literals passed to `concat!`, like `("a ", "{}")`, into the contents

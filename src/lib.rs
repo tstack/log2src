@@ -153,7 +153,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "32")]
+    #[serde(rename = "33")]
     Current,
 }
 
@@ -296,7 +296,8 @@ pub struct LogCall {
 ///
 /// The statements are paired with whether their level came from an argument.  Pruning can be
 /// done again, like after a file changes, since a statement whose call name has a level is
-/// only `Unknown` if it was pruned before, so its level is restored first.
+/// only `Unknown` if it was pruned before, so its level is restored first.  The calls that are
+/// known not to be logging, see [`MessageCategory::from_call`], are skipped.
 fn prune_log_calls(mut stmts: Vec<(&mut SourceRef, bool)>) -> BTreeMap<String, LogCall> {
     // The level from the name of each call, which only needs to be computed once per name.
     let mut name_levels: HashMap<String, Option<LogLevel>> = HashMap::new();
@@ -305,6 +306,10 @@ fn prune_log_calls(mut stmts: Vec<(&mut SourceRef, bool)>) -> BTreeMap<String, L
         let Some(call_name) = stmt.call_name.as_deref() else {
             continue;
         };
+        if MessageCategory::from_call(stmt).is_some() {
+            // A call that is known not to be logging, like `Err(...)`, is never counted.
+            continue;
+        }
         if stmt.level == LogLevel::Unknown && !*from_arg {
             let name_level = match name_levels.get(call_name) {
                 Some(level) => *level,
@@ -370,6 +375,8 @@ fn prune_log_calls(mut stmts: Vec<(&mut SourceRef, bool)>) -> BTreeMap<String, L
         if pruned {
             stmt.level = LogLevel::Unknown;
             stmt.category = MessageCategory::Other;
+        } else {
+            stmt.category = MessageCategory::classify(stmt);
         }
     }
     log_calls
@@ -525,7 +532,9 @@ impl SourceTree {
 /// line coming from a different statement.  The exception is when the statement is closer to
 /// the line number in the log message, which is better evidence than the values.  The
 /// candidates are ordered by [`MessageCategory::match_priority`] first, and a later tier is only
-/// searched when nothing in an earlier tier matched, even with an empty value.
+/// searched when nothing in an earlier tier matched, even with an empty value.  Statements that
+/// are not `Log` need [`MIN_FALLBACK_QUALITY`], since there are a lot of them, like
+/// `format!("{}/{}", dir, name)`, and they would match lines that are not from this source.
 fn first_match<'a, T>(
     candidates: impl IntoIterator<Item = T>,
     body: &str,
@@ -539,6 +548,9 @@ fn first_match<'a, T>(
             src_ref(prior).category.match_priority() < stmt.category.match_priority()
         }) {
             break;
+        }
+        if stmt.category != MessageCategory::Log && stmt.quality < MIN_FALLBACK_QUALITY {
+            continue;
         }
         if !stmt.pattern.is_match(body) {
             continue;
@@ -557,6 +569,10 @@ fn first_match<'a, T>(
     }
     with_empty_value
 }
+
+/// The least amount of literal text, not counting whitespace, for a statement that is not `Log` to
+/// be matched to a log message.
+const MIN_FALLBACK_QUALITY: usize = 5;
 
 /// How far a statement is from the line number in a log message, or zero if there is none.
 fn line_distance(src_ref: &SourceRef, lineno: Option<usize>) -> usize {
@@ -1396,8 +1412,9 @@ impl SourceLanguage {
                         (token_tree .
                             (string_literal) @log
                         )
-                        ; standard macros that build strings or read files at compile time
-                        (#not-match? @macro-name "(^|::)(format|vec|env|option_env|include|include_str|include_bytes|concat|stringify|compile_error)$")
+                        ; standard macros that build strings or read files at compile time, but
+                        ; not `format!`, whose messages end up in errors and output
+                        (#not-match? @macro-name "(^|::)(vec|env|option_env|include|include_str|include_bytes|concat|stringify|compile_error)$")
                     )
                     ; a format string built with `concat!`, like `info!(concat!("a ", "{}"), x)`
                     (macro_invocation macro: (_) @macro-name
@@ -1405,7 +1422,7 @@ impl SourceLanguage {
                             (identifier) @_concat . "!" . (token_tree) @log
                         )
                         (#eq? @_concat "concat")
-                        (#not-match? @macro-name "(^|::)(format|vec|env|option_env|include|include_str|include_bytes|concat|stringify|compile_error)$")
+                        (#not-match? @macro-name "(^|::)(vec|env|option_env|include|include_str|include_bytes|concat|stringify|compile_error)$")
                     )
                     ; macros that take the level before the format string, like
                     ; `log!(Level::Warn, "...")` or `tracing::event!(Level::INFO, "...")`
@@ -1427,6 +1444,22 @@ impl SourceLanguage {
                             (identifier) . (identifier) . (identifier) . (string_literal) @log
                         )
                         (#match? @macro-name "(^|::)(log|event)$")
+                    )
+                    ; a message written by a `Display` or `Debug` impl, like `write!(f, "...")`
+                    (macro_invocation macro: (_) @macro-name
+                        (token_tree . (identifier) . (string_literal) @log)
+                        (#match? @macro-name "^(write|writeln)$")
+                    )
+                    ; error and panic messages passed to a method, like `.context("...")`
+                    (call_expression
+                        function: (field_expression field: (field_identifier) @macro-name)
+                        arguments: (arguments . (string_literal) @log)
+                        (#match? @macro-name "^(context|with_context|wrap_err|wrap_err_with|expect|expect_err|ok_or)$")
+                    )
+                    ; thiserror's `#[error("...")]`
+                    (attribute (identifier) @macro-name
+                        arguments: (token_tree . (string_literal) @log)
+                        (#eq? @macro-name "error")
                     )
                 "#
             }
@@ -2158,7 +2191,7 @@ fn namedarg2(salutation: &str, name: &str) {
             .pop()
             .unwrap()
             .log_statements;
-        assert_eq!(src_refs.len(), 5);
+        assert_eq!(src_refs.len(), 6);
         let result = link_to_source(&log_ref, &src_refs);
         assert!(ptr::eq(result.unwrap(), &src_refs[0]));
     }
@@ -2225,7 +2258,7 @@ fn main() {
             .pop()
             .unwrap()
             .log_statements;
-        assert_eq!(src_refs.len(), 5);
+        assert_eq!(src_refs.len(), 6);
         let result = link_to_source(&log_ref, &src_refs);
         assert!(result.is_none());
     }
@@ -2238,7 +2271,7 @@ fn main() {
             .pop()
             .unwrap()
             .log_statements;
-        assert_eq!(src_refs.len(), 5);
+        assert_eq!(src_refs.len(), 6);
         let vars = extract_variables(&log_ref, &src_refs[1]);
         assert_eq!(
             vars,
@@ -2265,8 +2298,8 @@ fn main() {
             .pop()
             .unwrap()
             .log_statements;
-        assert_eq!(src_refs.len(), 5);
-        let vars = extract_variables(&log_ref, &src_refs[3]);
+        assert_eq!(src_refs.len(), 6);
+        let vars = extract_variables(&log_ref, &src_refs[4]);
         assert_eq!(
             vars,
             vec![VariablePair {
@@ -5164,6 +5197,120 @@ void dissect(void) {
                 ("\"ws wrapped message\"", LogLevel::Warn, Log),
             ]
         );
+    }
+
+    #[test]
+    fn test_categories_rust() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.rs"),
+            r#"
+#[derive(thiserror::Error, Debug)]
+enum ConfigError {
+    #[error("cannot read config {0}")]
+    Read(String),
+}
+
+struct ParseError;
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "parse failed at {}", self.0)
+    }
+}
+
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "point ({}, {})", self.x, self.y)
+    }
+}
+
+mod wire {
+    impl<T> fmt::Display for super::FrameErr<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "bad frame {}", self.0)
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    info!("starting up");
+    log!(lvl, "level variable message");
+    println!("plain output {}", 1);
+    writeln!(out, "written output {}", 2)?;
+    let path = format!("dir {}", 3);
+    let f = File::open(&path).context("failed to open file")?;
+    let g = File::open(&path).with_context(|| format!("failed to open {}", path))?;
+    let h = File::open(&path).map_err(|e| format!("cannot open {}: {}", path, e))?;
+    let v = parse(&path).expect("parse must succeed");
+    if v.is_empty() {
+        bail!("no values in {}", path);
+    }
+    if v.len() > 10 {
+        return Err(format!("too many values in {}", path));
+    }
+    panic!("unreachable state {}", 4);
+    custom_macro!("custom message {}", 5);
+}
+"#,
+        );
+        let mut sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        prune_log_calls(sif.statements_for_pruning().collect());
+        let found: Vec<(&str, Option<&str>, MessageCategory)> = sif
+            .statements()
+            .map(|stmt| (stmt.text.as_str(), stmt.call_name.as_deref(), stmt.category))
+            .collect();
+        use MessageCategory::*;
+        assert_eq!(
+            found,
+            vec![
+                // An attribute is not mistaken for the `error!` macro.
+                ("\"cannot read config {0}\"", Some("#[error]"), Error),
+                // A `Display` impl for an error type is an error message.
+                ("\"parse failed at {}\"", Some("write"), Error),
+                ("\"point ({}, {})\"", Some("write"), Format),
+                ("\"bad frame {}\"", Some("write"), Error),
+                ("\"starting up\"", Some("info"), Log),
+                ("\"level variable message\"", Some("log"), Log),
+                ("\"plain output {}\"", Some("println"), Output),
+                ("\"written output {}\"", Some("writeln"), Output),
+                ("\"dir {}\"", Some("format"), Format),
+                ("\"failed to open file\"", Some("context"), Error),
+                // A `format!` is named after the call that consumes the message.
+                ("\"failed to open {}\"", Some("with_context"), Error),
+                ("\"cannot open {}: {}\"", Some("map_err"), Error),
+                ("\"parse must succeed\"", Some("expect"), Panic),
+                ("\"no values in {}\"", Some("bail"), Error),
+                ("\"too many values in {}\"", Some("Err"), Error),
+                ("\"unreachable state {}\"", Some("panic"), Panic),
+                ("\"custom message {}\"", Some("custom_macro"), Other),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fallback_quality() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.rs"),
+            r#"
+fn main() {
+    let a = format!("{}/{}", dir, name);
+    let b = format!("ready: {}", name);
+}
+"#,
+        );
+        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap()
+            .log_statements;
+        let best = |line: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+            link_to_source(&log_ref, &src_refs).map(|src_ref| src_ref.line_no)
+        };
+        // Too little literal text to match a log message unless it is a log statement.
+        assert_eq!(best("usr/bin"), None);
+        assert_eq!(best("ready: now"), Some(4));
     }
 
     #[test]
