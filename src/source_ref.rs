@@ -951,6 +951,35 @@ fn push_regex_literal(out: &mut String, c: char) {
     }
 }
 
+/// The literal text matched by a regex built by `push_regex_literal()`, like a segment of a
+/// matcher.  An unescaped `.`, which `literal_to_regex()` uses for a character that it could not
+/// decode, matches anything, so the text is split there and the pieces are returned.
+pub(crate) fn regex_literal_pieces(regex: &str) -> Vec<String> {
+    let mut pieces = vec![];
+    let mut piece = String::new();
+    let mut chars = regex.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('n') => piece.push('\n'),
+                Some('r') => piece.push('\r'),
+                Some('t') => piece.push('\t'),
+                Some('x') => {
+                    let hex: String = chars.by_ref().take(2).collect();
+                    piece.extend(u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32));
+                }
+                Some(c) => piece.push(c),
+                None => {}
+            },
+            '.' => pieces.push(std::mem::take(&mut piece)),
+            c => piece.push(c),
+        }
+    }
+    pieces.push(piece);
+    pieces.retain(|piece| !piece.is_empty());
+    pieces
+}
+
 /// Consume up to `max` hex digits and return their value, if there were any.
 fn take_hex(chars: &mut Chars, max: usize) -> Option<u32> {
     let mut value: u32 = 0;
@@ -1104,6 +1133,20 @@ fn literal_to_regex(raw: bool, language: SourceLanguage, segment: &str) -> Strin
 
 #[cfg(test)]
 mod tests {
+    use super::{push_regex_literal, regex_literal_pieces};
+
+    #[test]
+    fn test_regex_literal_pieces() {
+        let text = "a.b (c) [d] {e} $f^ g|h *+? \\ \n\t\x01 end";
+        let mut regex = String::new();
+        for c in text.chars() {
+            push_regex_literal(&mut regex, c);
+        }
+        assert_eq!(regex_literal_pieces(&regex), vec![text.to_string()]);
+        // An unescaped `.` is a character that could not be decoded.
+        assert_eq!(regex_literal_pieces(r"abc.def\.g"), vec!["abc", "def.g"]);
+    }
+
     use super::*;
 
     #[test]

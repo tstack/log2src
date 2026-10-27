@@ -54,6 +54,8 @@ log2src locate -d ~/src/app 'C:\build\App\Program.cs'
 # Find the statements that could have produced a message, like one copied from a log, a
 # screenshot, or a dialog, and the statements that produced the values in it, like an error
 log2src find -d ~/src/app 'Unable to start: failed to load the cache: Permission denied'
+# A fragment of a message, like one partly copied from a dialog, works too
+log2src find -d ~/src/app 'load the cache'
 
 # Manage the cache of log statements
 log2src cache path

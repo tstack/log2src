@@ -2,6 +2,7 @@
 //! screenshot, or a dialog in a GUI.  A message is often built out of other messages, like the
 //! error in `"Unable to read file: {}"`, so the values of the placeholders are looked up too.
 
+use crate::source_ref::regex_literal_pieces;
 use crate::{compare_candidates, first_match, MessageCategory, SourceRef, MIN_FALLBACK_QUALITY};
 use serde::Serialize;
 
@@ -17,6 +18,10 @@ pub struct MessageSource<'s> {
     /// `"Unable to read file: {}"`.  Values that are too short to look up are left out.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub causes: Vec<MessageSource<'s>>,
+    /// The candidates only share some literal text with the text, since none match all of it,
+    /// like for a fragment of a message that was copied from a GUI.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 /// How deep to look up the values of placeholders, which also stops runaway recursion for a
@@ -25,6 +30,13 @@ const MAX_DEPTH: usize = 6;
 
 /// Values shorter than this are not looked up, since they would match all sorts of statements.
 const MIN_VALUE_LEN: usize = 4;
+
+/// The least amount of literal text, not counting whitespace, that a statement has to share with
+/// a fragment of a message.
+const MIN_FRAGMENT_LEN: usize = 10;
+
+/// The most candidates to return for a fragment, since a lot of statements can share a few words.
+const MAX_FRAGMENT_CANDIDATES: usize = 10;
 
 /// Find the sources of a message in the given statements.  More than one source is returned
 /// when the message is a chain of messages, like `"outer: inner: leaf"` from anyhow's `{:#}`,
@@ -42,7 +54,32 @@ pub fn find_message_sources<'s>(
             .filter(|stmt| stmt.quality >= MIN_FALLBACK_QUALITY)
             .collect(),
     };
-    finder.resolve(message.trim(), 0, true).1
+    let message = message.trim();
+    let sources = finder.resolve(message, 0, true).1;
+    if !sources.is_empty() {
+        return sources;
+    }
+    // Text copied from a GUI is often wrapped differently than the message.
+    let collapsed = collapse_whitespace(message);
+    if collapsed != message {
+        let sources = finder.resolve(&collapsed, 0, true).1;
+        if !sources.is_empty() {
+            return sources;
+        }
+    }
+    // A message with some text in front of it, like `"Error: "` added by a dialog.
+    let mut best = (0, vec![]);
+    for (pos, sep) in collapsed.match_indices(": ") {
+        let (score, mut sources) = finder.resolve(&collapsed[pos + sep.len()..], 0, true);
+        if score > best.0 {
+            sources.insert(0, MessageSource::unknown(&collapsed[..pos]));
+            best = (score, sources);
+        }
+    }
+    if !best.1.is_empty() {
+        return best.1;
+    }
+    finder.fragment(&collapsed).into_iter().collect()
 }
 
 struct Finder<'s> {
@@ -137,9 +174,88 @@ impl<'s> Finder<'s> {
             text: text.to_string(),
             candidates,
             causes,
+            partial: false,
         };
         Some((score, source))
     }
+
+    /// The statements that share the most literal text with `text`, which is not all of a
+    /// message, like a fragment of one or one with extra text around it.  The whitespace in
+    /// `text` should already be collapsed.
+    fn fragment(&self, text: &str) -> Option<MessageSource<'s>> {
+        let mut scored: Vec<(usize, &'s SourceRef)> = self
+            .statements
+            .iter()
+            .map(|stmt| (shared_literal_len(stmt, text), *stmt))
+            .filter(|(score, _)| *score >= MIN_FRAGMENT_LEN)
+            .collect();
+        scored.sort_by(|(lhs_score, lhs), (rhs_score, rhs)| {
+            rhs_score
+                .cmp(lhs_score)
+                .then_with(|| compare_candidates(lhs, rhs, None, None))
+        });
+        scored.truncate(MAX_FRAGMENT_CANDIDATES);
+        if scored.is_empty() {
+            return None;
+        }
+        Some(MessageSource {
+            text: text.to_string(),
+            candidates: scored.into_iter().map(|(_, stmt)| stmt).collect(),
+            causes: vec![],
+            partial: true,
+        })
+    }
+}
+
+/// Replace each run of whitespace with a single space and trim the ends.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The amount of literal text, not counting whitespace, that a statement shares with `text`.
+/// The literal parts of the statement that are in the text count, like `"Unable to read "` in
+/// `"Unable to read file"`.  When the text is only part of the message, the text can also be
+/// in a literal part, or overlap the start or end of one, like `"read file: denied"` for
+/// `"Unable to read file: {}"`.
+fn shared_literal_len(stmt: &SourceRef, text: &str) -> usize {
+    let non_ws = |s: &str| s.chars().filter(|c| !c.is_whitespace()).count();
+    let mut contained = 0;
+    let mut overlap = 0;
+    // The segments are regexes, so they are turned back into the literal text.
+    for segment in stmt
+        .segments
+        .iter()
+        .flat_map(|segment| regex_literal_pieces(segment))
+    {
+        let segment = collapse_whitespace(&segment);
+        if segment.is_empty() {
+            continue;
+        }
+        if text.contains(&segment) {
+            contained += non_ws(&segment);
+        } else if segment.contains(text) {
+            overlap = overlap.max(non_ws(text));
+        } else {
+            overlap = overlap.max(non_ws(edge_overlap(&segment, text)));
+        }
+    }
+    contained.max(overlap)
+}
+
+/// The longest piece of `text` that is at the end of `segment` and the start of `text`, or the
+/// start of `segment` and the end of `text`.
+fn edge_overlap<'t>(segment: &str, text: &'t str) -> &'t str {
+    let mut best = "";
+    for (pos, _) in text.char_indices().skip(1) {
+        let (head, tail) = text.split_at(pos);
+        if head.len() > best.len() && segment.ends_with(head) {
+            best = head;
+        }
+        if tail.len() > best.len() && segment.starts_with(tail) {
+            best = tail;
+        }
+    }
+    best
 }
 
 impl MessageSource<'_> {
@@ -149,6 +265,7 @@ impl MessageSource<'_> {
             text: text.to_string(),
             candidates: vec![],
             causes: vec![],
+            partial: false,
         }
     }
 }
