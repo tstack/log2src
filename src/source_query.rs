@@ -186,6 +186,8 @@ impl<'a> SourceQuery<'a> {
                 // The node whose following siblings are the arguments for the placeholders.
                 let mut args_anchor = None;
                 let mut printf = false;
+                // The name of the call that formats a wrapped message, like `fmt::format`.
+                let mut format_call = None;
                 if let Some(lambda) = outer.parent().filter(|p| p.kind() == "lambda_expression") {
                     // A Java supplier, like `log.fine(() -> "...")`.
                     outer = lambda;
@@ -198,6 +200,12 @@ impl<'a> SourceQuery<'a> {
                     // Only the first message of a call is used, like other captures.
                     if self.follows_message(outer, |_| true) {
                         break;
+                    }
+                    if wrapped.args_anchor != child {
+                        // Not a translation, which only passes the message through.
+                        format_call = child
+                            .child_by_field_name("function")
+                            .map(|function| self.source[function.byte_range()].to_string());
                     }
                     child = wrapped.literal;
                     args_anchor = Some(wrapped.args_anchor);
@@ -217,10 +225,19 @@ impl<'a> SourceQuery<'a> {
                     && (outer != capture.node || child != capture.node)
                 {
                     // Strings and calls are wrapped like this for all sorts of reasons, so
-                    // only keep the ones passed to a logging call.
+                    // only keep the ones passed to a logging call or an error, like a C++
+                    // `throw`.  A message that is formatted for some other call, like
+                    // `report(fmt::format("..."))`, is kept as a message of the format call.
                     let leading = leading_args.get_or_insert_with(|| self.leading_args(outer));
-                    if !Self::has_level(call_name.as_deref(), leading) {
-                        break;
+                    if !Self::has_level(call_name.as_deref(), leading)
+                        && !call_name
+                            .as_deref()
+                            .is_some_and(MessageCategory::is_c_error_call)
+                    {
+                        match format_call.take() {
+                            Some(name) => call_name = Some(name),
+                            None => break,
+                        }
                     }
                 }
                 if query.capture_names()[capture.index as usize] == "message-ref" {
@@ -242,9 +259,11 @@ impl<'a> SourceQuery<'a> {
                 }
                 if self.source_language == SourceLanguage::Cpp && kind == "raw_string_literal" {
                     // Raw strings are used for all sorts of things, like JSON and usage text,
-                    // so only keep the ones passed to a logging call.
+                    // so only keep the ones passed to a logging call or used for a message.
                     let leading = leading_args.get_or_insert_with(|| self.leading_args(outer));
-                    if !Self::has_level(call_name.as_deref(), leading) {
+                    if !Self::has_level(call_name.as_deref(), leading)
+                        && !Self::is_c_message_call(call_name.as_deref())
+                    {
                         break;
                     }
                     // The contents of a raw string, like `R"(...)"`, are used as-is.
@@ -312,9 +331,11 @@ impl<'a> SourceQuery<'a> {
                                 call_name.as_deref(),
                                 leading_args.get_or_insert_with(|| self.leading_args(outer)),
                             )
+                            && !Self::is_c_message_call(call_name.as_deref())
                         {
                             // C++ strings are concatenated for all sorts of calls, like paths
-                            // and option names, so only keep the ones passed to a logging call.
+                            // and option names, so only keep the ones passed to a logging call
+                            // or used for a message.
                             break;
                         }
                         if child.kind() == "binary_expression" {
@@ -361,7 +382,7 @@ impl<'a> SourceQuery<'a> {
                             // derived from it.
                             let range = capture.node.byte_range();
                             call_name = Some(
-                                self.rust_call_name(capture.node)
+                                self.special_call_name(capture.node)
                                     .unwrap_or_else(|| self.source[range].to_string()),
                             );
                             continue;
@@ -1262,6 +1283,12 @@ impl<'a> SourceQuery<'a> {
             || call_name.and_then(LogLevel::from_name).is_some()
     }
 
+    /// Check if a C or C++ call is known to use its argument as a message, like a `throw` or
+    /// `snprintf()`, although it is not logging.
+    fn is_c_message_call(call_name: Option<&str>) -> bool {
+        call_name.is_some_and(|name| MessageCategory::from_c_call(name).is_some())
+    }
+
     fn in_function_body(node: Node) -> bool {
         let mut curr = node.parent();
         while let Some(parent) = curr {
@@ -1558,6 +1585,31 @@ impl<'a> SourceQuery<'a> {
         Some(self.normalized_text(curr))
     }
 
+    /// The name to use for a call whose name is not the name in the source, see
+    /// `rust_call_name()` and `cpp_call_name()`.
+    fn special_call_name(&self, name: Node) -> Option<String> {
+        match self.source_language {
+            SourceLanguage::Rust => self.rust_call_name(name),
+            SourceLanguage::Cpp => self.cpp_call_name(name),
+            _ => None,
+        }
+    }
+
+    /// The name to use for a C++ call whose message is used for an exception, like
+    /// `throw std::runtime_error("...")`, which is `throw std::runtime_error`, so it is not
+    /// mistaken for a logging call with an error level.
+    fn cpp_call_name(&self, name: Node) -> Option<String> {
+        let call = name
+            .parent()
+            .filter(|call| call.kind() == "call_expression")?;
+        if call.child_by_field_name("function")? != name
+            || call.parent()?.kind() != "throw_statement"
+        {
+            return None;
+        }
+        Some(format!("throw {}", &self.source[name.byte_range()]))
+    }
+
     /// The name to use for a Rust call whose name is not the name in the source.  An attribute,
     /// like thiserror's `#[error("...")]`, is named `#[error]` so it is not mistaken for the
     /// `error!` macro.  A `format!` that is the first argument of an error call, like
@@ -1565,9 +1617,6 @@ impl<'a> SourceQuery<'a> {
     /// that consumes the message.  Any other `format!`, like the one in
     /// `names.push(format!("..."))`, keeps its name, since the message is only formatted.
     fn rust_call_name(&self, name: Node) -> Option<String> {
-        if self.source_language != SourceLanguage::Rust {
-            return None;
-        }
         let text = &self.source[name.byte_range()];
         let parent = name.parent()?;
         if parent.kind() == "attribute" {
