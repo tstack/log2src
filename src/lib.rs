@@ -155,7 +155,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "35")]
+    #[serde(rename = "36")]
     Current,
 }
 
@@ -3136,7 +3136,7 @@ class Same {
             .pop()
             .unwrap()
             .log_statements;
-        assert_eq!(src_refs.len(), 2);
+        assert_eq!(src_refs.len(), 3);
         assert_eq!(
             src_refs[0].pattern().as_str(),
             "(?s)^Opening href with external editor: (.*):(.*):(.*)$"
@@ -3145,6 +3145,110 @@ class Same {
         assert_eq!(src_refs[0].vars, vec!["path", "line", "0"]);
         assert_eq!(src_refs[1].pattern().as_str(), "(?s)^read (.*) bytes$");
         assert_eq!(src_refs[1].vars, vec!["size"]);
+        // A macro whose value is unknown matches anything.
+        assert_eq!(src_refs[2].pattern().as_str(), "(?s)^unknown (.*) text$");
+        assert_eq!(src_refs[2].arg_exprs(), vec!["SOME_MACRO"]);
+    }
+
+    #[test]
+    fn test_c_family_macro_calls_in_concatenation() {
+        // Macros that wrap a string-literal, like lnav's ANSI_BOLD("..."), cannot be parsed
+        // when they are concatenated with other string-literals.
+        let source = r#"
+#include "ansi.h"
+TEST_CASE("first")
+TEST_CASE("second")
+
+void report(char *buf, int count, long secs, long msecs) {
+    snprintf(buf, 128,
+             ANSI_BOLD("%'d") " row%s matched in " ANSI_BOLD(
+                 "%ld.%03ld") " seconds",
+             count, count == 1 ? "" : "s", secs, msecs);
+    log_info("Press " ANSI_BOLD("TAB") " to focus " ANSI_UNDERLINE("%s"), name);
+    log_info(ANSI_BOLD_START "%d" ANSI_NORM " files", count);
+    log_info("not rewritten " TWO_ARGS("a", "b"));
+    log_info(_("translated %d"), count);
+    // log_info("commented " ANSI_BOLD("%d"));
+    log_info("See " ANSI_BOLD("https://example.com/" "docs.html") " for more");
+    log_info("trailing " ANSI_BOLD("abc/" "def"));
+    log_info("got %" G_GINT64_FORMAT " items, %-4" G_GSIZE_FORMAT " bytes", n, size);
+}
+"#;
+        for name in ["in-mem.cc", "in-mem.c"] {
+            let code = CodeSource::from_string(&PathBuf::from(name), source);
+            let src_refs = extract_logging(&[code], &ProgressTracker::new())
+                .pop()
+                .unwrap()
+                .log_statements;
+            let found: Vec<(&str, usize, Vec<&str>)> = src_refs
+                .iter()
+                .map(|s| (s.pattern().as_str(), s.line_no, s.arg_exprs()))
+                .collect();
+            assert_eq!(
+                found,
+                vec![
+                    (
+                        r"(?s)^(.*)(.*)(.*) row(.*) matched in (.*)(.*)\.(.*)(.*) seconds$",
+                        8,
+                        vec![
+                            "ANSI_BOLD",
+                            "count",
+                            "ANSI_BOLD",
+                            r#"count == 1 ? "" : "s""#,
+                            "ANSI_BOLD",
+                            "secs",
+                            "msecs",
+                            "ANSI_BOLD"
+                        ]
+                    ),
+                    (
+                        "(?s)^Press (.*)TAB(.*) to focus (.*)(.*)(.*)$",
+                        11,
+                        vec![
+                            "ANSI_BOLD",
+                            "ANSI_BOLD",
+                            "ANSI_UNDERLINE",
+                            "name",
+                            "ANSI_UNDERLINE"
+                        ]
+                    ),
+                    (
+                        "(?s)^(.*)(.*)(.*) files$",
+                        12,
+                        vec!["ANSI_BOLD_START", "count", "ANSI_NORM"]
+                    ),
+                    ("(?s)^translated (.*)$", 14, vec!["count"]),
+                    (
+                        r"(?s)^See (.*)https://example\.com/docs\.html(.*) for more$",
+                        16,
+                        vec!["ANSI_BOLD", "ANSI_BOLD"]
+                    ),
+                    (
+                        "(?s)^trailing (.*)abc/def(.*)$",
+                        17,
+                        vec!["ANSI_BOLD", "ANSI_BOLD"]
+                    ),
+                    ("(?s)^got (.*) items, (.*) bytes$", 18, vec!["n", "size"]),
+                ],
+                "{name}"
+            );
+            assert_eq!(
+                src_refs[1].text, r#""Press " ANSI_BOLD("TAB") " to focus " ANSI_UNDERLINE("%s")"#,
+                "{name}"
+            );
+            assert_eq!(
+                src_refs[4].text,
+                r#""See " ANSI_BOLD("https://example.com/" "docs.html") " for more""#,
+                "{name}"
+            );
+            assert_eq!(
+                src_refs[5].text, r#""trailing " ANSI_BOLD("abc/" "def")"#,
+                "{name}"
+            );
+            let line = "1,234 rows matched in 0.010 seconds";
+            let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+            assert!(src_refs[0].pattern().is_match(log_ref.body()), "{name}");
+        }
     }
 
     #[test]

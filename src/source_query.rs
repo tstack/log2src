@@ -67,10 +67,24 @@ impl<'a> SourceQuery<'a> {
             .unwrap_or_else(|_| panic!("Error loading {:?} grammar", language));
         let source = code.buffer.as_str();
         let mut tree = parser.parse(source, None).expect("source is parsable");
+        // The text that `tree` was parsed from, which has the same byte offsets as `source`.
+        let mut parsed: Cow<str> = Cow::Borrowed(source);
+        if code.info.language.is_c_family() && tree.root_node().has_error() {
+            if let Some(rewritten) = Self::rewrite_literal_macro_calls(source) {
+                let rewritten_tree = parser.parse(&rewritten, None).expect("source is parsable");
+                // A call next to a string-literal is never valid, so the rewrite is kept
+                // unless it made things worse.  Some errors remain, like the ones for
+                // `"x " ANSI_BOLD "%d"`, but those are handled by `concatenated_pattern()`.
+                if Self::error_count(&rewritten_tree) <= Self::error_count(&tree) {
+                    tree = rewritten_tree;
+                    parsed = Cow::Owned(rewritten);
+                }
+            }
+        }
         if code.info.language.is_c_family() && tree.root_node().has_error() {
             // Masking the conditionals can also break code that parses fine as-is, like
             // alternate function signatures in each branch, so it is only a fallback.
-            if let Some(masked_source) = Self::mask_preproc_conditionals(source, &tree) {
+            if let Some(masked_source) = Self::mask_preproc_conditionals(&parsed, &tree) {
                 let masked = parser
                     .parse(masked_source, None)
                     .expect("source is parsable");
@@ -137,6 +151,152 @@ impl<'a> SourceQuery<'a> {
                 .collect::<String>()
         });
         masked_any.then(|| retval.into_owned())
+    }
+
+    /// Replace the parentheses of macro calls that wrap a string-literal and are concatenated
+    /// with other string-literals, like `ANSI_BOLD("%d") " rows"`, with spaces.  The grammar
+    /// cannot parse these since it does not know the macro expands to a string, but it can
+    /// parse `ANSI_BOLD "%d"  " rows"`, which keeps the same byte offsets.  Calls in comments
+    /// and literals are left alone.  The tree is not used to find those since its error
+    /// recovery for these calls can turn code into a string-literal.  Returns None if there was
+    /// nothing to rewrite.
+    fn rewrite_literal_macro_calls(source: &str) -> Option<String> {
+        static CALL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r#"\b[A-Za-z_][A-Za-z0-9_]*(\s*\()\s*(?:(?:u8|u|U|L)?"(?:[^"\\\n]|\\.)*"\s*)+(\))"#,
+            )
+            .unwrap()
+        });
+        let calls: Vec<_> = CALL_REGEX.captures_iter(source).collect();
+        if calls.is_empty() {
+            return None;
+        }
+        let code = Self::code_bytes(source);
+        let bounds: Vec<_> = calls
+            .iter()
+            .map(|call| {
+                let whole = call.get(0).unwrap();
+                let before = source[..whole.start()].trim_end();
+                let after = source[whole.end()..].trim_start();
+                (
+                    before.len(),
+                    whole.start(),
+                    whole.end(),
+                    source.len() - after.len(),
+                )
+            })
+            .collect();
+        // Only rewrite calls that are next to a string-literal, or next to another call that
+        // is rewritten, like `"x " A("y") B("z")`, since a call like `_("...")` is valid as-is.
+        let mut rewrite: Vec<bool> = bounds
+            .iter()
+            .map(|&(before_end, start, _, after_start)| {
+                let before = &source[..before_end];
+                // The `"` of a directive, like `#include "x.h"`, is not part of an expression.
+                let after_directive = before
+                    .rsplit('\n')
+                    .next()
+                    .is_some_and(|line| line.trim_start().starts_with('#'));
+                code[start]
+                    && ((before.ends_with('"') && !after_directive)
+                        || source[after_start..].starts_with('"'))
+            })
+            .collect();
+        let adjacent =
+            |left: usize, right: usize| code[bounds[right].1] && bounds[left].3 == bounds[right].1;
+        for index in 1..calls.len() {
+            if rewrite[index - 1] && adjacent(index - 1, index) {
+                rewrite[index] = true;
+            }
+        }
+        for index in (1..calls.len()).rev() {
+            if rewrite[index] && adjacent(index - 1, index) {
+                rewrite[index - 1] = true;
+            }
+        }
+        let mut retval = source.as_bytes().to_vec();
+        let mut rewrote_any = false;
+        for (call, _) in calls.iter().zip(&rewrite).filter(|(_, rewrite)| **rewrite) {
+            let open = call.get(1).unwrap();
+            let close = call.get(2).unwrap();
+            retval[open.end() - 1] = b' ';
+            retval[close.start()] = b' ';
+            rewrote_any = true;
+        }
+        // Only ASCII parentheses were replaced, so the result is still UTF-8.
+        rewrote_any.then(|| String::from_utf8(retval).unwrap())
+    }
+
+    /// Find which bytes of C or C++ source are code, and not in a comment or a string or
+    /// character literal.
+    fn code_bytes(source: &str) -> Vec<bool> {
+        let bytes = source.as_bytes();
+        let mut retval = vec![true; bytes.len()];
+        let mut index = 0;
+        while index < bytes.len() {
+            let start = index;
+            let end = match bytes[index] {
+                b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                    // Line comments can be continued with a backslash, like macros.
+                    let mut end = index;
+                    while end < bytes.len() && bytes[end] != b'\n' {
+                        end += if bytes[end] == b'\\' { 2 } else { 1 };
+                    }
+                    end
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'*') => source[index + 2..]
+                    .find("*/")
+                    .map_or(bytes.len(), |end| index + 2 + end + 2),
+                // A digit separator, like `1'000`, is not a character literal.
+                b'\'' if index > 0 && bytes[index - 1].is_ascii_hexdigit() => {
+                    index += 1;
+                    continue;
+                }
+                quote @ (b'"' | b'\'') => {
+                    Self::raw_string_end(source, index).unwrap_or_else(|| {
+                        let mut end = index + 1;
+                        while end < bytes.len() && bytes[end] != quote && bytes[end] != b'\n' {
+                            end += if bytes[end] == b'\\' { 2 } else { 1 };
+                        }
+                        end + 1
+                    })
+                }
+                _ => {
+                    index += 1;
+                    continue;
+                }
+            };
+            let end = end.min(bytes.len());
+            retval[start..end].fill(false);
+            index = end;
+        }
+        retval
+    }
+
+    /// If the `"` at `index` starts a raw string, like `R"delim(...)delim"`, returns the offset
+    /// just past its end.  The `R` has to be a whole prefix, so `ANSI_CLEAR"x"` is not one.
+    fn raw_string_end(source: &str, index: usize) -> Option<usize> {
+        let before = &source[..index];
+        let prefix_start = before
+            .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            .len();
+        if !matches!(&before[prefix_start..], "R" | "LR" | "uR" | "UR" | "u8R") {
+            return None;
+        }
+        let delim_len = source[index + 1..].find('(')?;
+        let delim = &source[index + 1..index + 1 + delim_len];
+        if delim.len() > 16
+            || delim.contains(|c: char| c.is_whitespace() || matches!(c, ')' | '\\' | '"'))
+        {
+            return None;
+        }
+        let terminator = format!("){delim}\"");
+        let body = index + 1 + delim_len;
+        Some(
+            source[body..]
+                .find(&terminator)
+                .map_or(source.len(), |end| body + end + terminator.len()),
+        )
     }
 
     /// Count the error and missing nodes in a tree.
@@ -315,7 +475,10 @@ impl<'a> SourceQuery<'a> {
                             && self.source_language.is_c_family()
                         {
                             match self.concatenated_pattern(child) {
-                                Some(pattern) => concat_pattern = Some(pattern),
+                                Some((pattern, args)) => {
+                                    concat_pattern = Some(pattern);
+                                    concat_args = args;
+                                }
                                 None => break,
                             }
                         }
@@ -401,9 +564,22 @@ impl<'a> SourceQuery<'a> {
                     let (name, qualified_name) = self.names(anchor);
                     let block_id = self.block_id(anchor);
                     let qr_index = results.len();
+                    let mut range = child.range();
+                    if let Some(prefix) = Self::concat_error_prefix(child) {
+                        range.start_byte = prefix.start_byte();
+                        range.start_point = prefix.start_position();
+                    }
+                    if let Some(close) = self.trailing_macro_call_paren(child) {
+                        // The `)` of a macro call at the end, like `"x " ANSI_BOLD("%d")`.
+                        range.end_byte = close + 1;
+                        range.end_point = Point::new(
+                            range.end_point.row,
+                            range.end_point.column + (close + 1 - child.end_byte()),
+                        );
+                    }
                     results.push(QueryResult {
                         kind: kind.to_string(),
-                        range: child.range(),
+                        range,
                         name: name.clone(),
                         qualified_name: qualified_name.clone(),
                         block_id,
@@ -524,29 +700,147 @@ impl<'a> SourceQuery<'a> {
         Some(retval)
     }
 
-    /// Join the pieces of a C++ concatenated string, like `"abc " "def"`, into the contents of
-    /// a single string-literal.  Returns None if a piece cannot be resolved, like a macro.
-    fn concatenated_pattern(&self, node: Node) -> Option<String> {
+    /// Join the pieces of a C or C++ concatenated string, like `"abc " "def"`, into the
+    /// contents of a single string-literal.  A macro whose value is unknown, like the
+    /// `ANSI_NORM` in `"%d" ANSI_NORM " rows"`, matches any text.  So does each side of a
+    /// macro call, like `ANSI_BOLD("%d")`, which `rewrite_literal_macro_calls()` made parsable.
+    /// If there are any macros, the returned arguments list every placeholder in order, with
+    /// the macros as named arguments so that they do not use up the arguments of the call.
+    /// Returns None if a piece cannot be resolved, like a function call.
+    fn concatenated_pattern(&self, node: Node) -> Option<(String, Vec<Arg>)> {
+        // The placeholder used for a macro, and where they are in the pattern.
+        const MACRO_PLACEHOLDER: &str = "%s";
+        let mut macros: Vec<(usize, &str)> = Vec::new();
         let mut pattern = String::new();
         let mut cursor = node.walk();
-        for piece in node.named_children(&mut cursor) {
+        let mut pieces: Vec<Node> = vec![];
+        if let Some(prefix) = Self::concat_error_prefix(node) {
+            let mut prefix_cursor = prefix.walk();
+            pieces.extend(prefix.named_children(&mut prefix_cursor));
+        }
+        pieces.extend(node.named_children(&mut cursor));
+        // The name of the macro call whose argument is the next piece.
+        let mut call_name = None;
+        for piece in pieces {
             let text = &self.source[piece.start_byte()..piece.end_byte()];
-            match piece.kind() {
+            // The C++ grammar wraps a macro that follows a string-literal in an ERROR node.
+            let kind = match piece.kind() {
+                "ERROR" if is_identifier(text) => "identifier",
+                kind => kind,
+            };
+            match kind {
                 "string_literal" => {
                     // Skip any prefix, like L or u8, and the quotes.
                     let start = text.find('"')? + 1;
                     let end = text.rfind('"')?;
                     pattern.push_str(text.get(start..end)?);
+                    // Part of the argument of a macro call, which can be several adjacent
+                    // string-literals, like `ANSI_BOLD("abc" "def")`.  The call ends after the
+                    // last one.  If anything else follows, the call was not rewritten, and the
+                    // next piece ends the pattern below.
+                    let call_ends = self.source[piece.end_byte()..]
+                        .trim_start()
+                        .starts_with(')');
+                    if let Some(name) = call_name.filter(|_| call_ends) {
+                        call_name = None;
+                        macros.push((pattern.len(), name));
+                        pattern.push_str(MACRO_PLACEHOLDER);
+                    }
                 }
                 // The <cinttypes> macros, like "%" PRIu64, finish a conversion specification.
-                // Some grammar versions wrap the macro name in an ERROR node.
-                "identifier" | "ERROR" if is_inttypes_macro(text) => {
+                "identifier" if call_name.is_none() && is_inttypes_macro(text) => {
                     pattern.push('d');
+                }
+                // Other macros can too, like "%" G_GINT64_FORMAT, but their type is unknown.
+                "identifier" if call_name.is_none() && ends_in_open_conversion(&pattern) => {
+                    pattern.push('s');
+                }
+                "identifier" if call_name.is_none() => {
+                    if self.source[piece.end_byte()..]
+                        .trim_start()
+                        .starts_with('(')
+                    {
+                        call_name = Some(text);
+                    }
+                    macros.push((pattern.len(), text));
+                    pattern.push_str(MACRO_PLACEHOLDER);
                 }
                 _ => return None,
             }
         }
-        Some(pattern)
+        if call_name.is_some() {
+            // A macro call at the end that was not rewritten, like `"x" A("y", "z")`.
+            return None;
+        }
+        if macros.is_empty() {
+            // The placeholders will be found when building the matcher.
+            return Some((pattern, vec![]));
+        }
+        let language = self.source_language;
+        let mut counter = ArgCounter::default();
+        let mut args = Vec::new();
+        for cap in language.get_placeholder_regex().captures_iter(&pattern) {
+            let start = cap.get(0).unwrap().start();
+            if let Some((_, name)) = macros.iter().find(|(offset, _)| *offset == start) {
+                args.push((FormatArgument::Named(name.to_string()), ValueKind::Any));
+                continue;
+            }
+            if let Substitution::Value(arg) = counter.substitution(language, &cap) {
+                args.push((arg, ValueKind::Any));
+            }
+        }
+        let named = args
+            .iter()
+            .filter(|(arg, _)| matches!(arg, FormatArgument::Named(_)))
+            .count();
+        // A macro that was swallowed by a conversion would match its placeholder as text.
+        (named >= macros.len()).then_some((pattern, args))
+    }
+
+    /// The C++ grammar cannot parse a concatenation where a macro follows the first
+    /// string-literal, like `"unknown " SOME_MACRO " text"`, so it wraps the leading
+    /// string-literals in an ERROR node just before the rest of the concatenation.  Returns
+    /// that node, if there is one.
+    pub(crate) fn concat_error_prefix(node: Node) -> Option<Node> {
+        if node.kind() != "concatenated_string" {
+            return None;
+        }
+        let prefix = node.prev_sibling().filter(|prev| prev.is_error())?;
+        let mut cursor = prefix.walk();
+        let only_literals = prefix.child_count() > 0
+            && prefix
+                .children(&mut cursor)
+                .all(|piece| piece.kind() == "string_literal");
+        only_literals.then_some(prefix)
+    }
+
+    /// If a concatenation ends with a macro call that `rewrite_literal_macro_calls()` made
+    /// parsable, like `"x " ANSI_BOLD("%d")`, returns the offset of the call's `)`, which the
+    /// tree does not include.  Only spaces are expected before it, like in the rewrite.
+    fn trailing_macro_call_paren(&self, node: Node) -> Option<usize> {
+        if node.kind() != "concatenated_string" {
+            return None;
+        }
+        let literal = node.named_child(node.named_child_count().checked_sub(1)?)?;
+        // The argument can be several adjacent string-literals, like `A("abc" "def")`.
+        let mut first = literal;
+        while let Some(prev) = first.prev_named_sibling().filter(|prev| {
+            prev.kind() == "string_literal"
+                && self.source[prev.end_byte()..first.start_byte()]
+                    .trim()
+                    .is_empty()
+        }) {
+            first = prev;
+        }
+        let name = first.prev_named_sibling()?;
+        let after_name = &self.source[name.end_byte()..first.start_byte()];
+        let after_literal = &self.source[literal.end_byte()..];
+        let spaces = after_literal.len() - after_literal.trim_start_matches(' ').len();
+        (literal.kind() == "string_literal"
+            && matches!(name.kind(), "identifier" | "ERROR")
+            && after_name.trim() == "("
+            && after_literal[spaces..].starts_with(')'))
+        .then(|| literal.end_byte() + spaces)
     }
 
     /// Check if a Python log message is followed by positional arguments.  The `logging` module
@@ -1172,7 +1466,12 @@ impl<'a> SourceQuery<'a> {
                 text.get(start..end).map(Cow::Borrowed)
             }
             (SourceLanguage::C | SourceLanguage::Cpp, "concatenated_string") => {
-                self.concatenated_pattern(node).map(Cow::Owned)
+                // Only the contents are returned, so the arguments for any macros would be
+                // lost.
+                match self.concatenated_pattern(node)? {
+                    (pattern, args) if args.is_empty() => Some(Cow::Owned(pattern)),
+                    _ => None,
+                }
             }
             (_, "string_literal") if !text.starts_with("\"\"\"") && text.len() >= 2 => {
                 Some(Cow::Borrowed(&text[1..text.len() - 1]))
@@ -1852,7 +2151,25 @@ enum ConcatPiece<'a> {
 
 /// Check for a format macro from <cinttypes>, like PRIu64 or SCNd32.
 fn is_inttypes_macro(text: &str) -> bool {
-    (text.starts_with("PRI") || text.starts_with("SCN"))
+    (text.starts_with("PRI") || text.starts_with("SCN")) && is_identifier(text)
+}
+
+/// Check if a printf-style format ends in a conversion specification that is not finished,
+/// like the `%-10` in `"%-10" G_GINT64_FORMAT`.
+fn ends_in_open_conversion(format: &str) -> bool {
+    let mut open = false;
+    for c in format.chars() {
+        if open {
+            open = matches!(c, '-' | '+' | ' ' | '#' | '0'..='9' | '\'' | '.' | '*');
+        } else if c == '%' {
+            open = true;
+        }
+    }
+    open
+}
+
+fn is_identifier(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -1878,6 +2195,40 @@ mod test {
             Some("int f() {\n        \n  return 1;\n      \n}\n")
         );
         assert_eq!(mask("int f() { return 1; }\n"), None);
+    }
+
+    #[test]
+    fn test_rewrite_literal_macro_calls() {
+        let rewrite = SourceQuery::rewrite_literal_macro_calls;
+        assert_eq!(
+            rewrite(r#"f(A("%d") " rows " B( "x" ) "y");"#).as_deref(),
+            Some(r#"f(A "%d"  " rows " B  "x"   "y");"#)
+        );
+        // Chains of calls next to a string-literal.
+        assert_eq!(
+            rewrite(r#"f(A("a") B("b") "c");"#).as_deref(),
+            Some(r#"f(A "a"  B "b"  "c");"#)
+        );
+        assert_eq!(
+            rewrite(r#"f("a" A("b") B("c"));"#).as_deref(),
+            Some(r#"f("a" A "b"  B "c" );"#)
+        );
+        // Calls that are valid as-is, or that are in a comment or literal.
+        assert_eq!(rewrite(r#"f(_("a"), "b");"#), None);
+        assert_eq!(
+            rewrite("#include \"a.h\"\nTEST(\"a\")\nTEST(\"b\")\n"),
+            None
+        );
+        assert_eq!(rewrite(r#"f("x A(\"a\") y"); // "a" B("b")"#), None);
+        assert_eq!(
+            rewrite(r#"/* "a" A("b") */ f('"', 1'000, R"(" B("c"))");"#),
+            None
+        );
+        // An identifier that ends with an `R` is not the prefix of a raw string.
+        assert_eq!(
+            rewrite(r#"f(ANSI_CLEAR"x", c); g("a" A("b"));"#).as_deref(),
+            Some(r#"f(ANSI_CLEAR"x", c); g("a" A "b" );"#)
+        );
     }
 
     #[test]
