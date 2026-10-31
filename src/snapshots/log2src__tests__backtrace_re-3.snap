@@ -1,6 +1,6 @@
 ---
 source: src/lib.rs
-expression: src_refs
+expression: "sif.statements().collect::<Vec<_>>()"
 ---
 - sourcePath: in-mem.java
   language: java
@@ -14,21 +14,7 @@ expression: src_refs
   level: Info
   category: Log
   callName: info
-  quality: 8
   pattern: "(?s)^(.*): Started$"
-  args:
-    - Placeholder
-  argKinds:
-    - Any
-  vars:
-    - this
-  varKinds:
-    - Any
-  kinds:
-    - Any
-  segments:
-    - ""
-    - ": Started"
 - sourcePath: in-mem.java
   language: java
   lineNumber: 9
@@ -41,18 +27,4 @@ expression: src_refs
   level: Info
   category: Log
   callName: info
-  quality: 8
   pattern: "(?s)^(.*): Stopped$"
-  args:
-    - Placeholder
-  argKinds:
-    - Any
-  vars:
-    - this
-  varKinds:
-    - Any
-  kinds:
-    - Any
-  segments:
-    - ""
-    - ": Stopped"

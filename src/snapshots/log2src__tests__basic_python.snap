@@ -1,6 +1,6 @@
 ---
 source: src/lib.rs
-expression: src_refs
+expression: "sif.statements().collect::<Vec<_>>()"
 ---
 - sourcePath: in-mem.py
   language: python
@@ -14,21 +14,7 @@ expression: src_refs
   level: Info
   category: Log
   callName: logger.info
-  quality: 4
   pattern: (?s)^foo (.*) .$
-  args:
-    - Placeholder
-  argKinds:
-    - Any
-  vars:
-    - test_var
-  varKinds:
-    - Any
-  kinds:
-    - Any
-  segments:
-    - "foo "
-    - " ."
 - sourcePath: in-mem.py
   language: python
   lineNumber: 4
@@ -41,19 +27,7 @@ expression: src_refs
   level: Info
   category: Log
   callName: logging.info
-  quality: 7
   pattern: "(?s)^Hello, (.*)!$"
-  args:
-    - Named: "args[1]"
-  argKinds:
-    - Any
-  vars: []
-  varKinds: []
-  kinds:
-    - Any
-  segments:
-    - "Hello, "
-    - "!"
 - sourcePath: in-mem.py
   language: python
   lineNumber: 5
@@ -66,15 +40,7 @@ expression: src_refs
   level: Warn
   category: Log
   callName: logger.warning
-  quality: 29
   pattern: "(?s)^warning message:\\nlow disk space$"
-  args: []
-  argKinds: []
-  vars: []
-  varKinds: []
-  kinds: []
-  segments:
-    - "warning message:\\nlow disk space"
 - sourcePath: in-mem.py
   language: python
   lineNumber: 6
@@ -87,16 +53,4 @@ expression: src_refs
   level: Info
   category: Log
   callName: logger.info
-  quality: 35
   pattern: "(?s)^info message:\\nprocessing \\\\started -- (.*)$"
-  args:
-    - Named: "args[0]"
-  argKinds:
-    - Any
-  vars: []
-  varKinds: []
-  kinds:
-    - Any
-  segments:
-    - "info message:\\nprocessing \\\\started -- "
-    - ""

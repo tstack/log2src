@@ -47,7 +47,7 @@ pub use progress::ProgressUpdate;
 pub use progress::WorkInfo;
 use source_query::QueryResult;
 pub use source_query::SourceQuery;
-pub use source_ref::{LogLevel, MessageCategory, SourceRef};
+pub use source_ref::{LogLevel, MessageCategory, Statement};
 
 #[derive(Error, Debug, Diagnostic, Clone, Default)]
 pub enum LogError {
@@ -155,7 +155,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "36")]
+    #[serde(rename = "38")]
     Current,
 }
 
@@ -184,14 +184,67 @@ where
     }
 }
 
+/// A log statement and the file it is in, which has the details shared by all of the
+/// statements in the file.  This is what the matching API returns, and it serializes to a
+/// self-contained description of the statement for the JSON output.
+#[derive(Copy, Clone, Debug)]
+pub struct StatementRef<'s> {
+    pub file: &'s StatementsInFile,
+    pub stmt: &'s Statement,
+}
+
+impl<'s> StatementRef<'s> {
+    pub fn source_path(&self) -> &'s str {
+        &self.file.path
+    }
+
+    pub fn language(&self) -> SourceLanguage {
+        self.file.language
+    }
+}
+
+impl Serialize for StatementRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let stmt = self.stmt;
+        // The fields used for matching, like the segments and the kinds of the arguments, are
+        // left out: they are internal, and `LogMapping::variables` has what they found.
+        let mut state = serializer.serialize_struct("StatementRef", 13)?;
+        state.serialize_field("sourcePath", self.source_path())?;
+        state.serialize_field("language", &self.language())?;
+        state.serialize_field("lineNumber", &stmt.line_no)?;
+        state.serialize_field("endLineNumber", &stmt.end_line_no)?;
+        state.serialize_field("column", &stmt.column)?;
+        state.serialize_field("name", &stmt.name)?;
+        state.serialize_field("qualifiedName", &stmt.qualified_name)?;
+        state.serialize_field("blockId", &stmt.block_id)?;
+        state.serialize_field("text", &stmt.text)?;
+        state.serialize_field("level", &stmt.level)?;
+        state.serialize_field("category", &stmt.category)?;
+        state.serialize_field("callName", &stmt.call_name)?;
+        state.serialize_field("pattern", &stmt.pattern_source())?;
+        state.end()
+    }
+}
+
+impl Deref for StatementRef<'_> {
+    type Target = Statement;
+
+    fn deref(&self) -> &Statement {
+        self.stmt
+    }
+}
+
 /// Collection of log statements in a single source file
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatementsInFile {
     pub path: String,
+    pub language: SourceLanguage,
     id: SourceFileID,
     /// The statements with a string-literal message.  Use `statements()` to also get the ones
     /// whose message is a constant.
-    log_statements: Vec<SourceRef>,
+    log_statements: Vec<Statement>,
     /// The locations, as line and column, of the statements whose level comes from an
     /// argument, like `syslog(LOG_ERR, ...)`, instead of the name of the call.  Those levels
     /// are never pruned by `prune_log_calls()`.
@@ -199,7 +252,7 @@ pub struct StatementsInFile {
     /// The statements whose message is a constant.  The constants are usually defined in other
     /// files, so these are rebuilt by `SourceTree::resolve_message_refs()` instead of cached.
     #[serde(skip)]
-    resolved_statements: Vec<SourceRef>,
+    resolved_statements: Vec<Statement>,
     /// The Java string constants defined in this file.
     constants: Vec<StringConstant>,
     /// The Java log calls in this file whose message is a constant.
@@ -207,32 +260,37 @@ pub struct StatementsInFile {
 }
 
 impl StatementsInFile {
-    /// Iterate over all of the statements, paired with whether their level came from an
-    /// argument, for `prune_log_calls()`.
-    fn statements_for_pruning(&mut self) -> impl Iterator<Item = (&mut SourceRef, bool)> {
+    /// Iterate over all of the statements, paired with the file's language and whether their
+    /// level came from an argument, for `prune_log_calls()`.
+    fn statements_for_pruning(
+        &mut self,
+    ) -> impl Iterator<Item = (&mut Statement, SourceLanguage, bool)> {
         let arg_levels = &self.arg_levels;
+        let language = self.language;
         self.log_statements
             .iter_mut()
             .chain(self.resolved_statements.iter_mut())
             .map(move |stmt| {
                 let from_arg = arg_levels.contains(&(stmt.line_no, stmt.column));
-                (stmt, from_arg)
+                (stmt, language, from_arg)
             })
     }
 
     /// Iterate over all of the statements, the ones with a string-literal message first.
-    pub fn statements(&self) -> impl Iterator<Item = &SourceRef> {
+    pub fn statements(&self) -> impl Iterator<Item = StatementRef<'_>> {
         self.log_statements
             .iter()
             .chain(self.resolved_statements.iter())
+            .map(move |stmt| StatementRef { file: self, stmt })
     }
 
     /// Get a statement by its index in `statements()`.
-    fn statement(&self, index: usize) -> Option<&SourceRef> {
-        match index.checked_sub(self.log_statements.len()) {
+    fn statement(&self, index: usize) -> Option<StatementRef<'_>> {
+        let stmt = match index.checked_sub(self.log_statements.len()) {
             None => self.log_statements.get(index),
             Some(resolved_index) => self.resolved_statements.get(resolved_index),
-        }
+        }?;
+        Some(StatementRef { file: self, stmt })
     }
 
     fn to_lookup_pair(&self) -> Option<(String, SourceFileID)> {
@@ -266,6 +324,9 @@ pub struct SourceTree {
     /// the name of the call.  Rebuilt after loading/extracting.
     #[serde(skip)]
     pub log_calls: BTreeMap<String, LogCall>,
+    /// The languages of the files with statements under this root.  Rebuilt with `log_calls`.
+    #[serde(skip)]
+    pub languages: BTreeSet<SourceLanguage>,
 }
 
 /// A logging function/macro/method, like `ws_debug` or `logger.info`, and the levels of the
@@ -300,15 +361,17 @@ pub struct LogCall {
 /// done again, like after a file changes, since a statement whose call name has a level is
 /// only `Unknown` if it was pruned before, so its level is restored first.  The calls that are
 /// known not to be logging, see [`MessageCategory::from_call`], are skipped.
-fn prune_log_calls(mut stmts: Vec<(&mut SourceRef, bool)>) -> BTreeMap<String, LogCall> {
+fn prune_log_calls(
+    mut stmts: Vec<(&mut Statement, SourceLanguage, bool)>,
+) -> BTreeMap<String, LogCall> {
     // The level from the name of each call, which only needs to be computed once per name.
     let mut name_levels: HashMap<String, Option<LogLevel>> = HashMap::new();
     let mut log_calls: BTreeMap<String, LogCall> = BTreeMap::new();
-    for (stmt, from_arg) in stmts.iter_mut() {
+    for (stmt, language, from_arg) in stmts.iter_mut() {
         let Some(call_name) = stmt.call_name.as_deref() else {
             continue;
         };
-        if MessageCategory::from_call(stmt).is_some() {
+        if MessageCategory::from_call(stmt, *language).is_some() {
             // A call that is known not to be logging, like `Err(...)`, is never counted.
             continue;
         }
@@ -363,7 +426,7 @@ fn prune_log_calls(mut stmts: Vec<(&mut SourceRef, bool)>) -> BTreeMap<String, L
             .as_ref()
             .is_some_and(|family| pruned_families.contains(family));
     }
-    for (stmt, from_arg) in stmts.iter_mut() {
+    for (stmt, language, from_arg) in stmts.iter_mut() {
         stmt.category = MessageCategory::Log;
         // A level from an argument, like `syslog(LOG_ERR, ...)`, is kept.
         if *from_arg {
@@ -378,7 +441,7 @@ fn prune_log_calls(mut stmts: Vec<(&mut SourceRef, bool)>) -> BTreeMap<String, L
             stmt.level = LogLevel::Unknown;
             stmt.category = MessageCategory::Other;
         } else {
-            stmt.category = MessageCategory::classify(stmt);
+            stmt.category = MessageCategory::classify(stmt, *language);
         }
     }
     log_calls
@@ -414,7 +477,7 @@ impl SourceTree {
                     summary.not_found += 1;
                     continue;
                 };
-                match SourceRef::from_message_ref(&sif.path, message_ref, value) {
+                match Statement::from_message_ref(message_ref, value) {
                     Some(src_ref) => {
                         sif.resolved_statements.push(src_ref);
                         summary.resolved += 1;
@@ -436,6 +499,12 @@ impl SourceTree {
             .flat_map(|sif| sif.statements_for_pruning())
             .collect();
         self.log_calls = prune_log_calls(stmts);
+        self.languages = self
+            .files_with_statements
+            .values()
+            .filter(|sif| sif.statements().next().is_some())
+            .map(|sif| sif.language)
+            .collect();
     }
 
     fn rebuild_prefilter(&mut self) {
@@ -460,7 +529,7 @@ impl SourceTree {
 
     /// Find the highest quality statement that previously matched a log message with the same
     /// file name and line number as this one, and matches this one too.
-    fn find_cached_match(&self, log_ref: &LogRef) -> Option<&SourceRef> {
+    fn find_cached_match(&self, log_ref: &LogRef) -> Option<StatementRef<'_>> {
         let (filename, lineno) = self.line_cache_key(log_ref)?;
         let body = log_ref.body();
         let cache = self
@@ -475,13 +544,13 @@ impl SourceTree {
                 self.files_with_statements.get(file_id)?.statement(*index)
             })
             .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, Some(lineno), log_ref.level()));
-        first_match(candidates, body, Some(lineno), |src_ref| src_ref)
+        first_match(candidates, body, Some(lineno), |src_ref| src_ref.stmt)
     }
 
     /// Find the highest quality statement that matches the given log message, preferring the one
     /// closest to the message's line number for a tie.  If the message has a file name and line
     /// number, the statement is added to the cache for them.
-    fn find_best_match(&self, log_ref: &LogRef) -> Option<&SourceRef> {
+    fn find_best_match(&self, log_ref: &LogRef) -> Option<StatementRef<'_>> {
         let prefilter = self.prefilter.as_ref()?;
         let body = log_ref.body();
         let filename = match log_ref.details {
@@ -492,7 +561,7 @@ impl SourceTree {
             _ => None,
         };
         let file_ids = filename.and_then(|name| self.file_name_to_sources.get(name));
-        let mut candidates: Vec<(StatementID, &SourceRef)> = Vec::new();
+        let mut candidates: Vec<(StatementID, StatementRef)> = Vec::new();
         prefilter.candidates(body, |(file_id, index)| {
             let Some(sif) = self.files_with_statements.get(&file_id) else {
                 return;
@@ -508,8 +577,9 @@ impl SourceTree {
         });
         let lineno = log_ref.details.as_ref().and_then(|details| details.lineno);
         let level = log_ref.level();
-        candidates.sort_by(|lhs, rhs| compare_candidates(lhs.1, rhs.1, lineno, level));
-        let (stmt_id, src_ref) = first_match(candidates, body, lineno, |(_, src_ref)| src_ref)?;
+        candidates.sort_by(|lhs, rhs| compare_candidates(&lhs.1, &rhs.1, lineno, level));
+        let (stmt_id, src_ref) =
+            first_match(candidates, body, lineno, |(_, src_ref)| src_ref.stmt)?;
         if let Some((filename, lineno)) = self.line_cache_key(log_ref) {
             let mut cache = self
                 .line_cache
@@ -541,7 +611,7 @@ fn first_match<'a, T>(
     candidates: impl IntoIterator<Item = T>,
     body: &str,
     lineno: Option<usize>,
-    src_ref: impl Fn(&T) -> &'a SourceRef,
+    src_ref: impl Fn(&T) -> &'a Statement,
 ) -> Option<T> {
     let mut with_empty_value: Option<T> = None;
     for candidate in candidates {
@@ -554,7 +624,7 @@ fn first_match<'a, T>(
         if stmt.category != MessageCategory::Log && stmt.quality < MIN_FALLBACK_QUALITY {
             continue;
         }
-        if !stmt.pattern.is_match(body) {
+        if !stmt.pattern().is_match(body) {
             continue;
         }
         if stmt.matches_without_empty_values(body) {
@@ -577,7 +647,7 @@ fn first_match<'a, T>(
 const MIN_FALLBACK_QUALITY: usize = 5;
 
 /// How far a statement is from the line number in a log message, or zero if there is none.
-fn line_distance(src_ref: &SourceRef, lineno: Option<usize>) -> usize {
+fn line_distance(src_ref: &Statement, lineno: Option<usize>) -> usize {
     lineno.map_or(0, |lineno| {
         if lineno < src_ref.line_no {
             src_ref.line_no - lineno
@@ -596,13 +666,13 @@ fn line_distance(src_ref: &SourceRef, lineno: Option<usize>) -> usize {
 /// earliest location in the source so that the choice does not depend on the order the
 /// candidates were found in.
 fn compare_candidates(
-    lhs: &SourceRef,
-    rhs: &SourceRef,
+    lhs: &StatementRef,
+    rhs: &StatementRef,
     lineno: Option<usize>,
     level: Option<LogLevel>,
 ) -> Ordering {
-    let distance = |src_ref: &SourceRef| line_distance(src_ref, lineno);
-    let level_matches = |src_ref: &SourceRef| level == Some(src_ref.level);
+    let distance = |src_ref: &StatementRef| line_distance(src_ref, lineno);
+    let level_matches = |src_ref: &StatementRef| level == Some(src_ref.level);
     lhs.category
         .match_priority()
         .cmp(&rhs.category.match_priority())
@@ -612,8 +682,8 @@ fn compare_candidates(
         // A placeholder can be empty, so a message like "Done" matches both "Done" and "Done{}".
         .then_with(|| lhs.kinds.len().cmp(&rhs.kinds.len()))
         .then_with(|| {
-            (&lhs.source_path, lhs.line_no, lhs.column).cmp(&(
-                &rhs.source_path,
+            (lhs.source_path(), lhs.line_no, lhs.column).cmp(&(
+                rhs.source_path(),
                 rhs.line_no,
                 rhs.column,
             ))
@@ -760,11 +830,7 @@ impl LogMatcher {
                     path: path.to_owned(),
                     source: Arc::new(err),
                 })?;
-        for sif in decoded_root.files_with_statements.values_mut() {
-            // The pattern string is not serialized, so fill it in from the regex.
-            for stmt in sif.log_statements.iter_mut() {
-                stmt.pattern_str = stmt.pattern.to_string();
-            }
+        for sif in decoded_root.files_with_statements.values() {
             sif.to_lookup_pair().into_iter().for_each(|(name, sid)| {
                 decoded_root
                     .file_name_to_sources
@@ -908,6 +974,7 @@ impl LogMatcher {
                     prefilter: None,
                     line_cache: RwLock::default(),
                     log_calls: BTreeMap::new(),
+                    languages: BTreeSet::new(),
                 });
         }
         Ok(())
@@ -1066,8 +1133,16 @@ impl LogMatcher {
             .map(|(root, coll)| (root, &coll.log_calls))
     }
 
+    /// The languages of the log statements found under all of the roots, each once.
+    pub fn languages(&self) -> BTreeSet<SourceLanguage> {
+        self.roots
+            .values()
+            .flat_map(|coll| coll.languages.iter().copied())
+            .collect()
+    }
+
     /// Iterate over all of the log statements that were found.
-    pub fn statements(&self) -> impl Iterator<Item = &SourceRef> {
+    pub fn statements(&self) -> impl Iterator<Item = StatementRef<'_>> {
         self.roots
             .values()
             .flat_map(|coll| coll.files_with_statements.values())
@@ -1084,7 +1159,7 @@ impl LogMatcher {
     fn to_log_mapping<'a, 's>(
         &self,
         log_ref: &LogRef<'a>,
-        src_ref: &'s SourceRef,
+        src_ref: StatementRef<'s>,
         options: &LogMatchOptions,
     ) -> LogMapping<'a, 's> {
         let exception_trace = match log_ref {
@@ -1098,7 +1173,7 @@ impl LogMatcher {
             _ => Vec::new(),
         };
         let variables = if options.extract_variables {
-            extract_variables(log_ref, src_ref)
+            extract_variables(log_ref, src_ref.stmt)
         } else {
             Vec::new()
         };
@@ -1113,7 +1188,9 @@ impl LogMatcher {
 
 /// Named by their LSP language identifiers ("rust", "java", "cpp", ...) in the JSON output,
 /// on the command line, and by [SourceLanguage::as_str].
-#[derive(Debug, Eq, PartialEq, Copy, Clone, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(
+    Debug, Eq, PartialEq, Ord, PartialOrd, Copy, Clone, Serialize, Deserialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceLanguage {
     Rust,
@@ -1684,7 +1761,7 @@ pub struct LogMapping<'a, 's> {
     #[serde(rename(serialize = "logRef"))]
     pub log_ref: LogRef<'a>,
     #[serde(rename(serialize = "srcRef"))]
-    pub src_ref: Option<&'s SourceRef>,
+    pub src_ref: Option<StatementRef<'s>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename(serialize = "exceptionTrace"))]
     pub exception_trace: Vec<CallSite>,
@@ -1921,18 +1998,18 @@ impl<'a> LogRef<'a> {
     }
 }
 
-pub fn link_to_source<'a>(log_ref: &LogRef, src_refs: &'a [SourceRef]) -> Option<&'a SourceRef> {
-    let candidates = src_refs
-        .iter()
+pub fn link_to_source<'a>(log_ref: &LogRef, sif: &'a StatementsInFile) -> Option<StatementRef<'a>> {
+    let candidates = sif
+        .statements()
         .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, None, log_ref.level()));
-    first_match(candidates, log_ref.body(), None, |src_ref| src_ref)
+    first_match(candidates, log_ref.body(), None, |src_ref| src_ref.stmt)
 }
 
 pub fn lookup_source<'a>(
     log_ref: &LogRef,
     log_format: &LogFormat,
-    src_refs: &'a [SourceRef],
-) -> Option<&'a SourceRef> {
+    sif: &'a StatementsInFile,
+) -> Option<StatementRef<'a>> {
     if let Some(captures) = log_format.captures(log_ref.body()) {
         let file_name = captures.name("file").map_or("", |m| m.as_str());
         let line_no: usize = captures
@@ -1940,16 +2017,15 @@ pub fn lookup_source<'a>(
             .map_or(0, |m| m.as_str().parse::<usize>().unwrap_or_default());
         // println!("{:?} {:?}", file_name, line_no);
 
-        src_refs.iter().find(|&source_ref| {
-            // println!("source_ref.source_path = {} line_no = {}", source_ref.source_path, source_ref.line_no);
-            source_ref.source_path.contains(file_name) && source_ref.line_no == line_no
+        sif.statements().find(|source_ref| {
+            source_ref.source_path().contains(file_name) && source_ref.line_no == line_no
         })
     } else {
         None
     }
 }
 
-pub fn extract_variables<'a>(log_ref: &LogRef<'a>, src_ref: &'a SourceRef) -> Vec<VariablePair> {
+pub fn extract_variables(log_ref: &LogRef, src_ref: &Statement) -> Vec<VariablePair> {
     let mut variables = Vec::new();
     let line = match log_ref.details {
         Some(details) => details.body.unwrap_or(log_ref.line),
@@ -1981,7 +2057,7 @@ pub fn extract_variables<'a>(log_ref: &LogRef<'a>, src_ref: &'a SourceRef) -> Ve
 /// might be re-split using the kinds of values expected for each placeholder.
 fn find_values(
     line: &str,
-    src_ref: &SourceRef,
+    src_ref: &Statement,
     greedy: Vec<Range<usize>>,
 ) -> (Vec<Range<usize>>, Vec<bool>) {
     let not_ambiguous = vec![false; greedy.len()];
@@ -2074,7 +2150,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                     "string_literal" | "string" | "concatenated_string" | "binary_expression" => {
                         args_target = ArgsTarget::None;
                         let from_arg = result.arg_level().is_some();
-                        if let Some(src_ref) = SourceRef::new(code, result) {
+                        if let Some(src_ref) = Statement::new(code, result) {
                             if from_arg {
                                 arg_levels.insert((src_ref.line_no, src_ref.column));
                             }
@@ -2149,6 +2225,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
             } else {
                 Some(StatementsInFile {
                     path: code.filename.clone(),
+                    language: code.info.language,
                     id: code.info.id,
                     arg_levels,
                     log_statements: matched,
@@ -2188,7 +2265,10 @@ mod tests {
             assert_eq!(serde_json::to_string(lang).unwrap(), format!("\"{name}\""));
             assert_eq!(SourceLanguage::from_str(name, false), Ok(*lang));
         }
-        assert_eq!(SourceLanguage::from_str("c++", false), Ok(SourceLanguage::Cpp));
+        assert_eq!(
+            SourceLanguage::from_str("c++", false),
+            Ok(SourceLanguage::Cpp)
+        );
     }
 
     #[test]
@@ -2254,11 +2334,10 @@ fn namedarg2(salutation: &str, name: &str) {
     #[test]
     fn test_extract_logging() {
         let code = CodeSource::from_string(Path::new("in-mem.rs"), TEST_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
-        assert_yaml_snapshot!(src_refs);
+            .unwrap();
+        assert_yaml_snapshot!(sif.statements().collect::<Vec<_>>());
     }
 
     #[test]
@@ -2271,13 +2350,13 @@ fn namedarg2(salutation: &str, name: &str) {
             lf,
         );
         let code = CodeSource::from_string(Path::new("in-mem.rs"), TEST_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 6);
-        let result = link_to_source(&log_ref, &src_refs);
-        assert!(ptr::eq(result.unwrap(), &src_refs[0]));
+        let result = link_to_source(&log_ref, &sif);
+        assert!(ptr::eq(result.unwrap().stmt, &src_refs[0]));
     }
 
     #[test]
@@ -2288,11 +2367,10 @@ fn namedarg2(salutation: &str, name: &str) {
         let log_ref =
             from_log_format_and_line("[2024-05-09T19:58:53Z DEBUG main] Hello, Leander!", lf);
         let code = CodeSource::from_string(Path::new("in-mem.rs"), TEST_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
-        let result = link_to_source(&log_ref, &src_refs);
+            .unwrap();
+        let result = link_to_source(&log_ref, &sif);
         assert_yaml_snapshot!(result);
     }
 
@@ -2316,13 +2394,13 @@ fn main() {
             lf,
         );
         let code = CodeSource::from_string(Path::new("in-mem.rs"), MULTILINE_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 1);
-        let result = link_to_source(&log_ref, &src_refs);
-        assert!(ptr::eq(result.unwrap(), &src_refs[0]));
+        let result = link_to_source(&log_ref, &sif);
+        assert!(ptr::eq(result.unwrap().stmt, &src_refs[0]));
         let vars = extract_variables(&log_ref, &src_refs[0]);
         assert_eq!(
             vars,
@@ -2338,12 +2416,12 @@ fn main() {
     fn test_link_to_source_no_matches() {
         let log_ref = LogRefBuilder::new().build("nope!");
         let code = CodeSource::from_string(Path::new("in-mem.rs"), TEST_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 6);
-        let result = link_to_source(&log_ref, &src_refs);
+        let result = link_to_source(&log_ref, &sif);
         assert!(result.is_none());
     }
 
@@ -2351,10 +2429,10 @@ fn main() {
     fn test_extract_variables() {
         let log_ref = LogRefBuilder::new().build("this won't match i=1; j=2");
         let code = CodeSource::from_string(Path::new("in-mem.rs"), TEST_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 6);
         let vars = extract_variables(&log_ref, &src_refs[1]);
         assert_eq!(
@@ -2378,10 +2456,10 @@ fn main() {
     fn test_extract_named() {
         let log_ref = LogRefBuilder::new().build("Hello, Tim!");
         let code = CodeSource::from_string(Path::new("in-mem.rs"), TEST_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 6);
         let vars = extract_variables(&log_ref, &src_refs[4]);
         assert_eq!(
@@ -2415,10 +2493,10 @@ fn main() {
             lf,
         );
         let code = CodeSource::from_string(&PathBuf::from("in-mem.java"), TEST_PUNC_SRC);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 2);
         let vars = extract_variables(&log_ref, &src_refs[0]);
         assert_eq!(
@@ -2443,15 +2521,18 @@ fn main() {
     #[test]
     fn test_extract_java_util_logging() {
         let code = CodeSource::from_string(&PathBuf::from("in-mem.java"), TEST_JUL_SRC);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 3);
         assert_eq!(src_refs[2].text, r#""not a {}""#);
         let line = "Loading driver configuration via classloader jdk.internal.loader";
         let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
-        assert_eq!(link_to_source(&log_ref, &src_refs), Some(&src_refs[0]));
+        assert!(ptr::eq(
+            link_to_source(&log_ref, &sif).unwrap().stmt,
+            &src_refs[0]
+        ));
         let vars = extract_variables(&log_ref, &src_refs[0]);
         assert_eq!(
             vars,
@@ -2494,10 +2575,10 @@ class Main {
 }
 "#,
         );
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let found: Vec<(&str, LogLevel)> = src_refs
             .iter()
             .map(|s| (s.pattern().as_str(), s.level))
@@ -2544,10 +2625,10 @@ class Main {
     #[test]
     fn test_extract_java_concatenation() {
         let code = CodeSource::from_string(&PathBuf::from("in-mem.java"), TEST_JAVA_CONCAT_SRC);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
         assert_eq!(
             patterns,
@@ -2654,7 +2735,7 @@ class Caller {
             .match_log_statement(&log_ref, &LogMatchOptions::default())
             .map(|mapping| {
                 let src_ref = mapping.src_ref.unwrap();
-                assert!(src_ref.source_path.ends_with("Caller.java"));
+                assert!(src_ref.source_path().ends_with("Caller.java"));
                 (
                     src_ref.line_no,
                     mapping
@@ -2759,7 +2840,7 @@ class Dup {
             matcher
                 .match_log_statement(&log_ref, &LogMatchOptions::default())
                 .and_then(|mapping| mapping.src_ref)
-                .map(|src_ref| src_ref.source_path.clone())
+                .map(|src_ref| src_ref.source_path().to_string())
         };
 
         assert!(match_path("count xyz").unwrap().ends_with("com/a/Dup.java"));
@@ -2811,7 +2892,7 @@ class Same {
                 .match_log_statement(&log_ref, &LogMatchOptions::default())
                 .and_then(|mapping| mapping.src_ref)
                 .map(|src_ref| {
-                    let dir = if src_ref.source_path.ends_with("com/a/Same.java") {
+                    let dir = if src_ref.source_path().ends_with("com/a/Same.java") {
                         "a"
                     } else {
                         "b"
@@ -2902,9 +2983,9 @@ class Same {
             match_message(&matcher, "Loaded 3 keys"),
             Some((10, vars(&[("port - 1", "3")])))
         );
-        let caller: Vec<&SourceRef> = matcher
+        let caller: Vec<StatementRef> = matcher
             .statements()
-            .filter(|stmt| stmt.source_path.ends_with("Caller.java"))
+            .filter(|stmt| stmt.source_path().ends_with("Caller.java"))
             .collect();
         assert_eq!(caller.len(), 3);
         assert!(caller
@@ -3099,10 +3180,10 @@ class Same {
     fn test_rejected_literal_args_are_dropped() {
         let code =
             CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_REJECTED_LITERAL_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 1);
         assert_eq!(src_refs[0].line_no, 3);
         assert_eq!(src_refs[0].end_line_no, 3);
@@ -3149,10 +3230,10 @@ class Same {
     #[test]
     fn test_cpp_concatenated_string() {
         let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_CONCAT_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 3);
         assert_eq!(
             src_refs[0].pattern().as_str(),
@@ -3193,10 +3274,10 @@ void report(char *buf, int count, long secs, long msecs) {
 "#;
         for name in ["in-mem.cc", "in-mem.c"] {
             let code = CodeSource::from_string(&PathBuf::from(name), source);
-            let src_refs = extract_logging(&[code], &ProgressTracker::new())
+            let sif = extract_logging(&[code], &ProgressTracker::new())
                 .pop()
-                .unwrap()
-                .log_statements;
+                .unwrap();
+            let src_refs = &sif.log_statements;
             let found: Vec<(&str, usize, Vec<&str>)> = src_refs
                 .iter()
                 .map(|s| (s.pattern().as_str(), s.line_no, s.arg_exprs()))
@@ -3279,10 +3360,10 @@ void load() {
 }
 "#,
         );
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
         assert_eq!(
             patterns,
@@ -3315,10 +3396,10 @@ def main(name, count, err, user, d, a, b, off, old_id):
     #[test]
     fn test_python_formatted() {
         let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_FORMATTED_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
         assert_eq!(
             patterns,
@@ -3402,10 +3483,10 @@ def main(name, value, d, x):
     #[test]
     fn test_python_formatted_edge_cases() {
         let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_FORMATTED_EDGE_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
         assert_eq!(
             patterns,
@@ -3472,10 +3553,10 @@ void connect() {
 }
 "#,
         );
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
         assert_eq!(
             patterns,
@@ -3591,10 +3672,10 @@ void connect() {
 }
 "#,
         );
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let found: Vec<(&str, LogLevel)> = src_refs
             .iter()
             .map(|s| (s.pattern().as_str(), s.level))
@@ -3642,10 +3723,10 @@ void connect() {
     #[test]
     fn test_cpp_else_split_by_preproc() {
         let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_SPLIT_ELSE_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 1);
         assert_eq!(src_refs[0].line_no, 15);
         assert_eq!(src_refs[0].text, r#""END load fd(%d): %d""#);
@@ -3685,10 +3766,10 @@ int other(int x) {
     fn test_cpp_else_split_by_complex_preproc() {
         let code =
             CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_SPLIT_ELSE_COMPLEX_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 2);
         assert_eq!(src_refs[0].line_no, 20);
         assert_eq!(src_refs[0].qualified_name, "load");
@@ -3716,10 +3797,10 @@ int other(int x) {
     #[test]
     fn test_cpp_signature_split_by_preproc() {
         let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_SPLIT_SIGNATURE_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 2);
         assert_eq!(src_refs[0].qualified_name, "load");
         assert_eq!(src_refs[1].qualified_name, "other");
@@ -3728,10 +3809,10 @@ int other(int x) {
     #[test]
     fn test_cpp_nested_statements() {
         let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), CPP_NESTED_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let found: Vec<(usize, &str)> = src_refs
             .iter()
             .map(|s| (s.line_no, s.text.as_str()))
@@ -3750,10 +3831,10 @@ int other(int x) {
     fn test_basic_cpp() {
         let log_ref = LogRefBuilder::new().build("Hello, Steve!");
         let code = CodeSource::from_string(Path::new("in-mem.cc"), CPP_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 1);
         let vars = extract_variables(&log_ref, &src_refs[0]);
         assert_eq!(
@@ -3790,10 +3871,10 @@ node_insert(struct node *list, const char *class, uint64_t size)
     fn test_basic_c() {
         let code = CodeSource::from_string(Path::new("in-mem.c"), C_SOURCE);
         assert_eq!(code.info.language, SourceLanguage::C);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let summary: Vec<_> = src_refs
             .iter()
             .map(|s| {
@@ -3829,10 +3910,10 @@ node_insert(struct node *list, const char *class, uint64_t size)
         );
 
         let log_ref = LogRefBuilder::new().build("inserted widget with 42 bytes");
-        let result = link_to_source(&log_ref, &src_refs).unwrap();
+        let result = link_to_source(&log_ref, &sif).unwrap();
         assert_eq!(result.line_no, 14);
         assert_eq!(
-            extract_variables(&log_ref, result),
+            extract_variables(&log_ref, &result),
             vec![
                 VariablePair {
                     expr: "class".to_string(),
@@ -3853,16 +3934,16 @@ node_insert(struct node *list, const char *class, uint64_t size)
         let c_header = "static inline void push(struct node *new, const char *class) {\n    log_info(\"push %s\", class);\n}\n";
         let code = CodeSource::from_string(Path::new("list.h"), c_header);
         assert_eq!(code.info.language, SourceLanguage::C);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 1);
         assert_eq!(
             src_refs[0].name,
             "push(struct node *new, const char *class)"
         );
-        assert_eq!(src_refs[0].language, SourceLanguage::C);
+        assert_eq!(sif.language, SourceLanguage::C);
 
         for cpp_header in [
             "namespace net { void f(); }",
@@ -3894,10 +3975,10 @@ void f(const char *path, int a, int b, long total) {
 }
 "#,
         );
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let patterns: Vec<(&str, MessageCategory)> = src_refs
             .iter()
             .map(|s| (s.pattern().as_str(), s.category))
@@ -3951,16 +4032,16 @@ void f(int n) {
 }
 "#,
         );
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         assert_eq!(src_refs.len(), 1);
         // Braces are not placeholders in C.
         let log_ref = LogRefBuilder::new().build("{literal} 7\x1b[0m");
-        let result = link_to_source(&log_ref, &src_refs).unwrap();
+        let result = link_to_source(&log_ref, &sif).unwrap();
         assert_eq!(
-            extract_variables(&log_ref, result),
+            extract_variables(&log_ref, &result),
             vec![VariablePair {
                 expr: "n".to_string(),
                 value: "7".to_string(),
@@ -3982,10 +4063,10 @@ def main(name, count, x):
     #[test]
     fn test_python_concatenation() {
         let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_CONCAT_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
         assert_eq!(
             patterns,
@@ -4034,11 +4115,11 @@ processing \started -- {args[0]}""")
     fn test_basic_python() {
         let log_ref = LogRefBuilder::new().build("foo bar π");
         let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
-        assert_yaml_snapshot!(src_refs);
+            .unwrap();
+        let src_refs = &sif.log_statements;
+        assert_yaml_snapshot!(sif.statements().collect::<Vec<_>>());
         let vars = extract_variables(&log_ref, &src_refs[0]);
         assert_eq!(
             vars,
@@ -4234,10 +4315,10 @@ fn main() {
 }
 "#;
         let code = CodeSource::from_string(&PathBuf::from("in-mem.rs"), source);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
         assert_eq!(patterns, vec![r"(?s)^request (.*) done$"]);
         assert_eq!(src_refs[0].level, LogLevel::Info);
@@ -4478,15 +4559,14 @@ class Server {
 }
 "#;
 
-    fn kotlin_statements() -> Vec<SourceRef> {
+    fn kotlin_statements() -> StatementsInFile {
         let code = CodeSource::from_string(Path::new("Server.kt"), KOTLIN_SOURCE);
         extract_logging(&[code], &ProgressTracker::new())
             .pop()
             .unwrap()
-            .log_statements
     }
 
-    fn kotlin_vars(src_ref: &SourceRef, line: &str) -> Vec<(String, String)> {
+    fn kotlin_vars(src_ref: &Statement, line: &str) -> Vec<(String, String)> {
         let log_ref = LogRefBuilder::new().build(line);
         extract_variables(&log_ref, src_ref)
             .into_iter()
@@ -4496,8 +4576,9 @@ class Server {
 
     #[test]
     fn test_basic_kotlin() {
-        let src_refs = kotlin_statements();
-        assert_yaml_snapshot!(src_refs);
+        let sif = kotlin_statements();
+        let src_refs = &sif.log_statements;
+        assert_yaml_snapshot!(sif.statements().collect::<Vec<_>>());
         // The raw string and println() are skipped.
         assert_eq!(src_refs.len(), 7);
         assert_eq!(
@@ -4633,10 +4714,10 @@ fun handle(x: Boolean, y: Int) {
     fn extract_pairs(path: &str, source: &str, index: usize, line: &str) -> Vec<(String, String)> {
         let log_ref = LogRefBuilder::new().build(line);
         let code = CodeSource::from_string(Path::new(path), source);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         extract_variables(&log_ref, &src_refs[index])
             .into_iter()
             .map(|pair| (pair.expr, pair.value))
@@ -4814,10 +4895,10 @@ fn adjacent(mask: u32, name: &str, point: Point) {
     fn ambiguous_vars(path: &str, source: &str, index: usize, line: &str) -> Vec<String> {
         let log_ref = LogRefBuilder::new().build(line);
         let code = CodeSource::from_string(Path::new(path), source);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         extract_variables(&log_ref, &src_refs[index])
             .into_iter()
             .filter(|pair| pair.ambiguous)
@@ -5090,13 +5171,12 @@ public class Done {
 }
 "#,
         );
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
         let line_of = |msg: &str| {
             let log_ref = LogRefBuilder::new().build(msg);
-            link_to_source(&log_ref, &src_refs).map(|src_ref| src_ref.line_no)
+            link_to_source(&log_ref, &sif).map(|src_ref| src_ref.line_no)
         };
         assert_eq!(line_of("Done"), Some(5));
         assert_eq!(line_of("Done now"), Some(4));
@@ -5172,13 +5252,13 @@ class Adjacent {
     #[test]
     fn test_adjacent_after_cache_round_trip() {
         let code = CodeSource::from_string(Path::new("in-mem.java"), JAVA_ADJACENT_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let encoded =
             bincode::serde::encode_to_vec(&src_refs[1], bincode::config::standard()).unwrap();
-        let (decoded, _): (SourceRef, usize) =
+        let (decoded, _): (Statement, usize) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         let log_ref = LogRefBuilder::new().build("sizes: hello world 5 foo bar");
         let vars: Vec<(String, String)> = extract_variables(&log_ref, &decoded)
@@ -5233,10 +5313,10 @@ def main(x, t, pct):
     #[test]
     fn test_percent_python() {
         let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_PERCENT_SOURCE);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
         assert_eq!(
             patterns,
@@ -5311,6 +5391,7 @@ void dissect(void) {
             prefilter: None,
             line_cache: RwLock::default(),
             log_calls: BTreeMap::new(),
+            languages: BTreeSet::new(),
         };
         for sif in extract_logging(&codes, &ProgressTracker::new()) {
             tree.files_with_statements.insert(sif.id, sif);
@@ -5319,6 +5400,7 @@ void dissect(void) {
         // statements are restored from their call names, so nothing else needs to be kept.
         tree.prune_log_calls();
         tree.prune_log_calls();
+        assert_eq!(tree.languages, BTreeSet::from([SourceLanguage::C]));
         let found: Vec<(&str, Vec<(LogLevel, usize)>, Option<&str>, bool)> = tree
             .log_calls
             .iter()
@@ -5370,6 +5452,7 @@ void dissect(void) {
             .files_with_statements
             .values()
             .flat_map(|sif| sif.statements())
+            .map(|stmt| stmt.stmt)
             .map(|stmt| (stmt.text.as_str(), stmt.level, stmt.category))
             .collect();
         levels.sort();
@@ -5456,6 +5539,7 @@ fn main() -> Result<()> {
         prune_log_calls(sif.statements_for_pruning().collect());
         let found: Vec<(&str, Option<&str>, MessageCategory)> = sif
             .statements()
+            .map(|stmt| stmt.stmt)
             .map(|stmt| (stmt.text.as_str(), stmt.call_name.as_deref(), stmt.category))
             .collect();
         use MessageCategory::*;
@@ -5677,7 +5761,7 @@ fn run(a: &str, b: &str) {
         // need an empty value.
         let line = "server ready";
         let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
-        let matched = link_to_source(&log_ref, &sif.log_statements).map(|stmt| stmt.line_no);
+        let matched = link_to_source(&log_ref, &sif).map(|stmt| stmt.line_no);
         assert_eq!(matched, Some(11));
         assert_eq!(find(line), vec![(line.to_string(), matched)]);
     }
@@ -5706,6 +5790,7 @@ def load(path, count):
         prune_log_calls(sif.statements_for_pruning().collect());
         let found: Vec<(&str, Option<&str>, LogLevel, MessageCategory)> = sif
             .statements()
+            .map(|stmt| stmt.stmt)
             .map(|stmt| {
                 (
                     stmt.pattern().as_str(),
@@ -5784,10 +5869,10 @@ class Loader {
 }
 "#,
         );
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let found: Vec<(&str, Option<&str>, LogLevel, MessageCategory)> = src_refs
             .iter()
             .map(|stmt| {
@@ -5852,6 +5937,7 @@ void load(const std::string &path, int count) {
         prune_log_calls(sif.statements_for_pruning().collect());
         let found: Vec<(&str, Option<&str>, MessageCategory)> = sif
             .statements()
+            .map(|stmt| stmt.stmt)
             .map(|stmt| (stmt.text.as_str(), stmt.call_name.as_deref(), stmt.category))
             .collect();
         use MessageCategory::*;
@@ -5897,6 +5983,7 @@ void load(const char *path, int count) {
         prune_log_calls(sif.statements_for_pruning().collect());
         let found: Vec<(&str, Option<&str>, MessageCategory)> = sif
             .statements()
+            .map(|stmt| stmt.stmt)
             .map(|stmt| {
                 (
                     stmt.pattern().as_str(),
@@ -5949,10 +6036,10 @@ fn check(p: &str) -> Result<()> {
 }
 "#,
         );
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
+        let src_refs = &sif.log_statements;
         let found: Vec<(usize, Option<&str>, MessageCategory)> = src_refs
             .iter()
             .map(|stmt| (stmt.line_no, stmt.call_name.as_deref(), stmt.category))
@@ -5970,7 +6057,7 @@ fn check(p: &str) -> Result<()> {
         let line = "failed to open the file /x";
         let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
         assert_eq!(
-            link_to_source(&log_ref, &src_refs).map(|src_ref| src_ref.line_no),
+            link_to_source(&log_ref, &sif).map(|src_ref| src_ref.line_no),
             Some(6)
         );
     }
@@ -5986,13 +6073,12 @@ fn main() {
 }
 "#,
         );
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
         let best = |line: &str| {
             let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
-            link_to_source(&log_ref, &src_refs).map(|src_ref| src_ref.line_no)
+            link_to_source(&log_ref, &sif).map(|src_ref| src_ref.line_no)
         };
         // Too little literal text to match a log message unless it is a log statement.
         assert_eq!(best("usr/bin"), None);
@@ -6020,6 +6106,7 @@ int main(int argc, char *argv[]) {
             prefilter: None,
             line_cache: RwLock::default(),
             log_calls: BTreeMap::new(),
+            languages: BTreeSet::new(),
         };
         for sif in extract_logging(&[code], &ProgressTracker::new()) {
             tree.files_with_statements.insert(sif.id, sif);
@@ -6240,10 +6327,9 @@ fn main() {
 }
 "#,
         );
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
         let log_format: LogFormat = r"^(?<level>\w+) (?<body>.*)$".try_into().unwrap();
         for (line, expected) in [
             ("DEBUG retry", LogLevel::Debug),
@@ -6251,7 +6337,7 @@ fn main() {
         ] {
             let log_ref =
                 LogRefBuilder::new().build_from_captures(log_format.captures(line).unwrap(), line);
-            let result = link_to_source(&log_ref, &src_refs).unwrap();
+            let result = link_to_source(&log_ref, &sif).unwrap();
             assert_eq!(result.level, expected, "{line}");
         }
     }
@@ -6267,17 +6353,16 @@ fn main() {
 }
 "#,
         );
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
+            .unwrap();
         for level in [LogLevel::Debug, LogLevel::Warn] {
             let log_ref = LogRefBuilder::new()
                 .with_log_level(Some(level))
                 .with_body(Some("retry"))
                 .build("retry");
             assert_eq!(log_ref.level(), Some(level));
-            let result = link_to_source(&log_ref, &src_refs).unwrap();
+            let result = link_to_source(&log_ref, &sif).unwrap();
             assert_eq!(result.level, level);
         }
         let log_ref = LogRefBuilder::new()
@@ -6300,11 +6385,11 @@ java.lang.IllegalStateException: simulated failure for demo
         let log_ref = LogRefBuilder::new().with_body(Some(TRACE)).build(TRACE);
         assert_snapshot!(log_ref.line);
         assert_yaml_snapshot!(log_ref);
-        let src_refs = extract_logging(&[code], &ProgressTracker::new())
+        let sif = extract_logging(&[code], &ProgressTracker::new())
             .pop()
-            .unwrap()
-            .log_statements;
-        assert_yaml_snapshot!(src_refs);
+            .unwrap();
+        let src_refs = &sif.log_statements;
+        assert_yaml_snapshot!(sif.statements().collect::<Vec<_>>());
         let vars = extract_variables(&log_ref, &src_refs[0]);
         assert_yaml_snapshot!(vars);
     }

@@ -11,20 +11,20 @@ info:
     - "-f"
     - "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2} \\w+ \\w+ \\w+: (?<body>.*)"
   env:
-    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpQDeZS4
+    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpxpzDtz
     COLS: "1000"
-    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpQDeZS4
-    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpQDeZS4
-    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpQDeZS4
-    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpQDeZS4
+    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpxpzDtz
+    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpxpzDtz
+    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpxpzDtz
+    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpxpzDtz
 ---
 success: true
 exit_code: 0
 ----- stdout -----
-{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"java","lineNumber":18,"endLineNumber":18,"column":16,"name":"main","qualifiedName":"Basic.main","blockId":234,"text":"\"Hello from main\"","level":"Debug","category":"Log","callName":"fine","quality":13,"pattern":"(?s)^Hello from main$","args":[],"argKinds":[],"vars":[],"varKinds":[],"kinds":[],"segments":["Hello from main"]},"variables":[]}
-{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","blockId":618,"text":"\"Hello from foo i=\\{i}\"","level":"Debug","category":"Log","callName":"fine","quality":14,"pattern":"(?s)^Hello from foo i=(.*)$","args":[{"Named":"i"}],"argKinds":["Any"],"vars":[],"varKinds":[],"kinds":["Any"],"segments":["Hello from foo i=",""]},"variables":[{"expr":"i","value":"0"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"java","lineNumber":18,"endLineNumber":18,"column":16,"name":"main","qualifiedName":"Basic.main","blockId":234,"text":"\"Hello from main\"","level":"Debug","category":"Log","callName":"fine","pattern":"(?s)^Hello from main$"},"variables":[]}
+{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","blockId":618,"text":"\"Hello from foo i=\\{i}\"","level":"Debug","category":"Log","callName":"fine","pattern":"(?s)^Hello from foo i=(.*)$"},"variables":[{"expr":"i","value":"0"}]}
 {"error":{"message":"unable to read line 2","source":"stream did not contain valid UTF-8"}}
-{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","blockId":618,"text":"\"Hello from foo i=\\{i}\"","level":"Debug","category":"Log","callName":"fine","quality":14,"pattern":"(?s)^Hello from foo i=(.*)$","args":[{"Named":"i"}],"argKinds":["Any"],"vars":[],"varKinds":[],"kinds":["Any"],"segments":["Hello from foo i=",""]},"variables":[{"expr":"i","value":"1"}]}
-{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","blockId":618,"text":"\"Hello from foo i=\\{i}\"","level":"Debug","category":"Log","callName":"fine","quality":14,"pattern":"(?s)^Hello from foo i=(.*)$","args":[{"Named":"i"}],"argKinds":["Any"],"vars":[],"varKinds":[],"kinds":["Any"],"segments":["Hello from foo i=",""]},"variables":[{"expr":"i","value":"2"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","blockId":618,"text":"\"Hello from foo i=\\{i}\"","level":"Debug","category":"Log","callName":"fine","pattern":"(?s)^Hello from foo i=(.*)$"},"variables":[{"expr":"i","value":"1"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","blockId":618,"text":"\"Hello from foo i=\\{i}\"","level":"Debug","category":"Log","callName":"fine","pattern":"(?s)^Hello from foo i=(.*)$"},"variables":[{"expr":"i","value":"2"}]}
 
 ----- stderr -----

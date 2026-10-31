@@ -1,6 +1,6 @@
 ---
 source: src/lib.rs
-expression: src_refs
+expression: "sif.statements().collect::<Vec<_>>()"
 ---
 - sourcePath: in-mem.rs
   language: rust
@@ -14,15 +14,7 @@ expression: src_refs
   level: Debug
   category: Log
   callName: debug
-  quality: 30
   pattern: "(?s)^you're only as funky as your last cut$"
-  args: []
-  argKinds: []
-  vars: []
-  varKinds: []
-  kinds: []
-  segments:
-    - "you're only as funky as your last cut"
 - sourcePath: in-mem.rs
   language: rust
   lineNumber: 18
@@ -35,27 +27,7 @@ expression: src_refs
   level: Debug
   category: Log
   callName: "log::debug"
-  quality: 19
   pattern: "(?s)^this won't match i=(.*); j=(.*)$"
-  args:
-    - Placeholder
-    - Placeholder
-  argKinds:
-    - Any
-    - Any
-  vars:
-    - i
-    - j
-  varKinds:
-    - Any
-    - Any
-  kinds:
-    - Any
-    - Any
-  segments:
-    - "this won't match i="
-    - ; j=
-    - ""
 - sourcePath: in-mem.rs
   language: rust
   lineNumber: 22
@@ -68,23 +40,7 @@ expression: src_refs
   level: Debug
   category: Log
   callName: debug
-  quality: 2
   pattern: "(?s)^(.*), (.*)!$"
-  args:
-    - Named: salutation
-    - Named: name
-  argKinds:
-    - Any
-    - Any
-  vars: []
-  varKinds: []
-  kinds:
-    - Any
-    - Any
-  segments:
-    - ""
-    - ", "
-    - "!"
 - sourcePath: in-mem.rs
   language: rust
   lineNumber: 26
@@ -97,19 +53,7 @@ expression: src_refs
   level: Unknown
   category: Format
   callName: format
-  quality: 9
   pattern: "(?s)^Goodbye, (.*)!$"
-  args:
-    - Named: name
-  argKinds:
-    - Any
-  vars: []
-  varKinds: []
-  kinds:
-    - Any
-  segments:
-    - "Goodbye, "
-    - "!"
 - sourcePath: in-mem.rs
   language: rust
   lineNumber: 27
@@ -122,19 +66,7 @@ expression: src_refs
   level: Debug
   category: Log
   callName: debug
-  quality: 7
   pattern: "(?s)^Hello, (.*)!$"
-  args:
-    - Named: name
-  argKinds:
-    - Any
-  vars: []
-  varKinds: []
-  kinds:
-    - Any
-  segments:
-    - "Hello, "
-    - "!"
 - sourcePath: in-mem.rs
   language: rust
   lineNumber: 31
@@ -147,20 +79,4 @@ expression: src_refs
   level: Debug
   category: Log
   callName: debug
-  quality: 2
   pattern: "(?s)^(.*), (.*)!$"
-  args:
-    - Named: salutation
-    - Named: name
-  argKinds:
-    - Any
-    - Any
-  vars: []
-  varKinds: []
-  kinds:
-    - Any
-    - Any
-  segments:
-    - ""
-    - ", "
-    - "!"

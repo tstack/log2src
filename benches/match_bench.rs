@@ -4,7 +4,7 @@
 
 use log2src::{
     extract_variables, LogMatchOptions, LogMatcher, LogRef, LogRefBuilder, ProgressTracker,
-    SourceRef,
+    StatementRef,
 };
 use rayon::prelude::*;
 use regex::RegexSet;
@@ -75,7 +75,7 @@ fn literal_runs(pattern: &str) -> Option<(Vec<Vec<u8>>, bool, bool)> {
 }
 
 /// Report where the longest literal, which the prefilter keys on, sits in each pattern.
-fn literal_position_stats(stmts: &[&SourceRef]) {
+fn literal_position_stats(stmts: &[StatementRef]) {
     const LABELS: [&str; 6] = [
         "no placeholders",
         "1 run, at start",
@@ -99,7 +99,7 @@ fn literal_position_stats(stmts: &[&SourceRef]) {
             _ if runs[0].len() == longest => 4,
             _ => 5,
         };
-        by_lang.entry(stmt.language.as_str()).or_default()[bucket] += 1;
+        by_lang.entry(stmt.language().as_str()).or_default()[bucket] += 1;
     }
     let mut langs: Vec<_> = by_lang.into_iter().collect();
     langs.sort_by_key(|(_, c)| std::cmp::Reverse(c.iter().sum::<usize>()));
@@ -126,7 +126,7 @@ fn percentile(sorted: &[usize], pct: usize) -> usize {
 
 /// Mirror the prefilter's candidate selection, without the filename filter, and report how
 /// much work is left for the regexes.
-fn prefilter_stats(stmts: &[&SourceRef], label: &str, bodies: &[&str]) {
+fn prefilter_stats(stmts: &[StatementRef], label: &str, bodies: &[&str]) {
     let mut literals: Vec<Vec<u8>> = Vec::new();
     let mut lit_ids: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut by_literal: Vec<Vec<usize>> = Vec::new();
@@ -158,7 +158,7 @@ fn prefilter_stats(stmts: &[&SourceRef], label: &str, bodies: &[&str]) {
         for &hit in &hits {
             *hot_literals.entry(hit).or_default() += by_literal[hit].len();
         }
-        let mut cands: Vec<&SourceRef> = hits
+        let mut cands: Vec<StatementRef> = hits
             .iter()
             .flat_map(|&hit| by_literal[hit].iter())
             .chain(always.iter())
@@ -269,9 +269,9 @@ fn time<F: FnMut(&Line) -> MatchResult>(
     (start.elapsed() / rounds as u32, results)
 }
 
-fn key(src_ref: &SourceRef) -> (String, usize, usize) {
+fn stmt_key(src_ref: StatementRef) -> (String, usize, usize) {
     (
-        src_ref.source_path.clone(),
+        src_ref.source_path().to_string(),
         src_ref.line_no,
         src_ref.quality,
     )
@@ -279,17 +279,17 @@ fn key(src_ref: &SourceRef) -> (String, usize, usize) {
 
 /// The per-file RegexSet matching that the prefilter replaced, rebuilt here for comparison.
 struct OldMatcher<'a> {
-    files: Vec<(&'a str, RegexSet, Vec<&'a SourceRef>)>,
+    files: Vec<(&'a str, RegexSet, Vec<StatementRef<'a>>)>,
     by_name: HashMap<&'a str, Vec<usize>>,
     /// Files where the RegexSet failed to build, which made the old code panic when matching.
     failed: usize,
 }
 
 impl<'a> OldMatcher<'a> {
-    fn new(stmts: &[&'a SourceRef]) -> Self {
-        let mut grouped: HashMap<&'a str, Vec<&'a SourceRef>> = HashMap::new();
+    fn new(stmts: &[StatementRef<'a>]) -> Self {
+        let mut grouped: HashMap<&'a str, Vec<StatementRef<'a>>> = HashMap::new();
         for stmt in stmts {
-            grouped.entry(&stmt.source_path).or_default().push(stmt);
+            grouped.entry(stmt.source_path()).or_default().push(*stmt);
         }
         let mut files = Vec::new();
         let mut by_name: HashMap<&'a str, Vec<usize>> = HashMap::new();
@@ -313,14 +313,14 @@ impl<'a> OldMatcher<'a> {
         }
     }
 
-    fn first_match(&self, index: usize, body: &str) -> Option<&'a SourceRef> {
+    fn first_match(&self, index: usize, body: &str) -> Option<StatementRef<'a>> {
         let (_path, set, stmts) = &self.files[index];
         set.matches(body).iter().next().map(|i| stmts[i])
     }
 
-    fn match_log_statement(&self, log_ref: &LogRef) -> Option<&'a SourceRef> {
+    fn match_log_statement(&self, log_ref: &LogRef) -> Option<StatementRef<'a>> {
         let body = log_ref.body();
-        let matches: Vec<&SourceRef> = match log_ref.details.and_then(|d| d.file) {
+        let matches: Vec<StatementRef> = match log_ref.details.and_then(|d| d.file) {
             Some(filename) => match self.by_name.get(filename) {
                 Some(indexes) => indexes
                     .iter()
@@ -336,7 +336,7 @@ impl<'a> OldMatcher<'a> {
                 .flat_map(|i| self.first_match(i, body))
                 .collect(),
         };
-        let mut best: Option<&SourceRef> = None;
+        let mut best: Option<StatementRef> = None;
         for m in matches {
             if best.is_none_or(|b| m.quality > b.quality) {
                 best = Some(m);
@@ -344,7 +344,7 @@ impl<'a> OldMatcher<'a> {
         }
         // Do the same work as building the LogMapping in the real code.
         if let Some(src_ref) = best {
-            let _ = extract_variables(log_ref, src_ref);
+            let _ = extract_variables(log_ref, &src_ref);
         }
         best
     }
@@ -370,14 +370,14 @@ fn main() {
     matcher.rebuild_prefilters();
     println!("prefilter build alone: {:?}", start.elapsed());
 
-    let stmts: Vec<&SourceRef> = matcher.statements().collect();
+    let stmts: Vec<StatementRef> = matcher.statements().collect();
     if let Ok(path) = std::env::var("DUMP_STATEMENTS") {
         let mut out: Vec<String> = stmts
             .iter()
             .map(|s| {
                 format!(
                     "{}:{}\t{}",
-                    s.source_path,
+                    s.source_path(),
                     s.line_no,
                     s.text.replace('\n', " ")
                 )
@@ -393,7 +393,7 @@ fn main() {
             if stmt.pattern().is_match(&body) {
                 lines.push(Line {
                     body,
-                    file: Some(file_name(&stmt.source_path).to_string()),
+                    file: Some(file_name(stmt.source_path()).to_string()),
                 });
             }
         }
@@ -452,11 +452,11 @@ fn main() {
             let log_ref = build(line, with_file).build(&line.body);
             matcher
                 .match_log_statement(&log_ref, &LogMatchOptions::default())
-                .and_then(|m| m.src_ref.map(key))
+                .and_then(|m| m.src_ref.map(stmt_key))
         });
         let (old_elapsed, old_results) = time(&lines, rounds, |line| {
             let log_ref = build(line, with_file).build(&line.body);
-            old_matcher.match_log_statement(&log_ref).map(key)
+            old_matcher.match_log_statement(&log_ref).map(stmt_key)
         });
         println!(
             "{:>13}: {:>10.2?} total, {:>8.2?}/line, {} matched  [old RegexSet]",
@@ -518,7 +518,7 @@ fn main() {
         ("multi-word values", |n| format!("val {n} x")),
     ];
     for (label, value) in value_styles {
-        let pairs: Vec<(&SourceRef, String)> = stmts
+        let pairs: Vec<(StatementRef, String)> = stmts
             .iter()
             .filter(|stmt| stmt.pattern().captures_len() > 2)
             .filter_map(|stmt| Some((*stmt, synthesize_with(stmt.pattern().as_str(), value)?)))

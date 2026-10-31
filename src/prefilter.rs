@@ -33,7 +33,7 @@ impl Prefilter {
         for sif in files {
             for (index, stmt) in sif.statements().enumerate() {
                 let sid = (sif.id, index);
-                match longest_literal(stmt.pattern.as_str()) {
+                match longest_literal(&stmt.pattern_source()) {
                     Some(lit) => {
                         let lit_id = *literal_ids.entry(lit.clone()).or_insert_with(|| {
                             literals.push(lit);

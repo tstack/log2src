@@ -4,7 +4,7 @@ use colored_json::{ColoredFormatter, CompactFormatter, Styler};
 use indicatif::{ProgressBar, ProgressStyle};
 use log2src::{
     Cache, LogCall, LogError, LogFormat, LogLevel, LogMapping, LogMatchOptions, LogMatcher, LogRef,
-    LogRefBuilder, ProgressTracker, ProgressUpdate, Revision, SourceLanguage, SourceRef,
+    LogRefBuilder, ProgressTracker, ProgressUpdate, Revision, SourceLanguage, StatementRef,
 };
 use miette::{miette, IntoDiagnostic, MietteHandlerOpts, Report};
 use serde::Serialize;
@@ -546,7 +546,7 @@ fn run_match(cli: &Cli, args: &MatchArgs) -> miette::Result<()> {
 fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
     let log_matcher = load_log_matcher(cli, CacheMode::ReadWrite, true)?;
 
-    let mut statements: Vec<&SourceRef> = match &args.file {
+    let mut statements: Vec<StatementRef> = match &args.file {
         Some(path) => {
             let Some(found) = log_matcher.find_file(path) else {
                 return Err(miette!("cannot find source file \"{}\"", path.display()));
@@ -561,11 +561,11 @@ fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
     };
     statements.retain(|stmt| {
         (args.level.is_empty() || args.level.contains(&stmt.level))
-            && (args.lang.is_empty() || args.lang.contains(&stmt.language))
+            && (args.lang.is_empty() || args.lang.contains(&stmt.language()))
     });
     statements.sort_by(|lhs, rhs| {
-        (&lhs.source_path, lhs.line_no, lhs.column).cmp(&(
-            &rhs.source_path,
+        (lhs.source_path(), lhs.line_no, lhs.column).cmp(&(
+            rhs.source_path(),
             rhs.line_no,
             rhs.column,
         ))
@@ -575,15 +575,12 @@ fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
         let mut by_language: BTreeMap<&str, BTreeMap<String, usize>> = BTreeMap::new();
         for stmt in &statements {
             *by_language
-                .entry(stmt.language.as_str())
+                .entry(stmt.language().as_str())
                 .or_default()
                 .entry(format!("{:?}", stmt.level))
                 .or_default() += 1;
         }
-        let files: BTreeSet<&str> = statements
-            .iter()
-            .map(|stmt| stmt.source_path.as_str())
-            .collect();
+        let files: BTreeSet<&str> = statements.iter().map(|stmt| stmt.source_path()).collect();
         let summary = json!({
             "statements": statements.len(),
             "files": files.len(),
@@ -594,7 +591,7 @@ fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {
     }
 
     for stmt in statements {
-        if !print_json(stmt) {
+        if !print_json(&stmt) {
             break;
         }
     }

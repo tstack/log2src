@@ -616,6 +616,26 @@ pub(crate) enum SplitOrder {
     ShortestFirst,
 }
 
+/// The source of the message matcher, which has a greedy capture for every placeholder.  The
+/// exception is a placeholder followed only by whitespace, which was trimmed to a last segment of
+/// `\s*` by `build_matcher()`, whose capture is lazy so the value leaves out the whitespace.
+pub(crate) fn pattern_source(segments: &[String]) -> String {
+    let mut pattern = "(?s)^".to_string();
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            let last = index == segments.len() - 1;
+            pattern.push_str(if last && segment == "\\s*" {
+                "(.*?)"
+            } else {
+                ANY_CAPTURE
+            });
+        }
+        pattern.push_str(segment);
+    }
+    pattern.push('$');
+    pattern
+}
+
 /// Compile a matcher for the message that uses `capture` for every placeholder.
 pub(crate) fn compile_matcher(segments: &[String], capture: &str) -> Option<Regex> {
     Regex::new(&format!("(?s)^{}$", segments.join(capture))).ok()

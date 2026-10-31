@@ -4,6 +4,7 @@ use crate::{CodeSource, QueryResult, SourceLanguage};
 use core::fmt;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::str::Chars;
 use std::sync::OnceLock;
 
@@ -338,7 +339,7 @@ impl ArgCounter {
 /// order of the variants.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
 pub enum MessageCategory {
-    /// A logging call, whose level is in `SourceRef::level`.
+    /// A logging call, whose level is in `Statement::level`.
     Log,
     /// An error or panic message, like `bail!("...")`, `.context("...")`, thiserror's
     /// `#[error("...")]`, or `.expect("...")`.
@@ -369,14 +370,14 @@ impl MessageCategory {
     /// be logging, like `bail!` or `.context()`, has a category from its name, even if the name
     /// looks like it has a level, like `Err`.  Otherwise, a statement with a level is `Log`.
     /// Only Kotlin is not classified yet, so its statements are `Log`.
-    pub(crate) fn classify(src_ref: &SourceRef) -> MessageCategory {
-        if let Some(category) = Self::from_call(src_ref) {
+    pub(crate) fn classify(src_ref: &Statement, language: SourceLanguage) -> MessageCategory {
+        if let Some(category) = Self::from_call(src_ref, language) {
             return category;
         }
         if src_ref.level != LogLevel::Unknown {
             return MessageCategory::Log;
         }
-        match src_ref.language {
+        match language {
             SourceLanguage::Rust => match Self::short_call_name(src_ref) {
                 // a level that is not known until runtime, like `log!(lvl, "...")`
                 "log" | "event" => MessageCategory::Log,
@@ -395,9 +396,12 @@ impl MessageCategory {
 
     /// The category of a call that is known not to be logging, from its name and the function
     /// it is in.
-    pub(crate) fn from_call(src_ref: &SourceRef) -> Option<MessageCategory> {
+    pub(crate) fn from_call(
+        src_ref: &Statement,
+        language: SourceLanguage,
+    ) -> Option<MessageCategory> {
         let full_name = src_ref.call_name.as_deref().unwrap_or_default();
-        match src_ref.language {
+        match language {
             SourceLanguage::Rust => {}
             SourceLanguage::C | SourceLanguage::Cpp => return Self::from_c_call(full_name),
             SourceLanguage::Java | SourceLanguage::Python => {
@@ -504,7 +508,7 @@ impl MessageCategory {
 
     /// The last part of the name of the call, like `context` for `.context()` or `anyhow` for
     /// `anyhow::anyhow!`.
-    fn short_call_name(src_ref: &SourceRef) -> &str {
+    fn short_call_name(src_ref: &Statement) -> &str {
         let call_name = src_ref.call_name.as_deref().unwrap_or_default();
         call_name.rsplit(['.', ':']).next().unwrap_or(call_name)
     }
@@ -534,54 +538,44 @@ impl MessageCategory {
     }
 }
 
-// TODO: get rid of this clone?
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SourceRef {
-    #[serde(rename(serialize = "sourcePath"))]
-    pub source_path: String,
-    pub language: SourceLanguage,
-    #[serde(rename(serialize = "lineNumber"))]
+/// A log statement as it is stored in a `StatementsInFile`.  The things that are the same for
+/// every statement in a file, like the path and language, are kept in the file instead.  A
+/// `StatementRef` pairs a statement with its file.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Statement {
     pub line_no: usize,
-    #[serde(rename(serialize = "endLineNumber"))]
     pub end_line_no: usize,
     pub column: usize,
     pub name: String,
     /// The name of the enclosing function qualified by its containers, like namespaces,
     /// classes, and modules.
-    #[serde(rename(serialize = "qualifiedName"))]
     pub qualified_name: String,
     /// The start byte of the innermost lexical block containing the call.  Statements with the
-    /// same `source_path` and `block_id` are in the same block.
-    #[serde(rename(serialize = "blockId"))]
+    /// same source file and `block_id` are in the same block.
     pub block_id: u32,
     pub text: String,
     pub level: LogLevel,
     pub category: MessageCategory,
     /// The name of the logging function/macro/method that was called, as written in the source,
     /// like `ws_debug`, `logger.info`, or `syslog`.
-    #[serde(rename(serialize = "callName"))]
     pub call_name: Option<String>,
     pub quality: usize,
-    #[serde(with = "serde_regex")]
-    pub(crate) pattern: Regex,
-    /// The string form of `pattern`, kept for lnav.
-    #[serde(skip)]
-    pub pattern_str: String,
     pub(crate) args: Vec<FormatArgument>,
     /// The kind of value produced by the expression of each `FormatArgument::Named` in `args`.
-    #[serde(rename(serialize = "argKinds"))]
     pub(crate) arg_kinds: Vec<ValueKind>,
     pub(crate) vars: Vec<String>,
     /// The kind of value produced by each expression in `vars`.
-    #[serde(rename(serialize = "varKinds"))]
     pub(crate) var_kinds: Vec<ValueKind>,
     /// The kind of value expected for each placeholder based on its format spec.
     pub(crate) kinds: Vec<ValueKind>,
     /// The regexes in `pattern` for the literal text before, between, and after the
     /// placeholders.
     pub(crate) segments: Vec<String>,
-    /// `kinds` refined by the argument expressions.  This, and `segment_matchers`, are only
-    /// computed when needed since most statements are never matched.
+    /// The regex used to match log messages, built from `segments`.  This, and the rest of the
+    /// fields below, are only computed when needed since most statements are never matched.
+    #[serde(skip)]
+    pattern: OnceLock<Regex>,
+    /// `kinds` refined by the argument expressions.
     #[serde(skip)]
     value_kinds: OnceLock<Vec<ValueKind>>,
     #[serde(skip)]
@@ -602,8 +596,8 @@ struct MessageMatcher {
     segments: Vec<String>,
 }
 
-impl SourceRef {
-    pub(crate) fn new(code: &CodeSource, result: QueryResult) -> Option<SourceRef> {
+impl Statement {
+    pub(crate) fn new(code: &CodeSource, result: QueryResult) -> Option<Statement> {
         let range = result.range;
         let level = result.level();
         let call_name = result.call_name.clone();
@@ -638,9 +632,7 @@ impl SourceRef {
                 (args, arg_kinds) = result.args.into_iter().unzip();
                 arg_kinds
             };
-            let mut src_ref = SourceRef {
-                source_path: code.filename.clone(),
-                language: code.info.language,
+            let mut src_ref = Statement {
                 line_no,
                 end_line_no,
                 column: col,
@@ -652,8 +644,7 @@ impl SourceRef {
                 category: MessageCategory::Log,
                 call_name,
                 quality,
-                pattern_str: matcher.as_str().to_string(),
-                pattern: matcher,
+                pattern: OnceLock::from(matcher),
                 args,
                 arg_kinds,
                 vars: vec![],
@@ -667,7 +658,7 @@ impl SourceRef {
                 non_empty_matcher: OnceLock::new(),
             };
             // Redone by `prune_log_calls()`, which can change the level.
-            src_ref.category = MessageCategory::classify(&src_ref);
+            src_ref.category = MessageCategory::classify(&src_ref, code.info.language);
             if src_ref.category != MessageCategory::Log {
                 // Only log statements have a level, the name of an error call, like `Err`,
                 // does not mean anything.
@@ -681,11 +672,7 @@ impl SourceRef {
 
     /// Create a statement for a Java log call whose message is the given constant value.  The
     /// location is the call site, not where the constant is defined.
-    pub(crate) fn from_message_ref(
-        source_path: &str,
-        message_ref: &MessageRef,
-        value: &str,
-    ) -> Option<SourceRef> {
+    pub(crate) fn from_message_ref(message_ref: &MessageRef, value: &str) -> Option<Statement> {
         let MessageMatcher {
             matcher,
             args,
@@ -693,9 +680,7 @@ impl SourceRef {
             kinds,
             segments,
         } = build_matcher(false, value, SourceLanguage::Java)?;
-        Some(SourceRef {
-            source_path: source_path.to_string(),
-            language: SourceLanguage::Java,
+        Some(Statement {
             line_no: message_ref.line_no,
             end_line_no: message_ref.end_line_no,
             column: message_ref.column,
@@ -707,8 +692,7 @@ impl SourceRef {
             category: MessageCategory::Log,
             call_name: message_ref.call_name.clone(),
             quality,
-            pattern_str: matcher.as_str().to_string(),
-            pattern: matcher,
+            pattern: OnceLock::from(matcher),
             arg_kinds: vec![ValueKind::Any; args.len()],
             args,
             vars: message_ref.vars.clone(),
@@ -724,12 +708,26 @@ impl SourceRef {
     }
 
     pub fn captures<'a>(&self, line: &'a str) -> Option<Captures<'a>> {
-        self.pattern.captures(line)
+        self.pattern().captures(line)
     }
 
-    /// The regex used to match log messages to this statement.
+    /// The regex used to match log messages to this statement.  It is compiled the first time
+    /// it is needed, like after the statement is loaded from the cache.
     pub fn pattern(&self) -> &Regex {
-        &self.pattern
+        self.pattern.get_or_init(|| {
+            // The same pattern compiled when the statement was extracted, or it would have been
+            // skipped by `build_matcher()`.
+            Regex::new(&self.pattern_source()).expect("the pattern compiled before")
+        })
+    }
+
+    /// The source of `pattern()`, which does not need to compile it.  It is borrowed from the
+    /// regex if that was already compiled.
+    pub fn pattern_source(&self) -> Cow<'_, str> {
+        match self.pattern.get() {
+            Some(pattern) => Cow::Borrowed(pattern.as_str()),
+            None => Cow::Owned(value_kind::pattern_source(&self.segments)),
+        }
     }
 
     /// The argument expression for each placeholder and the kind of value it produces, in the
@@ -802,7 +800,7 @@ impl SourceRef {
     /// Check if `body` matches this statement with a non-empty value for every placeholder.
     pub(crate) fn matches_without_empty_values(&self, body: &str) -> bool {
         if self.kinds.is_empty() {
-            return self.pattern.is_match(body);
+            return self.pattern().is_match(body);
         }
         self.non_empty_matcher
             .get_or_init(|| value_kind::compile_matcher(&self.segments, "(.+)"))
@@ -811,7 +809,7 @@ impl SourceRef {
     }
 }
 
-impl fmt::Display for SourceRef {
+impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -821,7 +819,7 @@ impl fmt::Display for SourceRef {
     }
 }
 
-impl PartialEq for SourceRef {
+impl PartialEq for Statement {
     fn eq(&self, other: &Self) -> bool {
         self.line_no == other.line_no
             && self.column == other.column
@@ -895,6 +893,7 @@ fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<Mess
         }
         segments.push(pattern[last_group_end..].to_string());
         pattern.push('$');
+        debug_assert_eq!(pattern, value_kind::pattern_source(&segments));
         // A pattern that does not compile is not usable, so skip the log statement.
         Regex::new(pattern.as_str())
             .ok()

@@ -1,6 +1,6 @@
 ---
 source: src/lib.rs
-expression: src_refs
+expression: "sif.statements().collect::<Vec<_>>()"
 ---
 - sourcePath: Server.kt
   language: kotlin
@@ -14,27 +14,7 @@ expression: src_refs
   level: Info
   category: Log
   callName: info
-  quality: 18
   pattern: (?s)^Started (.*) with (.*) threads$
-  args:
-    - Placeholder
-    - Placeholder
-  argKinds:
-    - Any
-    - Any
-  vars:
-    - user.name
-    - count
-  varKinds:
-    - Any
-    - Any
-  kinds:
-    - Any
-    - Any
-  segments:
-    - "Started "
-    - " with "
-    - " threads"
 - sourcePath: Server.kt
   language: kotlin
   lineNumber: 6
@@ -47,23 +27,7 @@ expression: src_refs
   level: Info
   category: Log
   callName: info
-  quality: 21
   pattern: "(?s)^Hello (.*), you have (.*) messages$"
-  args:
-    - Named: user
-    - Named: user.messages.size
-  argKinds:
-    - Any
-    - Integer
-  vars: []
-  varKinds: []
-  kinds:
-    - Any
-    - Any
-  segments:
-    - "Hello "
-    - ", you have "
-    - " messages"
 - sourcePath: Server.kt
   language: kotlin
   lineNumber: 7
@@ -76,25 +40,7 @@ expression: src_refs
   level: Debug
   category: Log
   callName: debug
-  quality: 16
   pattern: "(?s)^Mixed (.*) and (.*) \\$5\\ttab$"
-  args:
-    - Placeholder
-    - Named: count
-  argKinds:
-    - Any
-    - Any
-  vars:
-    - user
-  varKinds:
-    - Any
-  kinds:
-    - Any
-    - Any
-  segments:
-    - "Mixed "
-    - " and "
-    - " \\$5\\ttab"
 - sourcePath: Server.kt
   language: kotlin
   lineNumber: 8
@@ -107,19 +53,7 @@ expression: src_refs
   level: Info
   category: Log
   callName: info
-  quality: 4
   pattern: (?s)^Lazy (.*)$
-  args:
-    - Named: user.id
-  argKinds:
-    - Any
-  vars: []
-  varKinds: []
-  kinds:
-    - Any
-  segments:
-    - "Lazy "
-    - ""
 - sourcePath: Server.kt
   language: kotlin
   lineNumber: 9
@@ -132,19 +66,7 @@ expression: src_refs
   level: Error
   category: Log
   callName: error
-  quality: 9
   pattern: (?s)^Failed for (.*)$
-  args:
-    - Named: user
-  argKinds:
-    - Any
-  vars: []
-  varKinds: []
-  kinds:
-    - Any
-  segments:
-    - "Failed for "
-    - ""
 - sourcePath: Server.kt
   language: kotlin
   lineNumber: 10
@@ -157,19 +79,7 @@ expression: src_refs
   level: Warn
   category: Log
   callName: warn
-  quality: 11
   pattern: (?s)^Concat (.*) items$
-  args:
-    - Named: count
-  argKinds:
-    - Any
-  vars: []
-  varKinds: []
-  kinds:
-    - Any
-  segments:
-    - "Concat "
-    - " items"
 - sourcePath: Server.kt
   language: kotlin
   lineNumber: 12
@@ -182,24 +92,4 @@ expression: src_refs
   level: Warn
   category: Log
   callName: warn
-  quality: 29
   pattern: "(?s)^Failed \\[count=(.*)\\] after (.*) sec, (.*) left$"
-  args:
-    - Named: user.messages.size
-    - Named: count / 1000.0
-    - Named: count
-  argKinds:
-    - Integer
-    - Any
-    - Any
-  vars: []
-  varKinds: []
-  kinds:
-    - Any
-    - Any
-    - Any
-  segments:
-    - "Failed \\[count="
-    - "\\] after "
-    - " sec, "
-    - " left"

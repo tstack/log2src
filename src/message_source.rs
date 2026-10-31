@@ -3,7 +3,9 @@
 //! error in `"Unable to read file: {}"`, so the values of the placeholders are looked up too.
 
 use crate::source_ref::regex_literal_pieces;
-use crate::{compare_candidates, first_match, MessageCategory, SourceRef, MIN_FALLBACK_QUALITY};
+use crate::{
+    compare_candidates, first_match, MessageCategory, Statement, StatementRef, MIN_FALLBACK_QUALITY,
+};
 use serde::Serialize;
 
 /// The statements that could have produced some text in a message.
@@ -13,7 +15,7 @@ pub struct MessageSource<'s> {
     pub text: String,
     /// The statements whose pattern matches all of the text, best first.  It is empty if none
     /// match, like for an error from a library or the operating system.
-    pub candidates: Vec<&'s SourceRef>,
+    pub candidates: Vec<StatementRef<'s>>,
     /// The sources of the values of the best candidate's placeholders, like the error in
     /// `"Unable to read file: {}"`.  Values that are too short to look up are left out.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -45,7 +47,7 @@ const MAX_FRAGMENT_CANDIDATES: usize = 10;
 /// with too little literal text, like `warn!("{}: {}", a, b)`, are not used, even log
 /// statements, since they would be the source of all sorts of messages.
 pub fn find_message_sources<'s>(
-    statements: impl IntoIterator<Item = &'s SourceRef>,
+    statements: impl IntoIterator<Item = StatementRef<'s>>,
     message: &str,
 ) -> Vec<MessageSource<'s>> {
     let finder = Finder {
@@ -83,7 +85,7 @@ pub fn find_message_sources<'s>(
 }
 
 struct Finder<'s> {
-    statements: Vec<&'s SourceRef>,
+    statements: Vec<StatementRef<'s>>,
 }
 
 impl<'s> Finder<'s> {
@@ -92,8 +94,8 @@ impl<'s> Finder<'s> {
     /// made somewhere else, so only the errors and formatted messages are used for those.  The
     /// statements are ordered, and the best one is chosen, the same way as when matching a log
     /// line, so the answer agrees with `LogMatcher::match_log_statement()`.
-    fn candidates(&self, text: &str, top: bool) -> Vec<&'s SourceRef> {
-        let mut retval: Vec<&SourceRef> = self
+    fn candidates(&self, text: &str, top: bool) -> Vec<StatementRef<'s>> {
+        let mut retval: Vec<StatementRef<'s>> = self
             .statements
             .iter()
             .copied()
@@ -103,14 +105,14 @@ impl<'s> Finder<'s> {
                     MessageCategory::Error | MessageCategory::Format
                 )
             })
-            .filter(|stmt| stmt.pattern.is_match(text))
+            .filter(|stmt| stmt.pattern().is_match(text))
             .collect();
         retval.sort_by(|lhs, rhs| compare_candidates(lhs, rhs, None, None));
         let best = first_match(
             retval.iter().copied().enumerate(),
             text,
             None,
-            |candidate: &(usize, &'s SourceRef)| candidate.1,
+            |candidate: &(usize, StatementRef<'s>)| candidate.1.stmt,
         );
         if let Some((index, _)) = best {
             let best = retval.remove(index);
@@ -183,7 +185,7 @@ impl<'s> Finder<'s> {
     /// message, like a fragment of one or one with extra text around it.  The whitespace in
     /// `text` should already be collapsed.
     fn fragment(&self, text: &str) -> Option<MessageSource<'s>> {
-        let mut scored: Vec<(usize, &'s SourceRef)> = self
+        let mut scored: Vec<(usize, StatementRef<'s>)> = self
             .statements
             .iter()
             .map(|stmt| (shared_literal_len(stmt, text), *stmt))
@@ -217,7 +219,7 @@ fn collapse_whitespace(text: &str) -> String {
 /// `"Unable to read file"`.  When the text is only part of the message, the text can also be
 /// in a literal part, or overlap the start or end of one, like `"read file: denied"` for
 /// `"Unable to read file: {}"`.
-fn shared_literal_len(stmt: &SourceRef, text: &str) -> usize {
+fn shared_literal_len(stmt: &Statement, text: &str) -> usize {
     let non_ws = |s: &str| s.chars().filter(|c| !c.is_whitespace()).count();
     let mut contained = 0;
     let mut overlap = 0;
