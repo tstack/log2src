@@ -4,45 +4,45 @@ expression: events
 ---
 - NewFile:
     - test_rust.rs
-    - language: Rust
+    - language: rust
       id: 10
 - NewFile:
     - test_kotlin.rs
-    - language: Rust
+    - language: rust
       id: 9
 - NewFile:
     - test_java.rs
-    - language: Rust
+    - language: rust
       id: 8
 - NewFile:
     - test_cli.rs
-    - language: Rust
+    - language: rust
       id: 7
 - NewFile:
     - Basic.kt
-    - language: Kotlin
+    - language: kotlin
       id: 6
 - NewFile:
     - BasicWithUpper.java
-    - language: Java
+    - language: java
       id: 5
 - NewFile:
     - BasicWithLog.java
-    - language: Java
+    - language: java
       id: 4
 - NewFile:
     - BasicWithCustom.java
-    - language: Java
+    - language: java
       id: 3
 - NewFile:
     - BasicSlf4j.java
-    - language: Java
+    - language: java
       id: 2
 - NewFile:
     - Basic.java
-    - language: Java
+    - language: java
       id: 1
 - NewFile:
     - mod.rs
-    - language: Rust
+    - language: rust
       id: 0

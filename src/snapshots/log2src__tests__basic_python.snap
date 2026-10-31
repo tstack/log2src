@@ -3,7 +3,7 @@ source: src/lib.rs
 expression: src_refs
 ---
 - sourcePath: in-mem.py
-  language: Python
+  language: python
   lineNumber: 3
   endLineNumber: 3
   column: 16
@@ -30,7 +30,7 @@ expression: src_refs
     - "foo "
     - " ."
 - sourcePath: in-mem.py
-  language: Python
+  language: python
   lineNumber: 4
   endLineNumber: 4
   column: 17
@@ -55,7 +55,7 @@ expression: src_refs
     - "Hello, "
     - "!"
 - sourcePath: in-mem.py
-  language: Python
+  language: python
   lineNumber: 5
   endLineNumber: 5
   column: 19
@@ -76,7 +76,7 @@ expression: src_refs
   segments:
     - "warning message:\\nlow disk space"
 - sourcePath: in-mem.py
-  language: Python
+  language: python
   lineNumber: 6
   endLineNumber: 7
   column: 16

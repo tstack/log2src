@@ -3,6 +3,7 @@ source: tests/test_java.rs
 info:
   program: log2src
   args:
+    - match
     - "-d"
     - tests/java/Basic.java
     - "-l"
@@ -14,17 +15,17 @@ info:
     - "-c"
     - "2"
   env:
-    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpZfT05c
+    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpakwyaw
     COLS: "1000"
-    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpZfT05c
-    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpZfT05c
-    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpZfT05c
-    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpZfT05c
+    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpakwyaw
+    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpakwyaw
+    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpakwyaw
+    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpakwyaw
 ---
 success: true
 exit_code: 0
 ----- stdout -----
-{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"Java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","blockId":618,"text":"\"Hello from foo i=\\{i}\"","level":"Debug","category":"Log","callName":"fine","quality":14,"pattern":"(?s)^Hello from foo i=(.*)$","args":[{"Named":"i"}],"argKinds":["Any"],"vars":[],"varKinds":[],"kinds":["Any"],"segments":["Hello from foo i=",""]},"variables":[{"expr":"i","value":"0"}]}
-{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"Java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","blockId":618,"text":"\"Hello from foo i=\\{i}\"","level":"Debug","category":"Log","callName":"fine","quality":14,"pattern":"(?s)^Hello from foo i=(.*)$","args":[{"Named":"i"}],"argKinds":["Any"],"vars":[],"varKinds":[],"kinds":["Any"],"segments":["Hello from foo i=",""]},"variables":[{"expr":"i","value":"1"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","blockId":618,"text":"\"Hello from foo i=\\{i}\"","level":"Debug","category":"Log","callName":"fine","quality":14,"pattern":"(?s)^Hello from foo i=(.*)$","args":[{"Named":"i"}],"argKinds":["Any"],"vars":[],"varKinds":[],"kinds":["Any"],"segments":["Hello from foo i=",""]},"variables":[{"expr":"i","value":"0"}]}
+{"logRef":{},"srcRef":{"sourcePath":"{java_dir}/Basic.java","language":"java","lineNumber":25,"endLineNumber":25,"column":20,"name":"foo","qualifiedName":"Basic.foo","blockId":618,"text":"\"Hello from foo i=\\{i}\"","level":"Debug","category":"Log","callName":"fine","quality":14,"pattern":"(?s)^Hello from foo i=(.*)$","args":[{"Named":"i"}],"argKinds":["Any"],"vars":[],"varKinds":[],"kinds":["Any"],"segments":["Hello from foo i=",""]},"variables":[{"expr":"i","value":"1"}]}
 
 ----- stderr -----

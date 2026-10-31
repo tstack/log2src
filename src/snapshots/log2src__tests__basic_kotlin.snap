@@ -3,7 +3,7 @@ source: src/lib.rs
 expression: src_refs
 ---
 - sourcePath: Server.kt
-  language: Kotlin
+  language: kotlin
   lineNumber: 5
   endLineNumber: 5
   column: 20
@@ -36,7 +36,7 @@ expression: src_refs
     - " with "
     - " threads"
 - sourcePath: Server.kt
-  language: Kotlin
+  language: kotlin
   lineNumber: 6
   endLineNumber: 6
   column: 20
@@ -65,7 +65,7 @@ expression: src_refs
     - ", you have "
     - " messages"
 - sourcePath: Server.kt
-  language: Kotlin
+  language: kotlin
   lineNumber: 7
   endLineNumber: 7
   column: 21
@@ -96,7 +96,7 @@ expression: src_refs
     - " and "
     - " \\$5\\ttab"
 - sourcePath: Server.kt
-  language: Kotlin
+  language: kotlin
   lineNumber: 8
   endLineNumber: 8
   column: 22
@@ -121,7 +121,7 @@ expression: src_refs
     - "Lazy "
     - ""
 - sourcePath: Server.kt
-  language: Kotlin
+  language: kotlin
   lineNumber: 9
   endLineNumber: 9
   column: 26
@@ -146,7 +146,7 @@ expression: src_refs
     - "Failed for "
     - ""
 - sourcePath: Server.kt
-  language: Kotlin
+  language: kotlin
   lineNumber: 10
   endLineNumber: 10
   column: 20
@@ -171,7 +171,7 @@ expression: src_refs
     - "Concat "
     - " items"
 - sourcePath: Server.kt
-  language: Kotlin
+  language: kotlin
   lineNumber: 12
   endLineNumber: 13
   column: 12

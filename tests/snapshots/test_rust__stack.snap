@@ -3,6 +3,7 @@ source: tests/test_rust.rs
 info:
   program: log2src
   args:
+    - match
     - "-d"
     - examples/stack.rs
     - "-l"
@@ -12,16 +13,16 @@ info:
     - "-s"
     - "1"
   env:
-    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmptQdPjv
+    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpwQNDXA
     COLS: "1000"
-    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmptQdPjv
-    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmptQdPjv
-    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmptQdPjv
-    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmptQdPjv
+    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpwQNDXA
+    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpwQNDXA
+    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpwQNDXA
+    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpwQNDXA
 ---
 success: true
 exit_code: 0
 ----- stdout -----
-{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/stack.rs","language":"Rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"b","qualifiedName":"b","blockId":139,"text":"\"Hello from b\"","level":"Debug","category":"Log","callName":"debug","quality":10,"pattern":"(?s)^Hello from b$","args":[],"argKinds":[],"vars":[],"varKinds":[],"kinds":[],"segments":["Hello from b"]},"variables":[]}
+{"logRef":{},"srcRef":{"sourcePath":"{example_dir}/stack.rs","language":"rust","lineNumber":15,"endLineNumber":15,"column":11,"name":"b","qualifiedName":"b","blockId":139,"text":"\"Hello from b\"","level":"Debug","category":"Log","callName":"debug","quality":10,"pattern":"(?s)^Hello from b$","args":[],"argKinds":[],"vars":[],"varKinds":[],"kinds":[],"segments":["Hello from b"]},"variables":[]}
 
 ----- stderr -----

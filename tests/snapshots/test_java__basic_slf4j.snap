@@ -3,6 +3,7 @@ source: tests/test_java.rs
 info:
   program: log2src
   args:
+    - match
     - "-d"
     - tests/java/BasicSlf4j.java
     - "-l"
@@ -10,17 +11,17 @@ info:
     - "-f"
     - "^(?<timestamp>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}) (?<thread>\\d+) (?<body>.*)$"
   env:
-    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpdvhmvP
+    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpUJIUe9
     COLS: "1000"
-    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpdvhmvP
-    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpdvhmvP
-    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpdvhmvP
-    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpdvhmvP
+    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpUJIUe9
+    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpUJIUe9
+    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpUJIUe9
+    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpUJIUe9
 ---
 success: true
 exit_code: 0
 ----- stdout -----
-{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{java_dir}/BasicSlf4j.java","language":"Java","lineNumber":10,"endLineNumber":10,"column":20,"name":"main","qualifiedName":"org.example.Main.main","blockId":250,"text":"\"Application starting\"","level":"Info","category":"Log","callName":"info","quality":19,"pattern":"(?s)^Application starting$","args":[],"argKinds":[],"vars":[],"varKinds":[],"kinds":[],"segments":["Application starting"]},"variables":[]}
-{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{java_dir}/BasicSlf4j.java","language":"Java","lineNumber":12,"endLineNumber":13,"column":21,"name":"main","qualifiedName":"org.example.Main.main","blockId":250,"text":"\"Debug message: args length = {}\"","level":"Debug","category":"Log","callName":"debug","quality":24,"pattern":"(?s)^Debug message: args length = (.*)$","args":["Placeholder"],"argKinds":["Any"],"vars":["args.length"],"varKinds":["Integer"],"kinds":["Any"],"segments":["Debug message: args length = ",""]},"variables":[{"expr":"args.length","value":"0"}]}
+{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{java_dir}/BasicSlf4j.java","language":"java","lineNumber":10,"endLineNumber":10,"column":20,"name":"main","qualifiedName":"org.example.Main.main","blockId":250,"text":"\"Application starting\"","level":"Info","category":"Log","callName":"info","quality":19,"pattern":"(?s)^Application starting$","args":[],"argKinds":[],"vars":[],"varKinds":[],"kinds":[],"segments":["Application starting"]},"variables":[]}
+{"logRef":{"details":{"thread":"123"}},"srcRef":{"sourcePath":"{java_dir}/BasicSlf4j.java","language":"java","lineNumber":12,"endLineNumber":13,"column":21,"name":"main","qualifiedName":"org.example.Main.main","blockId":250,"text":"\"Debug message: args length = {}\"","level":"Debug","category":"Log","callName":"debug","quality":24,"pattern":"(?s)^Debug message: args length = (.*)$","args":["Placeholder"],"argKinds":["Any"],"vars":["args.length"],"varKinds":["Integer"],"kinds":["Any"],"segments":["Debug message: args length = ",""]},"variables":[{"expr":"args.length","value":"0"}]}
 
 ----- stderr -----

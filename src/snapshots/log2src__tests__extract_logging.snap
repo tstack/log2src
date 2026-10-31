@@ -3,7 +3,7 @@ source: src/lib.rs
 expression: src_refs
 ---
 - sourcePath: in-mem.rs
-  language: Rust
+  language: rust
   lineNumber: 7
   endLineNumber: 7
   column: 11
@@ -24,7 +24,7 @@ expression: src_refs
   segments:
     - "you're only as funky as your last cut"
 - sourcePath: in-mem.rs
-  language: Rust
+  language: rust
   lineNumber: 18
   endLineNumber: 18
   column: 16
@@ -57,7 +57,7 @@ expression: src_refs
     - ; j=
     - ""
 - sourcePath: in-mem.rs
-  language: Rust
+  language: rust
   lineNumber: 22
   endLineNumber: 22
   column: 11
@@ -86,7 +86,7 @@ expression: src_refs
     - ", "
     - "!"
 - sourcePath: in-mem.rs
-  language: Rust
+  language: rust
   lineNumber: 26
   endLineNumber: 26
   column: 22
@@ -111,7 +111,7 @@ expression: src_refs
     - "Goodbye, "
     - "!"
 - sourcePath: in-mem.rs
-  language: Rust
+  language: rust
   lineNumber: 27
   endLineNumber: 27
   column: 11
@@ -136,7 +136,7 @@ expression: src_refs
     - "Hello, "
     - "!"
 - sourcePath: in-mem.rs
-  language: Rust
+  language: rust
   lineNumber: 31
   endLineNumber: 31
   column: 11

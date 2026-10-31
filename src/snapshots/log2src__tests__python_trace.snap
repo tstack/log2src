@@ -4,9 +4,9 @@ expression: trace
 ---
 - name: main
   sourcePath: python-logging-example/python_logging_example/__main__.py
-  language: Python
+  language: python
   lineNumber: 26
 - name: fail_now
   sourcePath: python-logging-example/python_logging_example/helper.py
-  language: Python
+  language: python
   lineNumber: 3

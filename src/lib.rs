@@ -1111,12 +1111,14 @@ impl LogMatcher {
     }
 }
 
+/// Named by their LSP language identifiers ("rust", "java", "cpp", ...) in the JSON output,
+/// on the command line, and by [SourceLanguage::as_str].
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub enum SourceLanguage {
     Rust,
     Java,
     C,
-    #[serde(rename = "C++")]
     #[value(alias = "c++")]
     Cpp,
     Python,
@@ -1397,14 +1399,15 @@ impl SourceLanguage {
         matches!(self, SourceLanguage::C | SourceLanguage::Cpp)
     }
 
+    /// The LSP language identifier.
     pub fn as_str(&self) -> &'static str {
         match self {
-            SourceLanguage::Rust => "Rust",
-            SourceLanguage::Java => "Java",
-            SourceLanguage::C => "C",
-            SourceLanguage::Cpp => "C++",
-            SourceLanguage::Python => "Python",
-            SourceLanguage::Kotlin => "Kotlin",
+            SourceLanguage::Rust => "rust",
+            SourceLanguage::Java => "java",
+            SourceLanguage::C => "c",
+            SourceLanguage::Cpp => "cpp",
+            SourceLanguage::Python => "python",
+            SourceLanguage::Kotlin => "kotlin",
         }
     }
 
@@ -2172,6 +2175,20 @@ mod tests {
     fn from_log_format_and_line<'a>(buffer: &'a str, log_format: LogFormat) -> LogRef<'a> {
         let captures = log_format.captures(buffer).unwrap();
         LogRefBuilder::new().build_from_captures(captures, buffer)
+    }
+
+    #[test]
+    fn test_source_language_names_are_lsp_ids() {
+        use clap::ValueEnum;
+        let expected = ["rust", "java", "c", "cpp", "python", "kotlin"];
+        let langs = SourceLanguage::value_variants();
+        assert_eq!(langs.len(), expected.len());
+        for (lang, name) in langs.iter().zip(expected) {
+            assert_eq!(lang.as_str(), name);
+            assert_eq!(serde_json::to_string(lang).unwrap(), format!("\"{name}\""));
+            assert_eq!(SourceLanguage::from_str(name, false), Ok(*lang));
+        }
+        assert_eq!(SourceLanguage::from_str("c++", false), Ok(SourceLanguage::Cpp));
     }
 
     #[test]

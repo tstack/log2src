@@ -10,9 +10,9 @@ expression: new_and_updated_events
     - 8
 - NewFile:
     - Basic.java
-    - language: Java
+    - language: java
       id: 11
 - NewFile:
     - new.rs
-    - language: Rust
+    - language: rust
       id: 12
