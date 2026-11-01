@@ -57,31 +57,94 @@ pub fn find_message_sources<'s>(
             .collect(),
     };
     let message = message.trim();
-    let sources = finder.resolve(message, 0, true).1;
-    if !sources.is_empty() {
-        return sources;
-    }
-    // Text copied from a GUI is often wrapped differently than the message.
     let collapsed = collapse_whitespace(message);
-    if collapsed != message {
-        let sources = finder.resolve(&collapsed, 0, true).1;
-        if !sources.is_empty() {
-            return sources;
-        }
-    }
-    // A message with some text in front of it, like `"Error: "` added by a dialog.
-    let mut best = (0, vec![]);
-    for (pos, sep) in collapsed.match_indices(": ") {
-        let (score, mut sources) = finder.resolve(&collapsed[pos + sep.len()..], 0, true);
-        if score > best.0 {
-            sources.insert(0, MessageSource::unknown(&collapsed[..pos]));
-            best = (score, sources);
-        }
-    }
+    let best = finder.prefixed_resolve(message, &collapsed);
     if !best.1.is_empty() {
         return best.1;
     }
     finder.fragment(&collapsed).into_iter().collect()
+}
+
+/// The statement that produced the most of a log message, when that is not all of it.  This
+/// uses the same readings as [`find_message_sources`], like a prefix that is not from any
+/// statement or a chain of messages, like `"outer: inner"`, so a log line can be matched when a
+/// generic statement, like `"%s: %s"`, is the only one that matches all of it.  The statement
+/// is the first one in the reading, which is the outermost one for a chain, since the others
+/// made the values in it.  A reading of the whole message is left to the caller, which has
+/// better evidence for choosing between the statements that match all of it, like the line
+/// number in the log message.  Fragments are not used, since a statement that only shares some
+/// text with the line is usually not where it came from.  The whitespace is not collapsed
+/// either, since a log line has the same whitespace as the message.
+pub(crate) fn best_log_source<'s>(
+    statements: impl IntoIterator<Item = StatementRef<'s>>,
+    body: &str,
+) -> Option<LogSource<'s>> {
+    let finder = Finder {
+        statements: statements
+            .into_iter()
+            .filter(|stmt| stmt.quality >= MIN_FALLBACK_QUALITY)
+            .collect(),
+    };
+    let body = body.trim();
+    let (score, sources) = finder.prefixed_resolve(body, body);
+    if let [only] = sources.as_slice() {
+        if only.text == body {
+            return None;
+        }
+    }
+    // A prefix that is not from any statement is only ever the first in the reading.
+    let prefix = sources
+        .first()
+        .filter(|source| source.candidates.is_empty())
+        .map(|source| source.text.clone());
+    sources.into_iter().find_map(|source| {
+        let MessageSource {
+            text, candidates, ..
+        } = source;
+        candidates.into_iter().next().map(|stmt| LogSource {
+            score,
+            stmt,
+            text,
+            prefix: prefix.clone(),
+        })
+    })
+}
+
+/// The statement that produced the most of a log message, from [`best_log_source`].
+pub(crate) struct LogSource<'s> {
+    /// The amount of literal text explained by the reading of the message.
+    pub score: usize,
+    /// The statement.
+    pub stmt: StatementRef<'s>,
+    /// The part of the message that the statement produced.
+    pub text: String,
+    /// The text at the start of the message that no statement produced, if any.
+    pub prefix: Option<String>,
+}
+
+impl<'s> Finder<'s> {
+    /// Find the sources of a whole message, which could have some text in front of it that is
+    /// not from any statement, like `"Error: "` added by a dialog or the device name that the
+    /// Linux kernel's `dev_info()` adds.  The readings with and without the text in front are
+    /// compared by the amount of literal text they explain, so a generic statement that matches
+    /// all of the message, like `"%s [%s]"`, does not hide a better one for the rest of it.  The
+    /// whole message wins a tie, like a wrapper whose value is explained too.  `collapsed` is the
+    /// message with its whitespace collapsed, which is tried when the message is not found as is,
+    /// since text copied from a GUI is often wrapped differently than the message.
+    fn prefixed_resolve(&self, message: &str, collapsed: &str) -> (usize, Vec<MessageSource<'s>>) {
+        let mut best = self.resolve(message, 0, true);
+        if best.1.is_empty() && collapsed != message {
+            best = self.resolve(collapsed, 0, true);
+        }
+        for (pos, sep) in collapsed.match_indices(": ") {
+            let (score, mut sources) = self.resolve(&collapsed[pos + sep.len()..], 0, true);
+            if !sources.is_empty() && score > best.0 {
+                sources.insert(0, MessageSource::unknown(&collapsed[..pos]));
+                best = (score, sources);
+            }
+        }
+        best
+    }
 }
 
 struct Finder<'s> {
@@ -210,7 +273,7 @@ impl<'s> Finder<'s> {
 }
 
 /// Replace each run of whitespace with a single space and trim the ends.
-fn collapse_whitespace(text: &str) -> String {
+pub(crate) fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

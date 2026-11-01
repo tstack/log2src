@@ -1,6 +1,7 @@
 use crate::source_hier::SourceFileID;
 use crate::StatementsInFile;
 use aho_corasick::{AhoCorasick, MatchKind};
+use rayon::prelude::*;
 use regex_syntax::hir::{Hir, HirKind};
 use std::collections::HashMap;
 
@@ -13,12 +14,17 @@ pub(crate) type StatementID = (SourceFileID, usize);
 /// The patterns generated for log statements are mostly literal text with `(.*)` in place of
 /// the format placeholders.  So, we pick the longest literal run out of each pattern and put
 /// them all into a single Aho-Corasick automaton.  A log message is then scanned once to find
-/// the candidate statements, and only those have their full regex evaluated.
+/// the candidate statements, and only those have their full regex evaluated.  The literals that
+/// are a single byte, like the `=` in `"%s=%d"`, are looked up by byte instead, since an
+/// automaton that reports overlapping matches copies them into nearly every one of its states,
+/// which made building it for the Linux kernel take 15 seconds instead of one.
 #[derive(Debug)]
 pub(crate) struct Prefilter {
     ac: AhoCorasick,
     /// Indexed by Aho-Corasick pattern ID, the statements whose key literal is that pattern.
     by_literal: Vec<Vec<StatementID>>,
+    /// Indexed by byte, the statements whose key literal is that single byte.
+    by_byte: Vec<Vec<StatementID>>,
     /// Statements that did not have a usable literal and must always be checked.
     always: Vec<StatementID>,
 }
@@ -28,22 +34,32 @@ impl Prefilter {
         let mut literal_ids: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut literals: Vec<Vec<u8>> = Vec::new();
         let mut by_literal: Vec<Vec<StatementID>> = Vec::new();
+        let mut by_byte: Vec<Vec<StatementID>> = vec![Vec::new(); 256];
         let mut always = Vec::new();
 
-        for sif in files {
-            for (index, stmt) in sif.statements().enumerate() {
-                let sid = (sif.id, index);
-                match longest_literal(&stmt.pattern_source()) {
-                    Some(lit) => {
-                        let lit_id = *literal_ids.entry(lit.clone()).or_insert_with(|| {
-                            literals.push(lit);
-                            by_literal.push(Vec::new());
-                            literals.len() - 1
-                        });
-                        by_literal[lit_id].push(sid);
-                    }
-                    None => always.push(sid),
+        // Parsing the patterns is most of the work for a big tree, so it is done in parallel.
+        let keyed: Vec<(StatementID, Option<Vec<u8>>)> = files
+            .flat_map(|sif| {
+                sif.matchable_statements()
+                    .enumerate()
+                    .map(move |(index, stmt)| ((sif.id, index), stmt))
+            })
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(sid, stmt)| (sid, longest_literal(&stmt.pattern_source())))
+            .collect();
+        for (sid, lit) in keyed {
+            match lit {
+                Some(lit) if lit.len() == 1 => by_byte[usize::from(lit[0])].push(sid),
+                Some(lit) => {
+                    let lit_id = *literal_ids.entry(lit.clone()).or_insert_with(|| {
+                        literals.push(lit);
+                        by_literal.push(Vec::new());
+                        literals.len() - 1
+                    });
+                    by_literal[lit_id].push(sid);
                 }
+                None => always.push(sid),
             }
         }
 
@@ -54,6 +70,7 @@ impl Prefilter {
         Self {
             ac,
             by_literal,
+            by_byte,
             always,
         }
     }
@@ -69,6 +86,13 @@ impl Prefilter {
         hits.dedup();
         for lit_id in hits {
             self.by_literal[lit_id].iter().copied().for_each(&mut f);
+        }
+        let mut seen = [false; 256];
+        for byte in text.bytes() {
+            let byte = usize::from(byte);
+            if !std::mem::replace(&mut seen[byte], true) {
+                self.by_byte[byte].iter().copied().for_each(&mut f);
+            }
         }
         self.always.iter().copied().for_each(f);
     }

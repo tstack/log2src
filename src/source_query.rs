@@ -1,11 +1,13 @@
 use std::borrow::Cow;
+use std::ops::Range;
 use std::path::Path;
 use tree_sitter::{
-    Language, Node, Parser, Point, Query, QueryCursor, Range as TSRange, StreamingIterator, Tree,
+    InputEdit, Node, Parser, Point, Query, QueryCursor, Range as TSRange, StreamingIterator, Tree,
 };
 
 use crate::source_ref::{ArgCounter, FormatArgument, LogLevel, MessageCategory, Substitution};
-use crate::value_kind::ValueKind;
+use crate::value_kind::{self, ValueKind};
+use crate::wrappers::MacroWrapper;
 use crate::{CodeSource, SourceLanguage};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -14,7 +16,6 @@ pub struct SourceQuery<'a> {
     pub source: &'a str,
     filename: &'a str,
     tree: Tree,
-    language: Language,
     source_language: SourceLanguage,
 }
 
@@ -32,12 +33,18 @@ pub(crate) struct QueryResult {
     pub raw: bool,
     /// For an argument of the log call, the kind of value it produces.
     pub value_kind: ValueKind,
+    /// For an argument of the log call, the regexes for the only values it can produce.  See
+    /// `value_kind::value_choices()`.
+    pub value_choices: Vec<String>,
     /// The text of the last capture before the format string, which is the name of the logging
     /// function/macro/method being called (e.g. `log::warn`, `logger.info`).
     pub call_name: Option<String>,
     /// The text of the arguments before the format string, which might include the log level,
     /// as in `syslog(LOG_ERR, "...")`.
     pub leading_args: Vec<String>,
+    /// For a C or C++ message, the position of the argument that holds it in the call, like 1
+    /// for the `"Product"` in `show_string(udev, "Product", udev->product)`.
+    pub arg_position: Option<usize>,
 }
 
 impl QueryResult {
@@ -55,6 +62,21 @@ impl QueryResult {
             .iter()
             .find_map(|arg| LogLevel::from_level_arg(arg))
     }
+}
+
+/// Move `point`, which is the row and byte column of `offset` in `text`, forward to `target`
+/// and return it.
+fn advance_point(text: &str, point: &mut Point, offset: &mut usize, target: usize) -> Point {
+    let between = &text.as_bytes()[*offset..target];
+    match between.iter().rposition(|&b| b == b'\n') {
+        Some(last_newline) => {
+            point.row += between.iter().filter(|&&b| b == b'\n').count();
+            point.column = between.len() - last_newline - 1;
+        }
+        None => point.column += between.len(),
+    }
+    *offset = target;
+    *point
 }
 
 impl<'a> SourceQuery<'a> {
@@ -84,9 +106,28 @@ impl<'a> SourceQuery<'a> {
         if code.info.language.is_c_family() && tree.root_node().has_error() {
             // Masking the conditionals can also break code that parses fine as-is, like
             // alternate function signatures in each branch, so it is only a fallback.
-            if let Some(masked_source) = Self::mask_preproc_conditionals(&parsed, &tree) {
+            if let Some((masked_source, masked_ranges)) =
+                Self::mask_preproc_conditionals(&parsed, &tree)
+            {
+                // The masking keeps the byte offsets and lines the same, so the tree can be
+                // reparsed incrementally, which only redoes the parts near the directives.
+                let mut old_tree = tree.clone();
+                let mut point = Point::new(0, 0);
+                let mut point_offset = 0;
+                for range in masked_ranges {
+                    let start = advance_point(&parsed, &mut point, &mut point_offset, range.start);
+                    let end = advance_point(&parsed, &mut point, &mut point_offset, range.end);
+                    old_tree.edit(&InputEdit {
+                        start_byte: range.start,
+                        old_end_byte: range.end,
+                        new_end_byte: range.end,
+                        start_position: start,
+                        old_end_position: end,
+                        new_end_position: end,
+                    });
+                }
                 let masked = parser
-                    .parse(masked_source, None)
+                    .parse(masked_source, Some(&old_tree))
                     .expect("source is parsable");
                 if Self::error_count(&masked) < Self::error_count(&tree) {
                     tree = masked;
@@ -97,7 +138,6 @@ impl<'a> SourceQuery<'a> {
             source,
             filename: code.filename.as_str(),
             tree,
-            language,
             source_language: code.info.language,
         }
     }
@@ -109,14 +149,14 @@ impl<'a> SourceQuery<'a> {
     /// replaced with spaces so that byte offsets and line numbers still match the original
     /// source.  Directive-like text in comments and string literals, according to the original
     /// `tree`, is left alone.  Returns None if there was nothing to mask.
-    fn mask_preproc_conditionals(source: &str, tree: &Tree) -> Option<String> {
+    fn mask_preproc_conditionals(source: &str, tree: &Tree) -> Option<(String, Vec<Range<usize>>)> {
         static CONDITIONAL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(
                 r"(?m)^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b(?:[^\n]*\\\r?\n)*[^\n]*",
             )
             .unwrap()
         });
-        let mut masked_any = false;
+        let mut masked = vec![];
         let retval = CONDITIONAL_REGEX.replace_all(source, |caps: &regex::Captures| {
             let whole = caps.get(0).unwrap();
             let hash_pos = whole.start() + whole.as_str().find('#').unwrap();
@@ -136,7 +176,7 @@ impl<'a> SourceQuery<'a> {
             if in_literal {
                 return whole.as_str().to_string();
             }
-            masked_any = true;
+            masked.push(whole.range());
             // Map by byte so that multibyte characters in a trailing comment keep the
             // same length.
             caps[0]
@@ -150,7 +190,7 @@ impl<'a> SourceQuery<'a> {
                 })
                 .collect::<String>()
         });
-        masked_any.then(|| retval.into_owned())
+        (!masked.is_empty()).then(|| (retval.into_owned(), masked))
     }
 
     /// Replace the parentheses of macro calls that wrap a string-literal and are concatenated
@@ -320,12 +360,11 @@ impl<'a> SourceQuery<'a> {
         }
     }
 
-    pub(crate) fn query(&self, query: &str, node_kind: Option<&str>) -> Vec<QueryResult> {
-        let query = Query::new(&self.language, query).unwrap();
+    pub(crate) fn query(&self, query: &Query, node_kind: Option<&str>) -> Vec<QueryResult> {
         let filter_idx = node_kind.and_then(|kind| query.capture_index_for_name(kind));
         let mut cursor = QueryCursor::new();
         let mut results = Vec::new();
-        let matches = cursor.matches(&query, self.tree.root_node(), self.source.as_bytes());
+        let matches = cursor.matches(query, self.tree.root_node(), self.source.as_bytes());
         matches.for_each(|m| {
             let mut got_string_literal = false;
             let mut call_name: Option<String> = None;
@@ -587,10 +626,12 @@ impl<'a> SourceQuery<'a> {
                         args: std::mem::take(&mut concat_args),
                         raw,
                         value_kind: ValueKind::Any,
+                        value_choices: vec![],
                         call_name: call_name.clone(),
                         leading_args: leading_args
                             .take()
                             .unwrap_or_else(|| self.leading_args(outer)),
+                        arg_position: self.arg_position(outer),
                     });
                     if let Some(anchor) = args_anchor {
                         child = anchor;
@@ -626,6 +667,14 @@ impl<'a> SourceQuery<'a> {
                                 (_, [node]) => self.value_kind(*node),
                                 _ => ValueKind::Any,
                             };
+                            let value_choices = match &arg_nodes[..] {
+                                [node] => value_kind::value_choices(
+                                    self.source_language,
+                                    *node,
+                                    self.source,
+                                ),
+                                _ => vec![],
+                            };
                             arg_nodes.clear();
                             if let Some(start) = arg_start {
                                 if start.0 < next_child.start_byte() {
@@ -644,8 +693,10 @@ impl<'a> SourceQuery<'a> {
                                         args: vec![],
                                         raw: false,
                                         value_kind,
+                                        value_choices,
                                         call_name: None,
                                         leading_args: vec![],
+                                        arg_position: None,
                                     });
                                 }
                             }
@@ -1606,6 +1657,35 @@ impl<'a> SourceQuery<'a> {
 
     /// Collect the arguments before the format string that might be a log level, like the
     /// `LOG_ERR` in `syslog(LOG_ERR, "...")` or the `Level::Warn` in `log!(Level::Warn, "...")`.
+    /// The C and C++ macros that pass a message on, like
+    /// `#define ohci_dbg(ohci, fmt, args...) dev_dbg(..., fmt, ## args)`.  They are found in
+    /// the text, not the syntax tree, since preprocessor directives are lines of their own and
+    /// headers with a lot of them often do not parse.
+    pub(crate) fn macro_wrappers(&self) -> Vec<MacroWrapper> {
+        if !self.source_language.is_c_family() {
+            return vec![];
+        }
+        crate::wrappers::scan_defines(self.source)
+    }
+
+    /// The position of a C or C++ argument in the call it is passed to, not counting comments.
+    fn arg_position(&self, node: Node) -> Option<usize> {
+        if !self.source_language.is_c_family()
+            || node.parent().map(|p| p.kind()) != Some("argument_list")
+        {
+            return None;
+        }
+        let mut position = 0;
+        let mut prev = node.prev_named_sibling();
+        while let Some(arg) = prev {
+            if !arg.kind().contains("comment") {
+                position += 1;
+            }
+            prev = arg.prev_named_sibling();
+        }
+        Some(position)
+    }
+
     fn leading_args(&self, node: Node) -> Vec<String> {
         let mut args = Vec::new();
         match node.parent().map(|p| p.kind()) {
@@ -2168,7 +2248,7 @@ fn ends_in_open_conversion(format: &str) -> bool {
     open
 }
 
-fn is_identifier(text: &str) -> bool {
+pub(crate) fn is_identifier(text: &str) -> bool {
     text.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
@@ -2184,7 +2264,7 @@ mod test {
             .set_language(&tree_sitter_cpp::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
-        SourceQuery::mask_preproc_conditionals(source, &tree)
+        SourceQuery::mask_preproc_conditionals(source, &tree).map(|(masked, _)| masked)
     }
 
     #[test]

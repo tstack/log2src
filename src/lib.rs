@@ -11,15 +11,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::ops::{Deref, Range};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, LazyLock, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 use tempfile::NamedTempFile;
 use thiserror::Error;
-use tree_sitter::Language;
+use tree_sitter::{Language, Query};
 
 mod code_source;
 mod java_symbols;
@@ -31,13 +31,14 @@ mod source_hier;
 mod source_query;
 mod source_ref;
 mod value_kind;
+mod wrappers;
 
 // TODO: doesn't need to be exposed if we can clean up the arguments to do_mapping
 use crate::java_symbols::{JavaSymbols, MessageRef, StringConstant};
 use crate::prefilter::{Prefilter, StatementID};
 use crate::progress::{ProgressReader, WorkGuard};
 use crate::source_hier::{ScanEvent, SourceFileID, SourceHierContent, SourceHierTree};
-use crate::source_ref::{CallSite, FormatArgument};
+use crate::source_ref::{CallSite, ChainFrame, FormatArgument, Splice};
 use crate::value_kind::SplitOrder;
 pub use code_source::CodeSource;
 pub use log_format::LogFormat;
@@ -155,7 +156,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "38")]
+    #[serde(rename = "45")]
     Current,
 }
 
@@ -210,7 +211,7 @@ impl Serialize for StatementRef<'_> {
         let stmt = self.stmt;
         // The fields used for matching, like the segments and the kinds of the arguments, are
         // left out: they are internal, and `LogMapping::variables` has what they found.
-        let mut state = serializer.serialize_struct("StatementRef", 13)?;
+        let mut state = serializer.serialize_struct("StatementRef", 14)?;
         state.serialize_field("sourcePath", self.source_path())?;
         state.serialize_field("language", &self.language())?;
         state.serialize_field("lineNumber", &stmt.line_no)?;
@@ -224,6 +225,12 @@ impl Serialize for StatementRef<'_> {
         state.serialize_field("category", &stmt.category)?;
         state.serialize_field("callName", &stmt.call_name)?;
         state.serialize_field("pattern", &stmt.pattern_source())?;
+        if !stmt.call_chain.is_empty() {
+            state.serialize_field("callChain", &stmt.call_chain)?;
+        }
+        if !stmt.continuations.is_empty() {
+            state.serialize_field("continuations", &stmt.continuations)?;
+        }
         state.end()
     }
 }
@@ -253,6 +260,18 @@ pub struct StatementsInFile {
     /// files, so these are rebuilt by `SourceTree::resolve_message_refs()` instead of cached.
     #[serde(skip)]
     resolved_statements: Vec<Statement>,
+    /// The statements derived from the ones in this file for calls that pass a string for a
+    /// placeholder, which can be in other files, so these are rebuilt by
+    /// `SourceTree::derive_call_statements()` instead of cached.  They are only used for
+    /// matching, not listed with the other statements.
+    #[serde(skip)]
+    derived_statements: Vec<Statement>,
+    /// The Linux kernel continuations without any literal text, like `pr_cont(" %s", x)` or
+    /// `pr_cont("\n")`, which are not matched to log messages on their own, but are joined to
+    /// the line that an earlier statement started, see `join_continued_lines()`.
+    bare_continuations: Vec<Statement>,
+    /// The C and C++ macros defined in this file that pass their arguments to another call.
+    macros: Vec<wrappers::MacroWrapper>,
     /// The Java string constants defined in this file.
     constants: Vec<StringConstant>,
     /// The Java log calls in this file whose message is a constant.
@@ -284,11 +303,26 @@ impl StatementsInFile {
             .map(move |stmt| StatementRef { file: self, stmt })
     }
 
-    /// Get a statement by its index in `statements()`.
+    /// Iterate over the statements that log messages are matched against, which are the ones
+    /// from `statements()` followed by the derived ones.
+    fn matchable_statements(&self) -> impl Iterator<Item = StatementRef<'_>> {
+        self.statements().chain(
+            self.derived_statements
+                .iter()
+                .map(move |stmt| StatementRef { file: self, stmt }),
+        )
+    }
+
+    /// Get a statement by its index in `matchable_statements()`.
     fn statement(&self, index: usize) -> Option<StatementRef<'_>> {
-        let stmt = match index.checked_sub(self.log_statements.len()) {
-            None => self.log_statements.get(index),
-            Some(resolved_index) => self.resolved_statements.get(resolved_index),
+        let resolved_start = self.log_statements.len();
+        let derived_start = resolved_start + self.resolved_statements.len();
+        let stmt = if index < resolved_start {
+            self.log_statements.get(index)
+        } else if index < derived_start {
+            self.resolved_statements.get(index - resolved_start)
+        } else {
+            self.derived_statements.get(index - derived_start)
         }?;
         Some(StatementRef { file: self, stmt })
     }
@@ -312,9 +346,12 @@ pub struct SourceTree {
     /// to the source file IDs to speed up matches.
     #[serde(skip)]
     pub file_name_to_sources: HashMap<String, Vec<SourceFileID>>,
-    /// Finds the candidate statements for a log message, rebuilt after loading/extracting.
+    /// Finds the candidate statements for a log message.  It is reset whenever the statements
+    /// change and built the first time it is needed, since building it for a big tree takes a
+    /// while and the statements usually change more than once before then, like after loading
+    /// the cache and again after deriving the statements for calls through wrappers.
     #[serde(skip)]
-    prefilter: Option<Prefilter>,
+    prefilter: OnceLock<Prefilter>,
     /// The statements that matched log messages with a given file name and line number.  They
     /// are tried before the prefilter when another message has the same file and line.  Cleared
     /// whenever the statements change.
@@ -508,7 +545,7 @@ impl SourceTree {
     }
 
     fn rebuild_prefilter(&mut self) {
-        self.prefilter = Some(Prefilter::new(self.files_with_statements.values()));
+        self.prefilter = OnceLock::new();
         // The statement IDs in the cache may now refer to different statements.
         self.line_cache
             .get_mut()
@@ -551,30 +588,8 @@ impl SourceTree {
     /// closest to the message's line number for a tie.  If the message has a file name and line
     /// number, the statement is added to the cache for them.
     fn find_best_match(&self, log_ref: &LogRef) -> Option<StatementRef<'_>> {
-        let prefilter = self.prefilter.as_ref()?;
         let body = log_ref.body();
-        let filename = match log_ref.details {
-            Some(LogDetails {
-                file: Some(filename),
-                ..
-            }) => Some(filename),
-            _ => None,
-        };
-        let file_ids = filename.and_then(|name| self.file_name_to_sources.get(name));
-        let mut candidates: Vec<(StatementID, StatementRef)> = Vec::new();
-        prefilter.candidates(body, |(file_id, index)| {
-            let Some(sif) = self.files_with_statements.get(&file_id) else {
-                return;
-            };
-            let in_file = match (filename, file_ids) {
-                (None, _) => true,
-                (Some(_), Some(ids)) => ids.contains(&file_id),
-                (Some(name), None) => sif.path.contains(name),
-            };
-            if in_file {
-                candidates.extend(sif.statement(index).map(|stmt| ((file_id, index), stmt)));
-            }
-        });
+        let mut candidates = self.prefiltered_candidates(log_ref);
         let lineno = log_ref.details.as_ref().and_then(|details| details.lineno);
         let level = log_ref.level();
         candidates.sort_by(|lhs, rhs| compare_candidates(&lhs.1, &rhs.1, lineno, level));
@@ -596,6 +611,420 @@ impl SourceTree {
         }
         Some(src_ref)
     }
+
+    /// The prefilter for the current statements, which is built if it has not been yet.
+    fn prefilter(&self) -> &Prefilter {
+        self.prefilter
+            .get_or_init(|| Prefilter::new(self.files_with_statements.values()))
+    }
+
+    /// The statements that might match some or all of the body of the log message, since their
+    /// key literal is in it, limited to the source files with the message's file name, if it
+    /// has one.  A statement that matches part of the body has its key literal in that part, so
+    /// these are also the candidates for the parts of a message, like the value of a
+    /// placeholder or the text after a prefix.
+    fn prefiltered_candidates(&self, log_ref: &LogRef) -> Vec<(StatementID, StatementRef<'_>)> {
+        let mut candidates = Vec::new();
+        let prefilter = self.prefilter();
+        let filename = match log_ref.details {
+            Some(LogDetails {
+                file: Some(filename),
+                ..
+            }) => Some(filename),
+            _ => None,
+        };
+        let file_ids = filename.and_then(|name| self.file_name_to_sources.get(name));
+        prefilter.candidates(log_ref.body(), |(file_id, index)| {
+            let Some(sif) = self.files_with_statements.get(&file_id) else {
+                return;
+            };
+            let in_file = match (filename, file_ids) {
+                (None, _) => true,
+                (Some(_), Some(ids)) => ids.contains(&file_id),
+                (Some(name), None) => sif.path.contains(name),
+            };
+            if in_file {
+                candidates.extend(sif.statement(index).map(|stmt| ((file_id, index), stmt)));
+            }
+        });
+        candidates
+    }
+}
+
+/// Check if a C or C++ file is a header, which can be included by other files.
+fn is_c_header(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|ext| matches!(ext, "h" | "hh" | "hpp" | "hxx" | "tpp" | "inc"))
+}
+
+/// The most macros and functions to follow from a call to the statement that prints its message.
+const MAX_WRAPPER_DEPTH: usize = 6;
+
+/// The most continuations of a line that are in a different block than the statement that
+/// starts it, like in an `if`, which can be left out of the line.  Every combination of them is
+/// tried, so there are up to 2^N statements for a line.
+const MAX_OPTIONAL_CONTINUATIONS: usize = 6;
+
+/// Derive the statements for the lines in the Linux kernel that are printed by a statement and
+/// then continued by the `pr_cont()` or `printk(KERN_CONT ...)` calls after it in the same
+/// function, like
+///
+/// ```c
+/// pr_info("Console: switching ");
+/// if (!deflt)
+///     pr_cont("consoles %d-%d ", first + 1, last + 1);
+/// pr_cont("to %s\n", desc);
+/// ```
+///
+/// The continuations in the same block as the start are always printed, but the others, like
+/// in an `if` or a loop, might not be, so a statement is derived for each combination of them,
+/// up to the first one that ends the line.  Whether the branches of an `if` exclude each other
+/// is not known, so some of the combinations cannot happen.  A loop that prints a continuation more than once
+/// is not handled.  The start can also be one of the statements derived for a wrapper, like
+/// the one with the prefix from `pr_fmt()`.  See `Statement::join()`.
+fn join_continued_lines(sif: &StatementsInFile) -> Vec<Statement> {
+    let mut order: Vec<&Statement> = sif
+        .log_statements
+        .iter()
+        .chain(&sif.bare_continuations)
+        .collect();
+    order.sort_by_key(|stmt| (stmt.line_no, stmt.column));
+    let mut lines: Vec<(&Statement, Vec<&Statement>)> = vec![];
+    let mut current: Option<(&Statement, Vec<&Statement>)> = None;
+    for stmt in order {
+        if current
+            .as_ref()
+            .is_some_and(|(start, _)| start.qualified_name != stmt.qualified_name)
+        {
+            lines.extend(current.take());
+        }
+        if stmt.is_continuation() {
+            if let Some((start, conts)) = current.as_mut() {
+                conts.push(stmt);
+                if stmt.block_id == start.block_id && stmt.ends_line() {
+                    lines.extend(current.take());
+                }
+            }
+        } else if stmt.is_kernel_print() {
+            // Any other print starts a new line, even if the last one was not ended.
+            lines.extend(current.take());
+            if !stmt.ends_line() {
+                current = Some((stmt, vec![]));
+            }
+        }
+    }
+    lines.extend(current);
+
+    let mut joined = vec![];
+    for (start, conts) in lines {
+        if conts.is_empty() {
+            continue;
+        }
+        let mut optional = 0;
+        let conts: Vec<(&Statement, bool)> = conts
+            .into_iter()
+            .filter_map(|cont| {
+                if cont.block_id == start.block_id {
+                    Some((cont, false))
+                } else if optional < MAX_OPTIONAL_CONTINUATIONS {
+                    optional += 1;
+                    Some((cont, true))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let starts = std::iter::once(start).chain(sif.derived_statements.iter().filter(|stmt| {
+            stmt.line_no == start.line_no
+                && stmt.column == start.column
+                && stmt.continuations.is_empty()
+        }));
+        let starts: Vec<&Statement> = starts.collect();
+        let mut seen: HashSet<Vec<(usize, usize)>> = HashSet::new();
+        for mask in 0..(1usize << optional) {
+            let mut bit = 0;
+            let mut chosen: Vec<&Statement> = conts
+                .iter()
+                .filter(|(_, is_optional)| {
+                    if *is_optional {
+                        bit += 1;
+                        mask & (1 << (bit - 1)) != 0
+                    } else {
+                        true
+                    }
+                })
+                .map(|(cont, _)| *cont)
+                .collect();
+            // The line ends at the first continuation that ends it, and the rest are a line
+            // of their own.
+            if let Some(end) = chosen.iter().position(|cont| cont.ends_line()) {
+                chosen.truncate(end + 1);
+            }
+            let key = chosen
+                .iter()
+                .map(|cont| (cont.line_no, cont.column))
+                .collect();
+            if chosen.is_empty() || !seen.insert(key) {
+                continue;
+            }
+            joined.extend(starts.iter().filter_map(|start| start.join(&chosen)));
+        }
+    }
+    joined
+}
+
+/// The C and C++ wrappers that a message can go through, see `LogMatcher::link_statements()`.
+struct Wrappers<'s> {
+    macros: HashMap<&'s str, Vec<(&'s StatementsInFile, &'s wrappers::MacroWrapper)>>,
+    /// The statements with placeholders, by the name of the function they are in.
+    functions: HashMap<&'s str, Vec<(&'s StatementsInFile, &'s Statement)>>,
+}
+
+impl<'s> Wrappers<'s> {
+    /// The definitions with the name that a call in the file uses.  A definition in the file
+    /// with the call wins, like a `pr_fmt` that a file defines before it includes the headers.
+    /// Otherwise, the definitions have to be in a single file, or else in a single header, like
+    /// the default `pr_fmt` in `printk.h` when several files define their own, since it is not
+    /// known which one is used.  A macro is only seen by the file it is defined in and the ones
+    /// that include it, so, when `file_scoped`, the single file has to be a header.
+    fn pick<T: Copy>(
+        defs: Option<&Vec<(&'s StatementsInFile, T)>>,
+        call_site: &StatementsInFile,
+        file_scoped: bool,
+    ) -> Vec<(&'s StatementsInFile, T)> {
+        let Some(defs) = defs else {
+            return vec![];
+        };
+        // The IDs of files are only unique within a root, and the definitions can be in any root.
+        let in_call_site: Vec<_> = defs
+            .iter()
+            .filter(|(sif, _)| std::ptr::eq(*sif, call_site))
+            .copied()
+            .collect();
+        if !in_call_site.is_empty() {
+            return in_call_site;
+        }
+        if !file_scoped && defs.iter().map(|(sif, _)| &sif.path).all_equal() {
+            return defs.clone();
+        }
+        let in_headers: Vec<_> = defs
+            .iter()
+            .filter(|(sif, _)| is_c_header(&sif.path))
+            .copied()
+            .collect();
+        if !in_headers.is_empty() && in_headers.iter().map(|(sif, _)| &sif.path).all_equal() {
+            return in_headers;
+        }
+        vec![]
+    }
+
+    /// The macros with the name that a call in the file can use, see `pick()`.
+    fn pick_macros(
+        &self,
+        name: &str,
+        call_site: &StatementsInFile,
+    ) -> Vec<(&'s StatementsInFile, &'s wrappers::MacroWrapper)> {
+        Self::pick(self.macros.get(name), call_site, true)
+    }
+
+    fn frame(path: &str, wrapper: &wrappers::MacroWrapper, parameter: &str) -> ChainFrame {
+        ChainFrame {
+            source_path: path.to_string(),
+            line_number: wrapper.line_no,
+            column: wrapper.column,
+            name: wrapper.name.clone(),
+            call_name: wrapper.callee().unwrap_or_default().to_string(),
+            text: wrapper.text.clone(),
+            parameter: parameter.to_string(),
+        }
+    }
+
+    /// The statements derived for a call whose message goes through wrappers that change it.
+    fn link(&self, call: &Statement, sif: &'s StatementsInFile) -> Vec<Statement> {
+        let (Some(position), Some(callee)) = (call.arg_position, call.call_name.as_deref()) else {
+            return vec![];
+        };
+        // A text macro, like `pr_fmt`, following aliases, like `#define dev_fmt pr_fmt`.
+        let lookup = |name: &str| {
+            let mut name = name;
+            for _ in 0..MAX_WRAPPER_DEPTH {
+                let defs = self.pick_macros(name, sif);
+                if let Some((def_file, wrapper)) =
+                    defs.iter().find(|(_, wrapper)| wrapper.is_text())
+                {
+                    return Some((def_file.path.as_str(), *wrapper));
+                }
+                match defs.iter().find_map(|(_, wrapper)| match &wrapper.body {
+                    wrappers::MacroBody::Alias(target) => Some(target.as_str()),
+                    _ => None,
+                }) {
+                    Some(target) => name = target,
+                    None => return None,
+                }
+            }
+            None
+        };
+        let mut position = position as usize;
+        let mut name = callee;
+        let mut frames: Vec<ChainFrame> = vec![];
+        let mut prefix = String::new();
+        let mut suffix = String::new();
+        let mut last_macro: Option<&wrappers::MacroWrapper> = None;
+        for _ in 0..MAX_WRAPPER_DEPTH {
+            let defs: Vec<_> = self
+                .pick_macros(name, sif)
+                .into_iter()
+                .filter(|(_, wrapper)| wrapper.callee().is_some())
+                .collect();
+            let mut applied = vec![];
+            let Some((def_file, wrapper, forward)) = defs.iter().find_map(|(def_file, wrapper)| {
+                let forward = wrapper.forward(position, &lookup, &mut applied)?;
+                Some((*def_file, *wrapper, forward))
+            }) else {
+                if !defs.is_empty() {
+                    // The macro changes the message in a way that is not known, so the text
+                    // around it is not known either.
+                    return vec![];
+                }
+                let derived = self.link_function(
+                    call, name, position, sif, &frames, &prefix, &suffix, last_macro,
+                );
+                if !derived.is_empty() {
+                    return derived;
+                }
+                break;
+            };
+            frames.push(Self::frame(
+                &def_file.path,
+                wrapper,
+                &wrapper.params[position],
+            ));
+            for (path, text_macro) in applied {
+                frames.push(Self::frame(path, text_macro, &text_macro.params[0]));
+            }
+            prefix = format!("{}{}", forward.prefix, prefix);
+            suffix.push_str(&forward.suffix);
+            position = forward.position;
+            name = wrapper.callee().unwrap_or_default();
+            last_macro = Some(wrapper);
+        }
+        if prefix.is_empty() && suffix.is_empty() {
+            // The macros only pass the message on, so the call already matches it.
+            return vec![];
+        }
+        vec![call.with_affixes(&prefix, &suffix, frames)]
+    }
+
+    /// The statements derived for a call whose message is passed to a function with a
+    /// statement that prints it.
+    #[allow(clippy::too_many_arguments)]
+    fn link_function(
+        &self,
+        call: &Statement,
+        name: &str,
+        position: usize,
+        call_site: &StatementsInFile,
+        frames: &[ChainFrame],
+        prefix: &str,
+        suffix: &str,
+        last_macro: Option<&wrappers::MacroWrapper>,
+    ) -> Vec<Statement> {
+        let mut retval = vec![];
+        for (def_file, inner) in Self::pick(self.functions.get(name), call_site, false) {
+            let params = source_ref::c_parameter_names(&inner.name);
+            let Some(param) = params.get(position).filter(|param| !param.is_empty()) else {
+                continue;
+            };
+            let exprs = inner.arg_exprs();
+            let specs = inner.c_placeholder_specs();
+            let is_format = source_ref::c_is_variadic(&inner.name) && position + 2 == params.len();
+            let placeholder = if is_format {
+                // The format string of a variadic function, printed with the arguments by
+                // the Linux kernel's `%pV`.
+                specs.and_then(|specs| specs.iter().position(|spec| spec.ends_with("pV")))
+            } else if call.kinds.is_empty() && inner.category == MessageCategory::Log {
+                // A string printed with `%s` by a log statement.
+                exprs.iter().enumerate().position(|(index, expr)| {
+                    expr.trim() == param
+                        && specs
+                            .as_ref()
+                            .and_then(|specs| specs.get(index))
+                            .is_some_and(|spec| spec.ends_with('s'))
+                })
+            } else {
+                None
+            };
+            let Some(placeholder) = placeholder else {
+                continue;
+            };
+            let param_index = |expr: &str| {
+                let expr = expr.trim();
+                params
+                    .iter()
+                    .position(|param| !param.is_empty() && param == expr)
+            };
+            // A Linux kernel level, like `KERN_INFO`, is taken out of the message by printk().
+            let empty = exprs
+                .iter()
+                .enumerate()
+                .filter(|(index, expr)| {
+                    *index != placeholder
+                        && param_index(expr)
+                            .and_then(|pos| last_macro?.constant_arg(pos))
+                            .is_some_and(wrappers::is_kernel_log_level)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            // Without a macro in between, the arguments after the message are the call's.
+            let caller_exprs = exprs
+                .iter()
+                .map(|expr| {
+                    if !frames.is_empty() {
+                        return None;
+                    }
+                    let pos = param_index(expr).filter(|pos| *pos > position)?;
+                    call.trailing_args().get(pos - position - 1).cloned()
+                })
+                .collect();
+            let mut frames = frames.to_vec();
+            frames.push(ChainFrame {
+                source_path: def_file.path.clone(),
+                line_number: inner.line_no,
+                column: inner.column,
+                name: inner.name.clone(),
+                call_name: inner.call_name.clone().unwrap_or_default(),
+                text: inner.text.clone(),
+                parameter: param.clone(),
+            });
+            retval.extend(call.splice(&Splice {
+                inner,
+                placeholder,
+                prefix: prefix.to_string(),
+                suffix: suffix.to_string(),
+                empty,
+                caller_exprs,
+                frames,
+            }));
+        }
+        retval
+    }
+}
+
+/// The least fraction of the non-whitespace text in a log message that the literal text of the
+/// statement matched to it has to cover, as a percentage, before other readings of the message
+/// are tried, like one with a prefix that is not from the source.
+const MIN_EXPLAINED_PERCENT: usize = 50;
+
+/// Check if the statement matched to a log message explains enough of the message that other
+/// readings of it are not needed.
+fn explains_enough(best: Option<&StatementRef>, body: &str) -> bool {
+    let Some(best) = best else {
+        return false;
+    };
+    let total = body.chars().filter(|c| !c.is_whitespace()).count();
+    best.quality * 100 >= total * MIN_EXPLAINED_PERCENT
 }
 
 /// Find the first of the ordered candidates whose statement matches `body`.  A statement that
@@ -932,8 +1361,16 @@ impl LogMatcher {
                 serde_json::to_writer(&file, &header).map_err(to_write_cache_error)?;
                 file.write_all("\n".as_bytes())
                     .map_err(to_write_cache_error)?;
-                bincode::serde::encode_into_std_write(root, &mut file, bincode::config::standard())
-                    .map_err(to_write_cache_error)?;
+                // bincode writes each field on its own, which is a lot of small writes.
+                let mut writer = BufWriter::new(&mut file);
+                bincode::serde::encode_into_std_write(
+                    root,
+                    &mut writer,
+                    bincode::config::standard(),
+                )
+                .map_err(to_write_cache_error)?;
+                writer.flush().map_err(to_write_cache_error)?;
+                drop(writer);
                 total_size = total_size.saturating_add(file.stream_position().unwrap_or(0));
                 file.into_temp_path()
             };
@@ -971,7 +1408,7 @@ impl LogMatcher {
                     tree: SourceHierTree::from(&path),
                     files_with_statements: HashMap::new(),
                     file_name_to_sources: HashMap::new(),
-                    prefilter: None,
+                    prefilter: OnceLock::new(),
                     line_cache: RwLock::default(),
                     log_calls: BTreeMap::new(),
                     languages: BTreeSet::new(),
@@ -1036,48 +1473,58 @@ impl LogMatcher {
                 .filter(|event| matches!(event, ScanEvent::NewFile(..)))
                 .count();
             let guard = tracker.doing_work(new_files as u64, "files".to_string());
-            let mut unreadable: Vec<PathBuf> = Vec::new();
-            for event_chunk in &events.into_iter().chunks(10) {
-                let sources = event_chunk
-                    .flat_map(|event| match event {
-                        ScanEvent::NewFile(path, info) => {
-                            let res = File::open(&path)
-                                .map_err(|err| LogError::CannotReadSourceFile {
-                                    path: path.clone(),
-                                    source: Arc::new(err),
-                                })
-                                .and_then(|file| CodeSource::new(&path, info, file));
-                            match res {
-                                Ok(cs) => {
-                                    retval.new += 1;
-                                    Some(cs)
-                                }
-                                Err(err) => {
-                                    retval.errors.push(err);
-                                    unreadable.push(path);
-                                    guard.inc(1);
-                                    None
-                                }
-                            }
-                        }
-                        ScanEvent::DeletedFile(_path, id) => {
-                            retval.deleted += 1;
-                            coll.files_with_statements.remove(&id);
-                            coll.file_name_to_sources.values_mut().for_each(|ids| {
-                                ids.retain_mut(|elem| *elem != id);
-                            });
-                            None
-                        }
-                    })
-                    .collect::<Vec<CodeSource>>();
-                extract_logging_guarded(&sources, &guard)
-                    .into_iter()
-                    .for_each(|sif| {
-                        sif.to_lookup_pair().into_iter().for_each(|(name, sid)| {
-                            coll.file_name_to_sources.entry(name).or_default().push(sid);
+            let mut new_files = Vec::with_capacity(new_files);
+            for event in events {
+                match event {
+                    ScanEvent::NewFile(path, info) => new_files.push((path, info)),
+                    ScanEvent::DeletedFile(_path, id) => {
+                        retval.deleted += 1;
+                        coll.files_with_statements.remove(&id);
+                        coll.file_name_to_sources.values_mut().for_each(|ids| {
+                            ids.retain_mut(|elem| *elem != id);
                         });
-                        coll.files_with_statements.insert(sif.id, sif);
-                    });
+                    }
+                }
+            }
+            // Each file is read and extracted by the same worker, so the work is spread over all
+            // of the threads and only the files being worked on are in memory.
+            let results: Vec<Result<Option<StatementsInFile>, (PathBuf, LogError)>> = new_files
+                .into_par_iter()
+                .map(|(path, info)| {
+                    let code = File::open(&path)
+                        .map_err(|err| LogError::CannotReadSourceFile {
+                            path: path.clone(),
+                            source: Arc::new(err),
+                        })
+                        .and_then(|file| CodeSource::new(&path, info, file));
+                    match code {
+                        Ok(code) => {
+                            Ok(extract_logging_guarded(std::slice::from_ref(&code), &guard).pop())
+                        }
+                        Err(err) => {
+                            guard.inc(1);
+                            Err((path, err))
+                        }
+                    }
+                })
+                .collect();
+            let mut unreadable: Vec<PathBuf> = Vec::new();
+            for result in results {
+                match result {
+                    Ok(sif) => {
+                        retval.new += 1;
+                        if let Some(sif) = sif {
+                            sif.to_lookup_pair().into_iter().for_each(|(name, sid)| {
+                                coll.file_name_to_sources.entry(name).or_default().push(sid);
+                            });
+                            coll.files_with_statements.insert(sif.id, sif);
+                        }
+                    }
+                    Err((path, err)) => {
+                        retval.errors.push(err);
+                        unreadable.push(path);
+                    }
+                }
             }
             // The scan marked these as done, but they need to be retried on the next run.
             unreadable
@@ -1088,9 +1535,22 @@ impl LogMatcher {
             ref_summary.not_found += summary.not_found;
             ref_summary.no_text += summary.no_text;
             coll.prune_log_calls();
-            coll.rebuild_prefilter();
+        });
+        tracker.step("linking calls through wrappers".to_string());
+        let (derived, joined) = self.link_statements();
+        // Built now, instead of when the first message is matched, so the time is reported
+        // with the rest of the work of loading the statements.
+        tracker.step("indexing the statements".to_string());
+        self.roots.par_iter().for_each(|(_path, coll)| {
+            coll.prefilter();
         });
         let mut found = format!("{} found", self.statements().count());
+        if derived > 0 {
+            found.push_str(&format!(", {derived} more for calls through wrappers"));
+        }
+        if joined > 0 {
+            found.push_str(&format!(", {joined} more for continued lines"));
+        }
         if ref_summary.resolved + ref_summary.not_found + ref_summary.no_text > 0 {
             found.push_str(&format!(
                 " ({} with a message constant; {} constants not found, {} without text)",
@@ -1102,21 +1562,149 @@ impl LogMatcher {
         retval
     }
 
+    /// Derive statements for the C and C++ calls whose message goes through a wrapper that
+    /// changes it, and rebuild the prefilters with them.  A wrapper is a function-like macro
+    /// that passes the message on, like
+    /// `#define acpi_handle_info(handle, fmt, ...) acpi_handle_printk(KERN_INFO, handle, fmt, ...)`,
+    /// which can add text, like `"foo: " fmt`, and a function that prints the message with a
+    /// statement of its own, either a string passed for a `%s`, like the
+    /// `show_string(udev, "Product", udev->product)` calls of
+    /// `dev_info(&udev->dev, "%s: %s\n", id, string)` in `show_string()`, or the format string
+    /// of a variadic function printed with the Linux kernel's `%pV`, like the
+    /// `printk("%sACPI: %s: %pV", ...)` in `acpi_handle_printk()`.  The wrappers can be in any
+    /// root, like a macro in a header.  A wrapper defined in the same file as the call is used
+    /// before one in other files, since C functions are often `static`, and one defined in
+    /// several other files is not used, since it is not known which one is called.  Then, the
+    /// statements for the lines that are continued, see `join_continued_lines()`, are derived.
+    /// Returns the number of statements derived for wrappers and for continued lines.  See
+    /// `Statement::splice()`.
+    fn link_statements(&mut self) -> (usize, usize) {
+        for coll in self.roots.values_mut() {
+            for sif in coll.files_with_statements.values_mut() {
+                sif.derived_statements.clear();
+            }
+        }
+        let c_files = || {
+            self.roots
+                .iter()
+                .flat_map(|(root, coll)| {
+                    coll.files_with_statements
+                        .values()
+                        .map(move |sif| (root, sif))
+                })
+                .filter(|(_, sif)| sif.language.is_c_family())
+        };
+        let mut macros: HashMap<&str, Vec<(&StatementsInFile, &wrappers::MacroWrapper)>> =
+            HashMap::new();
+        let mut functions: HashMap<&str, Vec<(&StatementsInFile, &Statement)>> = HashMap::new();
+        for (_, sif) in c_files() {
+            for wrapper in &sif.macros {
+                macros
+                    .entry(wrapper.name.as_str())
+                    .or_default()
+                    .push((sif, wrapper));
+            }
+            for stmt in &sif.log_statements {
+                // Not only log statements, since a wrapper can print with a call that does
+                // not look like logging, like `printk("%sACPI: %s: %pV", level, ...)`.
+                if !stmt.kinds.is_empty() {
+                    functions
+                        .entry(stmt.qualified_name.as_str())
+                        .or_default()
+                        .push((sif, stmt));
+                }
+            }
+        }
+        let wrappers = Wrappers { macros, functions };
+        let derived: Vec<(PathBuf, SourceFileID, Statement)> = c_files()
+            .flat_map(|(root, sif)| {
+                let wrappers = &wrappers;
+                sif.log_statements.iter().flat_map(move |call| {
+                    wrappers
+                        .link(call, sif)
+                        .into_iter()
+                        .map(move |stmt| (root.clone(), sif.id, stmt))
+                })
+            })
+            .collect();
+        let count = derived.len();
+        for (root, file_id, stmt) in derived {
+            if let Some(sif) = self
+                .roots
+                .get_mut(&root)
+                .and_then(|coll| coll.files_with_statements.get_mut(&file_id))
+            {
+                sif.derived_statements.push(stmt);
+            }
+        }
+        let mut joined_count = 0;
+        for coll in self.roots.values_mut() {
+            for sif in coll.files_with_statements.values_mut() {
+                if sif.language.is_c_family() {
+                    let joined = join_continued_lines(sif);
+                    joined_count += joined.len();
+                    sif.derived_statements.extend(joined);
+                }
+            }
+        }
+        self.roots
+            .values_mut()
+            .for_each(SourceTree::rebuild_prefilter);
+        (count, joined_count)
+    }
+
     /// Attempt to match the given log message.  If the message has a file name and line number,
     /// the statements in a root that matched earlier messages with the same ones are tried
-    /// before the rest of that root.
+    /// before the rest of that root.  The best match from each root is found and then the best
+    /// of those is chosen the same way as within a root, so a generic statement in one root,
+    /// like `"%s\n"`, does not hide a better one in another, and the result does not depend on
+    /// the order of the roots.
     pub fn match_log_statement<'a, 's>(
         &'s self,
         log_ref: &LogRef<'a>,
         options: &LogMatchOptions,
     ) -> Option<LogMapping<'a, 's>> {
-        self.roots
+        let lineno = log_ref.details.as_ref().and_then(|details| details.lineno);
+        let level = log_ref.level();
+        let body = log_ref.body();
+        let candidates = self
+            .roots
             .values()
-            .find_map(|coll| {
+            .filter_map(|coll| {
                 coll.find_cached_match(log_ref)
                     .or_else(|| coll.find_best_match(log_ref))
             })
-            .map(|src_ref| self.to_log_mapping(log_ref, src_ref, options))
+            .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, lineno, level));
+        let best = first_match(candidates, body, lineno, |src_ref| src_ref.stmt);
+        if !explains_enough(best.as_ref(), body) {
+            if let Some(source) = self.explain_log_body(log_ref) {
+                if best.as_ref().is_none_or(|best| source.score > best.quality) {
+                    let mut mapping =
+                        self.to_log_mapping(log_ref, source.stmt, &source.text, options);
+                    mapping.prefix = source.prefix.as_deref().and_then(|prefix| {
+                        let body = body.trim_start();
+                        trim_prefix(body.get(..prefix.len()).filter(|start| *start == prefix)?)
+                    });
+                    return Some(mapping);
+                }
+            }
+        }
+        best.map(|src_ref| self.to_log_mapping(log_ref, src_ref, body, options))
+    }
+
+    /// Find the statement that produced the most of a log message when none matches enough of
+    /// all of it, like a message with a prefix that is not from the source, such as the device
+    /// name that the Linux kernel's `dev_info()` adds, or one that wraps a message made
+    /// somewhere else.  See [`message_source::best_log_source`].  Only the statements found by
+    /// the prefilters are used, which keeps this fast, since the statement for any part of the
+    /// message has its key literal in the message.
+    fn explain_log_body<'s>(&'s self, log_ref: &LogRef) -> Option<message_source::LogSource<'s>> {
+        let statements = self
+            .roots
+            .values()
+            .flat_map(|coll| coll.prefiltered_candidates(log_ref))
+            .map(|(_, stmt)| stmt);
+        message_source::best_log_source(statements, log_ref.body())
     }
 
     #[doc(hidden)]
@@ -1153,13 +1741,22 @@ impl LogMatcher {
     /// screenshot, or a GUI, and the sources of the values in it.  See
     /// [`find_message_sources`].
     pub fn find_message_sources(&self, message: &str) -> Vec<MessageSource<'_>> {
-        find_message_sources(self.statements(), message)
+        let statements = self
+            .roots
+            .values()
+            .flat_map(|coll| coll.files_with_statements.values())
+            .flat_map(|sif| sif.matchable_statements());
+        find_message_sources(statements, message)
     }
 
+    /// Map the log message to the statement, whose values are extracted from `text`, which is
+    /// the part of the message's body that the statement produced.  The text in front of it
+    /// that no statement produced is filled in by the caller.
     fn to_log_mapping<'a, 's>(
         &self,
         log_ref: &LogRef<'a>,
         src_ref: StatementRef<'s>,
+        text: &str,
         options: &LogMatchOptions,
     ) -> LogMapping<'a, 's> {
         let exception_trace = match log_ref {
@@ -1173,17 +1770,24 @@ impl LogMatcher {
             _ => Vec::new(),
         };
         let variables = if options.extract_variables {
-            extract_variables(log_ref, src_ref.stmt)
+            extract_variables_from(text, src_ref.stmt)
         } else {
             Vec::new()
         };
         LogMapping {
             log_ref: *log_ref,
             src_ref: Some(src_ref),
+            prefix: None,
             variables,
             exception_trace,
         }
     }
+}
+
+/// The text in front of a message that no statement produced, without the separator after it,
+/// like the `: ` in `"usb 1-5: new device"`, or `None` if there is nothing else.
+fn trim_prefix(prefix: &str) -> Option<&str> {
+    Some(prefix.trim_end().trim_end_matches(':').trim_end()).filter(|prefix| !prefix.is_empty())
 }
 
 /// Named by their LSP language identifiers ("rust", "java", "cpp", ...) in the JSON output,
@@ -1324,7 +1928,19 @@ static JAVA_PLACEHOLDER_REGEX: LazyLock<Regex> =
 /// conversion characters that are accepted.  There are no capture groups since the other
 /// placeholders in a language's regex are identified by their group.
 const PRINTF_CONVERSION: &str = r#"%(?:\d+\$)?[-+ #0']*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlLzjt]*"#;
-const C_CONVERSIONS: &str = "[diuoxXfFeEgGaAcspnm%]";
+/// The Linux kernel's printk() extends `%p` with the alphanumeric characters that follow it,
+/// like `%pR` for a resource or `%pOFn` for a device tree node, which print something other
+/// than the address.  Plain printf() would print the address followed by those characters,
+/// but that is rare in a format string, so they are treated as part of the conversion.
+const C_CONVERSIONS: &str = "(?:[diuoxXfFeEgGaAcsnm%]|p[0-9A-Za-z]*)";
+
+/// The extension characters after the `p` of a C pointer conversion, like `R` for `%pR`, or
+/// `None` if the conversion is not a pointer.  `spec` is the conversion without the `%`.  The
+/// flags, width, precision, and length modifiers that come before the conversion character do
+/// not contain a `p`, so the first one starts the conversion.
+pub(crate) fn pointer_extension(spec: &str) -> Option<&str> {
+    spec.split_once('p').map(|(_, ext)| ext)
+}
 
 /// C only has printf-style placeholders.
 static C_PLACEHOLDER_REGEX: LazyLock<Regex> =
@@ -1524,6 +2140,24 @@ impl SourceLanguage {
             // Some languages might have well-known file names without an extension
             None => None,
         }
+    }
+
+    /// The query for the log statements in this language, which is compiled the first time it
+    /// is needed and then shared, since compiling it takes longer than running it on most
+    /// files.
+    fn compiled_query(&self) -> &'static Query {
+        static QUERIES: [OnceLock<Query>; 6] = [const { OnceLock::new() }; 6];
+        let index = match self {
+            SourceLanguage::Rust => 0,
+            SourceLanguage::Java => 1,
+            SourceLanguage::C => 2,
+            SourceLanguage::Cpp => 3,
+            SourceLanguage::Python => 4,
+            SourceLanguage::Kotlin => 5,
+        };
+        QUERIES[index].get_or_init(|| {
+            Query::new(&(*self).into(), self.get_query()).expect("the query is valid")
+        })
     }
 
     fn get_query(&self) -> &str {
@@ -1765,6 +2399,10 @@ pub struct LogMapping<'a, 's> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename(serialize = "exceptionTrace"))]
     pub exception_trace: Vec<CallSite>,
+    /// The text at the start of the message that no statement produced, like the device name
+    /// that the Linux kernel's `dev_info()` adds, when the statement only produced the rest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<&'a str>,
     pub variables: Vec<VariablePair>,
 }
 
@@ -2026,11 +2664,16 @@ pub fn lookup_source<'a>(
 }
 
 pub fn extract_variables(log_ref: &LogRef, src_ref: &Statement) -> Vec<VariablePair> {
-    let mut variables = Vec::new();
     let line = match log_ref.details {
         Some(details) => details.body.unwrap_or(log_ref.line),
         None => log_ref.line,
     };
+    extract_variables_from(line, src_ref)
+}
+
+/// Extract the values of the statement's placeholders from the text it produced.
+fn extract_variables_from(line: &str, src_ref: &Statement) -> Vec<VariablePair> {
+    let mut variables = Vec::new();
     if let Some(captures) = src_ref.captures(line) {
         let exprs = src_ref.arg_exprs();
         let greedy = captures
@@ -2099,9 +2742,10 @@ fn find_values(
         std::iter::zip(lhs, rhs).map(|(l, r)| l != r).collect()
     };
     let split = |order| {
-        src_ref
-            .segment_matchers()
-            .and_then(|segments| value_kind::split_values(line, segments, kinds, order))
+        src_ref.segment_matchers().and_then(|segments| {
+            let choices = src_ref.choice_matchers().unwrap_or_default();
+            value_kind::split_values(line, segments, kinds, choices, order)
+        })
     };
     match split(SplitOrder::LongestFirst) {
         Some(longest) if unique => (longest, not_ambiguous),
@@ -2142,8 +2786,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
             } else {
                 Default::default()
             };
-            let query = code.info.language.get_query();
-            let results = src_query.query(query, None);
+            let results = src_query.query(code.info.language.compiled_query(), None);
             for result in results {
                 // println!("node.kind()={:?} range={:?}", result.kind, result.range);
                 match result.kind.as_str() {
@@ -2212,6 +2855,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                                 prior.end_line_no = end_line_no;
                                 prior.vars.push(var);
                                 prior.var_kinds.push(result.value_kind);
+                                prior.var_choices.push(result.value_choices);
                             }
                         }
                     }
@@ -2219,8 +2863,23 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                 }
                 // println!("*****");
             }
+            // Taken out after their arguments were added, since those follow the message, but
+            // before the choices of the arguments add to the quality, since a continuation like
+            // `pr_cont(" %s", on ? "on" : "off")` still has no literal text of its own.
+            let (mut bare_continuations, mut matched): (Vec<_>, Vec<_>) = matched
+                .into_iter()
+                .partition(Statement::is_bare_continuation);
+            matched.iter_mut().for_each(Statement::resolve_choices);
+            bare_continuations
+                .iter_mut()
+                .for_each(Statement::resolve_choices);
+            let macros = src_query.macro_wrappers();
             guard.inc(1);
-            if matched.is_empty() && message_refs.is_empty() && symbols.constants.is_empty() {
+            if matched.is_empty()
+                && message_refs.is_empty()
+                && symbols.constants.is_empty()
+                && macros.is_empty()
+            {
                 None
             } else {
                 Some(StatementsInFile {
@@ -2229,7 +2888,10 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                     id: code.info.id,
                     arg_levels,
                     log_statements: matched,
+                    bare_continuations,
                     resolved_statements: vec![],
+                    derived_statements: vec![],
+                    macros,
                     constants: symbols.constants,
                     message_refs,
                 })
@@ -3134,6 +3796,388 @@ class Same {
     }
 
     #[test]
+    fn test_match_explains_rest_of_message() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("hub.rs"),
+            r#"fn announce(dev: &str, mfr: u32) {
+    warn!("{}: {}", dev, mfr);
+    info!("New USB device strings: Mfr={}", mfr);
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let matched = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| {
+                    let vars: Vec<(String, String)> = mapping
+                        .variables
+                        .into_iter()
+                        .map(|var| (var.expr, var.value))
+                        .collect();
+                    mapping.src_ref.map(|src_ref| (src_ref.line_no, vars))
+                })
+        };
+
+        // A generic statement matches all of the line, but most of it is explained by the
+        // statement for the text after the device name, whose values are taken from that text.
+        assert_eq!(
+            matched("usb 1-5: New USB device strings: Mfr=3"),
+            Some((3, vec![("mfr".to_string(), "3".to_string())]))
+        );
+        // A line that is mostly explained by a generic statement keeps it.
+        assert_eq!(
+            matched("usb 1-5: 3"),
+            Some((
+                2,
+                vec![
+                    ("dev".to_string(), "usb 1-5".to_string()),
+                    ("mfr".to_string(), "3".to_string())
+                ]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_match_explains_rest_of_message_keeps_evidence() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("disk.rs"),
+            r#"fn check(dev: &str, ctl: &str) -> String {
+    warn!("Got {} from {}", dev, ctl);
+    let err = format!("disk failure on {}", dev);
+    let chained = format!("Controller {} reset", ctl);
+    warn!("Got {} from {}", dev, ctl);
+    err
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let matched = |msg: &str, lineno: Option<usize>| {
+            let log_ref = LogRefBuilder::new()
+                .with_body(Some(msg))
+                .with_lineno(lineno)
+                .build(msg);
+            let mapping = matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .unwrap();
+            (
+                mapping.src_ref.unwrap().line_no,
+                mapping.prefix.map(str::to_string),
+            )
+        };
+        // The values of the line are explained by other statements, but the reading of all of
+        // it does not change which of the statements that match all of it is the best.
+        let msg = "Got disk failure on sda1 from controller zero";
+        assert_eq!(matched(msg, Some(5)), (5, None));
+        assert_eq!(matched(msg, Some(2)), (2, None));
+        // The text in front of a chain of messages is not from any statement.
+        assert_eq!(
+            matched("usb 1-5: disk failure on sda1: Controller one reset", None),
+            (3, Some("usb 1-5".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_match_through_call_chain() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("hub.c"),
+            r#"static void show_string(int dev, const char *id, const char *value)
+{
+    syslog(LOG_INFO, "%s: %s\n", id, value);
+}
+
+static void announce(int dev, const char *product)
+{
+    show_string(dev, "Product", product);
+    show_string(dev, "Manufacturer", product);
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let msg = "usb 1-5: Product: USB2.0 HUB";
+        let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+        let mapping = matcher
+            .match_log_statement(&log_ref, &LogMatchOptions::default())
+            .unwrap();
+        let src_ref = mapping.src_ref.unwrap();
+        // The call that has the text, then the statement that printed it.
+        assert_eq!(src_ref.line_no, 8);
+        let chain: Vec<(usize, &str, &str, &str)> = src_ref
+            .call_chain
+            .iter()
+            .map(|frame| {
+                (
+                    frame.line_number,
+                    frame.call_name.as_str(),
+                    frame.parameter.as_str(),
+                    frame.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(chain, vec![(3, "syslog", "id", "\"%s: %s\\n\"")]);
+        // The value is for the expression in the call, not the parameter.
+        let vars: Vec<(&str, &str)> = mapping
+            .variables
+            .iter()
+            .map(|var| (var.expr.as_str(), var.value.as_str()))
+            .collect();
+        assert_eq!(vars, vec![("product", "USB2.0 HUB")]);
+        assert_eq!(mapping.prefix, Some("usb 1-5"));
+
+        // The derived statements are only used for matching.
+        assert_eq!(
+            matcher
+                .statements()
+                .filter(|stmt| !stmt.call_chain.is_empty())
+                .count(),
+            0
+        );
+        // A message from the statement without the call is still matched to it as is.
+        let msg = "Serial: 1234";
+        let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+        let src_ref = matcher
+            .match_log_statement(&log_ref, &LogMatchOptions::default())
+            .and_then(|mapping| mapping.src_ref)
+            .unwrap();
+        assert_eq!(src_ref.line_no, 3);
+        assert!(src_ref.call_chain.is_empty());
+    }
+
+    #[test]
+    fn test_match_through_format_wrappers() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let include = temp_dir.path().join("include");
+        let drivers = temp_dir.path().join("drivers");
+        fs::create_dir_all(&include).unwrap();
+        fs::create_dir_all(&drivers).unwrap();
+        // The header, which does not parse, has the default `dev_fmt` and a macro that passes
+        // the message to a function that prints it with `%pV`.
+        fs::write(
+            include.join("acpi.h"),
+            r#"#ifndef dev_fmt
+#define dev_fmt(fmt) fmt
+#endif
+__printf(3, 4) void acpi_handle_printk(const char *level, void *handle, const char *fmt, ...);
+#define acpi_handle_info(handle, fmt, ...) \
+	acpi_handle_printk(KERN_INFO, handle, dev_fmt(fmt), ##__VA_ARGS__)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            drivers.join("utils.c"),
+            r#"void acpi_handle_printk(const char *level, void *handle, const char *fmt, ...)
+{
+	struct va_format vaf;
+	const char *path = acpi_handle_path(handle);
+	printk("%sACPI: %s: %pV", level, path, &vaf);
+}
+"#,
+        )
+        .unwrap();
+        // The file with the call defines its own `dev_fmt` as another name for `pr_fmt`.
+        fs::write(
+            drivers.join("power.c"),
+            r#"#define pr_fmt(fmt) "PM: " fmt
+#define dev_fmt pr_fmt
+
+static int add_power_resource(void *handle, int count)
+{
+	acpi_handle_info(handle, "New power resource %d\n", count);
+	return 0;
+}
+"#,
+        )
+        .unwrap();
+        let tracker = ProgressTracker::new();
+        let mut matcher = LogMatcher::new();
+        matcher.add_root(&include).unwrap();
+        matcher.add_root(&drivers).unwrap();
+        assert!(matcher.discover_sources(&tracker).is_empty());
+        matcher.extract_log_statements(&tracker);
+
+        let msg = "ACPI: \\_SB_.PWRS: PM: New power resource 2";
+        let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+        let mapping = matcher
+            .match_log_statement(&log_ref, &LogMatchOptions::default())
+            .unwrap();
+        let src_ref = mapping.src_ref.unwrap();
+        // The call where the message was written, which explains all of the line.
+        assert!(src_ref.source_path().ends_with("power.c"));
+        assert_eq!(src_ref.line_no, 6);
+        assert_eq!(mapping.prefix, None);
+        let chain: Vec<(&str, usize, &str)> = src_ref
+            .call_chain
+            .iter()
+            .map(|frame| {
+                let file = Path::new(&frame.source_path).file_name().unwrap();
+                (
+                    file.to_str().unwrap(),
+                    frame.line_number,
+                    frame.name.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            chain,
+            vec![
+                ("acpi.h", 5, "acpi_handle_info"),
+                ("power.c", 1, "pr_fmt"),
+                (
+                    "utils.c",
+                    5,
+                    "acpi_handle_printk(const char *level, void *handle, const char *fmt, ...)"
+                ),
+            ]
+        );
+        // The level is taken out of the message by printk(), so it is not a value.
+        let vars: Vec<(&str, &str)> = mapping
+            .variables
+            .iter()
+            .map(|var| (var.expr.as_str(), var.value.as_str()))
+            .collect();
+        assert_eq!(vars, vec![("path", "\\_SB_.PWRS"), ("count", "2")]);
+    }
+
+    #[test]
+    fn test_match_through_macro_wrappers() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("printk.h"),
+            r#"#define pr_info(fmt, ...) printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("a.c"),
+            r#"#define pr_fmt(fmt) "alpha: " fmt
+#define DBG(fmt) printk(KERN_DEBUG "drv: " fmt)
+#define B(fmt) printk(xlate(fmt))
+#define A(fmt, ...) B("bee: " fmt)
+
+void start(void)
+{
+    pr_info("started up\n");
+    DBG("probe complete\n");
+    A("hello there\n");
+}
+"#,
+        )
+        .unwrap();
+        // This file does not define `pr_fmt`, and it cannot see the one in `a.c`.
+        fs::write(
+            temp_dir.path().join("b.c"),
+            r#"void ready(void)
+{
+    pr_info("ready to go\n");
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let matched = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            let mapping = matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .unwrap();
+            let src_ref = mapping.src_ref.unwrap();
+            let file = Path::new(src_ref.source_path()).file_name().unwrap();
+            let chain: Vec<String> = src_ref
+                .call_chain
+                .iter()
+                .map(|frame| frame.name.clone())
+                .collect();
+            (
+                file.to_str().unwrap().to_string(),
+                src_ref.line_no,
+                chain,
+                mapping.prefix.map(str::to_string),
+            )
+        };
+
+        assert_eq!(
+            matched("alpha: started up"),
+            (
+                "a.c".to_string(),
+                8,
+                vec!["pr_info".to_string(), "pr_fmt".to_string()],
+                None
+            )
+        );
+        // A macro with one parameter that is a single call is followed.
+        assert_eq!(
+            matched("drv: probe complete"),
+            ("a.c".to_string(), 9, vec!["DBG".to_string()], None)
+        );
+        // `B()` changes the message in a way that is not known, so the text from `A()` is not
+        // added either, and the text in front is not from any statement.
+        assert_eq!(
+            matched("bee: hello there"),
+            ("a.c".to_string(), 10, vec![], Some("bee".to_string()))
+        );
+        assert_eq!(
+            matched("alpha: ready to go"),
+            ("b.c".to_string(), 3, vec![], Some("alpha".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_best_match_across_roots() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let generic = temp_dir.path().join("generic");
+        let specific = temp_dir.path().join("specific");
+        fs::create_dir_all(&generic).unwrap();
+        fs::create_dir_all(&specific).unwrap();
+        fs::write(
+            generic.join("dock.c"),
+            "void dock(const char *msg, int irq) {\n    pr_info(\"%s with IRQ %d\\n\", msg, irq);\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            specific.join("aer.c"),
+            "void probe(int irq) {\n    pr_info(\"enabled with IRQ %d\\n\", irq);\n}\n",
+        )
+        .unwrap();
+        let tracker = ProgressTracker::new();
+        // The order the roots are visited in is not fixed, so try a few matchers, in both
+        // orders, to check that the generic statement in one root never wins.
+        for attempt in 0..8 {
+            let mut matcher = LogMatcher::new();
+            if attempt % 2 == 0 {
+                matcher.add_root(&generic).unwrap();
+                matcher.add_root(&specific).unwrap();
+            } else {
+                matcher.add_root(&specific).unwrap();
+                matcher.add_root(&generic).unwrap();
+            }
+            assert!(matcher.discover_sources(&tracker).is_empty());
+            matcher.extract_log_statements(&tracker);
+            let msg = "enabled with IRQ 122";
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            let src_ref = matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref)
+                .unwrap();
+            assert!(src_ref.source_path().ends_with("aer.c"));
+
+            // The generic statement is still used when it is the only one that matches.
+            let msg = "requested with IRQ 5";
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            let src_ref = matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref)
+                .unwrap();
+            assert!(src_ref.source_path().ends_with("dock.c"));
+        }
+    }
+
+    #[test]
     fn test_message_constants_from_cache() {
         let temp_dir = tempfile::tempdir().unwrap();
         let root = temp_dir.path().join("src");
@@ -3249,6 +4293,313 @@ class Same {
     }
 
     #[test]
+    fn test_join_ended_by_newline_only() {
+        let source = r#"
+static void show_features(int n, const char **names, int extra)
+{
+    int i;
+
+    pr_info("features:");
+    for (i = 0; i < n; i++)
+        pr_cont(" name=%s", names[i]);
+    pr_cont("\n");
+    if (extra)
+        pr_cont("extra flag set\n");
+    printk(KERN_INFO "regs:");
+    printk(KERN_CONT "\n");
+    printk(KERN_CONT "after regs\n");
+}
+"#;
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.c"), source);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        // The continuations that only end the line are not matched to messages.
+        assert!(sif.log_statements.iter().all(|stmt| stmt.quality > 0));
+        assert_eq!(
+            sif.bare_continuations
+                .iter()
+                .map(|stmt| stmt.line_no)
+                .collect::<Vec<_>>(),
+            vec![9, 13]
+        );
+        let joined = join_continued_lines(&sif);
+        let found: Vec<(usize, Vec<usize>, &str)> = joined
+            .iter()
+            .map(|stmt| {
+                (
+                    stmt.line_no,
+                    stmt.continuations.iter().map(|c| c.line_number).collect(),
+                    stmt.pattern().as_str(),
+                )
+            })
+            .sorted()
+            .collect();
+        // The line ends at the `pr_cont("\n")`, so the continuations after it are not joined.
+        assert_eq!(
+            found,
+            vec![
+                (6, vec![8, 9], r"(?s)^features: name=(.*?)\s*$"),
+                (6, vec![9], r"(?s)^features:\s*$"),
+                (12, vec![13], r"(?s)^(.*)regs:\s*$"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bare_continuation_with_choices() {
+        let source = r#"
+void show(int on)
+{
+    pr_info("state:");
+    pr_cont(" %s\n", on ? "on" : "off");
+}
+"#;
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.c"), source);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        // The choices do not make the continuation a statement of its own.
+        let lines = |stmts: &[Statement]| stmts.iter().map(|s| s.line_no).collect::<Vec<_>>();
+        assert_eq!(lines(&sif.log_statements), vec![4]);
+        assert_eq!(lines(&sif.bare_continuations), vec![5]);
+        let joined = join_continued_lines(&sif);
+        let patterns: Vec<&str> = joined.iter().map(|s| s.pattern().as_str()).collect();
+        assert_eq!(patterns, vec![r"(?s)^state: (off|on)\s*$"]);
+    }
+
+    #[test]
+    fn test_join_bare_continuation_in_loop() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("cpu.c"),
+            r#"static void show_cpu_features(int n, const char **names)
+{
+    int i;
+
+    pr_info("CPU features detected:");
+    for (i = 0; i < n; i++)
+        pr_cont(" %s", names[i]);
+    pr_cont("\n");
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let matched = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            let mapping = matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .unwrap();
+            let src_ref = mapping.src_ref.unwrap();
+            let conts: Vec<usize> = src_ref
+                .continuations
+                .iter()
+                .map(|cont| cont.line_number)
+                .collect();
+            let vars: Vec<(String, String)> = mapping
+                .variables
+                .into_iter()
+                .map(|var| (var.expr, var.value))
+                .collect();
+            (src_ref.line_no, conts, vars)
+        };
+        // The loop printed its continuation more than once, which is not known, so all of the
+        // values are in the one placeholder.
+        assert_eq!(
+            matched("CPU features detected: fpu vme de pse"),
+            (
+                5,
+                vec![7, 8],
+                vec![("names[i]".to_string(), "fpu vme de pse".to_string())]
+            )
+        );
+        // The loop printed nothing, which the start alone matches as well as the joined line.
+        let (line_no, _, vars) = matched("CPU features detected:");
+        assert_eq!((line_no, vars), (5, vec![]));
+        // A continuation without literal text is not matched on its own.
+        assert!(matcher
+            .statements()
+            .all(|stmt| !stmt.is_continuation() || stmt.quality > 0));
+    }
+
+    #[test]
+    fn test_join_continued_lines() {
+        let source = r#"
+static int do_bind_con_driver(int first, int last, int deflt, int j)
+{
+    pr_info("Console: switching ");
+    if (!deflt)
+        pr_cont("consoles %d-%d ", first + 1, last + 1);
+    if (j >= 0) {
+        pr_cont("to %s %dx%d\n", color ? "colour" : "mono", cols, rows);
+    } else {
+        pr_cont("to %s\n", desc);
+    }
+    pr_cont("ends the line\n");
+}
+
+void dump(int a, int b)
+{
+    printk(KERN_INFO "regs:");
+    printk(KERN_CONT " a=%d", a);
+    printk(KERN_CONT " b=%d\n", b);
+    printk(KERN_CONT "after the end\n");
+    pr_info("complete\n");
+    pr_cont("not after a start\n");
+    pr_warn("interrupted ");
+    pr_err("by another print\n");
+    pr_cont("so not continued\n");
+}
+
+void other(void)
+{
+    pr_cont("in another function\n");
+}
+"#;
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.c"), source);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let joined = join_continued_lines(&sif);
+        let found: Vec<(usize, Vec<usize>, &str)> = joined
+            .iter()
+            .map(|stmt| {
+                (
+                    stmt.line_no,
+                    stmt.continuations.iter().map(|c| c.line_number).collect(),
+                    stmt.pattern().as_str(),
+                )
+            })
+            .sorted()
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    4,
+                    vec![6, 8],
+                    r"(?s)^Console: switching\s*consoles (.*)-(.*)\s*to (colour|mono) (.*)x(.*?)\s*$"
+                ),
+                (
+                    4,
+                    vec![6, 10],
+                    r"(?s)^Console: switching\s*consoles (.*)-(.*)\s*to (.*?)\s*$"
+                ),
+                (
+                    4,
+                    vec![6, 12],
+                    r"(?s)^Console: switching\s*consoles (.*)-(.*)\s*ends the line\s*$"
+                ),
+                (
+                    4,
+                    vec![8],
+                    r"(?s)^Console: switching\s*to (colour|mono) (.*)x(.*?)\s*$"
+                ),
+                (4, vec![10], r"(?s)^Console: switching\s*to (.*?)\s*$"),
+                (4, vec![12], r"(?s)^Console: switching\s*ends the line\s*$"),
+                // `KERN_CONT` prints nothing, so it is left out.
+                (17, vec![18, 19], r"(?s)^(.*)regs: a=(.*) b=(.*?)\s*$"),
+            ]
+        );
+        let line = "Console: switching consoles 1-63 to colour 128x48";
+        let stmt = joined
+            .iter()
+            .find(|stmt| stmt.pattern().is_match(line))
+            .unwrap();
+        assert_eq!(stmt.end_line_no, 8);
+        assert_eq!(
+            stmt.text,
+            r#""Console: switching " "consoles %d-%d " "to %s %dx%d\n""#
+        );
+        assert_eq!(stmt.level, LogLevel::Info);
+        let vars: Vec<(String, String)> = extract_variables_from(line, stmt)
+            .into_iter()
+            .map(|pair| (pair.expr, pair.value))
+            .collect();
+        assert_eq!(
+            vars,
+            vec![
+                ("first + 1".to_string(), "1".to_string()),
+                ("last + 1".to_string(), "63".to_string()),
+                (
+                    r#"color ? "colour" : "mono""#.to_string(),
+                    "colour".to_string()
+                ),
+                ("cols".to_string(), "128".to_string()),
+                ("rows".to_string(), "48".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_conditional_string_args() {
+        // A conditional whose results are string literals can only print one of them, so a
+        // line with something else there did not come from the statement, even though `(.*)`
+        // would match it.
+        let source = r#"
+void con_init(struct vc_data *vc, const char *display_desc) {
+    pr_info("Console: %s %s %dx%d\n",
+            vc->vc_can_do_color ? "colour" : "mono",
+            display_desc, vc->vc_cols, vc->vc_rows);
+    pr_info("mode %s\n", fast ? "fast" : (slow ? "slow\t(really)" : "normal"));
+    pr_info("padded %-6s|\n", on ? "on" : "off");
+    pr_info("either %s\n", on ? "on" : name);
+}
+"#;
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.c"), source);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let src_refs = &sif.log_statements;
+        let patterns: Vec<&str> = src_refs.iter().map(|s| s.pattern().as_str()).collect();
+        assert_eq!(
+            patterns,
+            vec![
+                r"(?s)^Console: (colour|mono) (.*) (.*)x(.*?)\s*$",
+                r"(?s)^mode (fast|normal|slow\t\(really\))\s*$",
+                // The width pads the value, so it is not one of the choices.
+                r"(?s)^padded (.*)\|\s*$",
+                // `name` can be anything.
+                r"(?s)^either (.*?)\s*$",
+            ]
+        );
+        // The literal text of the shortest choice counts toward the quality.
+        assert_eq!(
+            src_refs[0].quality,
+            "Console:".len() + "mono".len() + "x".len()
+        );
+
+        let stmt = &src_refs[0];
+        assert!(!stmt
+            .pattern()
+            .is_match("Console: switching to colour frame buffer device 128x48"));
+        let vars: Vec<(String, String)> =
+            extract_variables_from("Console: colour dummy device 80x25", stmt)
+                .into_iter()
+                .map(|pair| (pair.expr, pair.value))
+                .collect();
+        assert_eq!(
+            vars,
+            vec![
+                (
+                    r#"vc->vc_can_do_color ? "colour" : "mono""#.to_string(),
+                    "colour".to_string()
+                ),
+                ("display_desc".to_string(), "dummy device".to_string()),
+                ("vc->vc_cols".to_string(), "80".to_string()),
+                ("vc->vc_rows".to_string(), "25".to_string()),
+            ]
+        );
+
+        // The choices are kept in the cache.
+        let encoded = bincode::serde::encode_to_vec(stmt, bincode::config::standard()).unwrap();
+        let (decoded, _): (Statement, usize) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(decoded.pattern().as_str(), stmt.pattern().as_str());
+    }
+
+    #[test]
     fn test_c_family_macro_calls_in_concatenation() {
         // Macros that wrap a string-literal, like lnav's ANSI_BOLD("..."), cannot be parsed
         // when they are concatenated with other string-literals.
@@ -3286,7 +4637,7 @@ void report(char *buf, int count, long secs, long msecs) {
                 found,
                 vec![
                     (
-                        r"(?s)^(.*)(.*)(.*) row(.*) matched in (.*)(.*)\.(.*)(.*) seconds$",
+                        r"(?s)^(.*)(.*)(.*) row(|s) matched in (.*)(.*)\.(.*)(.*) seconds$",
                         8,
                         vec![
                             "ANSI_BOLD",
@@ -5388,7 +6739,7 @@ void dissect(void) {
             tree: SourceHierTree::from(Path::new("in-mem")),
             files_with_statements: HashMap::new(),
             file_name_to_sources: HashMap::new(),
-            prefilter: None,
+            prefilter: OnceLock::new(),
             line_cache: RwLock::default(),
             log_calls: BTreeMap::new(),
             languages: BTreeSet::new(),
@@ -5713,6 +7064,48 @@ fn load(path: &str) -> Result<()> {
         );
         // Too little in common.
         assert_eq!(find("the cache"), vec![]);
+    }
+
+    #[test]
+    fn test_find_message_sources_unknown_prefix() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.c"),
+            r#"
+void announce(struct device *dev, const char *a, const char *b, int m) {
+    pr_info("%s strings: %s\n", a, b);
+    dev_info(dev, "New USB device strings: Mfr=%d\n", m);
+}
+"#,
+        );
+        let mut sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        prune_log_calls(sif.statements_for_pruning().collect());
+        let find = |message: &str| -> Vec<(String, Option<usize>)> {
+            find_message_sources(sif.statements(), message)
+                .iter()
+                .map(|source| {
+                    (
+                        source.text.clone(),
+                        source.candidates.first().map(|stmt| stmt.line_no),
+                    )
+                })
+                .collect()
+        };
+        // The device name that `dev_info()` adds is not from a statement, but the generic
+        // statement that matches all of the message must not hide the one for the rest of it.
+        assert_eq!(
+            find("usb 1-5: New USB device strings: Mfr=3"),
+            vec![
+                ("usb 1-5".to_string(), None),
+                ("New USB device strings: Mfr=3".to_string(), Some(4)),
+            ]
+        );
+        // The generic statement is still used when nothing explains more of the message.
+        assert_eq!(
+            find("foo: bar strings: baz"),
+            vec![("foo: bar strings: baz".to_string(), Some(3))]
+        );
     }
 
     #[test]
@@ -6103,7 +7496,7 @@ int main(int argc, char *argv[]) {
             tree: SourceHierTree::from(Path::new("in-mem")),
             files_with_statements: HashMap::new(),
             file_name_to_sources: HashMap::new(),
-            prefilter: None,
+            prefilter: OnceLock::new(),
             line_cache: RwLock::default(),
             log_calls: BTreeMap::new(),
             languages: BTreeSet::new(),
@@ -6129,6 +7522,46 @@ int main(int argc, char *argv[]) {
         // A log statement is used even if it only matches with an empty value and the other
         // statement matches without one.
         assert_eq!(best("server ready"), Some((6, MessageCategory::Log)));
+    }
+
+    #[test]
+    fn test_prefilter_single_byte_literals() {
+        let code = CodeSource::from_string(
+            &PathBuf::from("in-mem.c"),
+            r#"
+void f(const char *key, int value) {
+    log_info("%s=%d", key, value);
+    log_info("%s: %d", key, value);
+}
+"#,
+        );
+        let mut tree = SourceTree {
+            tree: SourceHierTree::from(Path::new("in-mem")),
+            files_with_statements: HashMap::new(),
+            file_name_to_sources: HashMap::new(),
+            prefilter: OnceLock::new(),
+            line_cache: RwLock::default(),
+            log_calls: BTreeMap::new(),
+            languages: BTreeSet::new(),
+        };
+        for sif in extract_logging(&[code], &ProgressTracker::new()) {
+            tree.files_with_statements.insert(sif.id, sif);
+        }
+        tree.rebuild_prefilter();
+        let candidates = |line: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+            tree.prefiltered_candidates(&log_ref)
+                .into_iter()
+                .map(|(_, stmt)| stmt.line_no)
+                .sorted()
+                .collect::<Vec<_>>()
+        };
+        // The literal of the first statement is a single byte, which is looked up by byte
+        // instead of in the automaton.
+        assert_eq!(candidates("a=1"), vec![3]);
+        assert_eq!(candidates("a: 1"), vec![4]);
+        assert_eq!(candidates("a=b: 1="), vec![3, 4]);
+        assert!(candidates("nothing").is_empty());
     }
 
     #[test]

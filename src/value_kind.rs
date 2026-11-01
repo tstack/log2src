@@ -12,6 +12,7 @@
 use crate::SourceLanguage;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ops::Range;
@@ -92,6 +93,17 @@ impl ValueKind {
             if spec.contains('\'') {
                 // The digits are grouped, like `1,000`.
                 return ValueKind::Any;
+            }
+            if language.is_c_family() {
+                if let Some(ext) = crate::pointer_extension(spec) {
+                    // Most kernel extensions print text, like a symbol name for `%pS` or an
+                    // error name for `%pe`, but `%px`, `%pK`, and the `%pa` variants for
+                    // physical and DMA addresses print hex.
+                    return match ext {
+                        "" | "x" | "K" | "a" | "ap" | "ad" => ValueKind::Pointer,
+                        _ => ValueKind::Any,
+                    };
+                }
             }
             return match spec.chars().last() {
                 Some('d' | 'i' | 'u') => ValueKind::Integer,
@@ -484,6 +496,127 @@ const BOOL_METHODS: &[&str] = &[
     "endswith",
 ];
 
+/// The regexes for the only values that an argument expression can produce, when it is a
+/// conditional whose results are all string literals, like `colour` and `mono` for
+/// `vc->vc_can_do_color ? "colour" : "mono"`.  This is empty when the value can be anything,
+/// including for a lone string literal, since that is not worth the trouble.
+pub(crate) fn value_choices(language: SourceLanguage, node: Node, source: &str) -> Vec<String> {
+    let node = unparenthesize(node);
+    if !is_conditional(language, node) {
+        return vec![];
+    }
+    let mut choices = vec![];
+    if !collect_choices(language, node, source, &mut choices) {
+        return vec![];
+    }
+    choices.sort();
+    choices.dedup();
+    choices
+}
+
+fn unparenthesize(mut node: Node) -> Node {
+    while node.kind() == "parenthesized_expression" {
+        match node.named_child(0) {
+            Some(inner) if node.named_child_count() == 1 => node = inner,
+            _ => break,
+        }
+    }
+    node
+}
+
+fn is_conditional(language: SourceLanguage, node: Node) -> bool {
+    match language {
+        SourceLanguage::C | SourceLanguage::Cpp => node.kind() == "conditional_expression",
+        SourceLanguage::Java => node.kind() == "ternary_expression",
+        SourceLanguage::Python => node.kind() == "conditional_expression",
+        SourceLanguage::Rust | SourceLanguage::Kotlin => false,
+    }
+}
+
+/// Add the regexes for the values that `node` can produce to `choices`, and return false if it
+/// can produce something other than a string literal.
+fn collect_choices(
+    language: SourceLanguage,
+    node: Node,
+    source: &str,
+    choices: &mut Vec<String>,
+) -> bool {
+    let node = unparenthesize(node);
+    if is_conditional(language, node) {
+        let branches = if language == SourceLanguage::Python {
+            // `consequence if condition else alternative`, without field names.
+            (node.named_child(0), node.named_child(2))
+        } else {
+            (
+                node.child_by_field_name("consequence"),
+                node.child_by_field_name("alternative"),
+            )
+        };
+        return match branches {
+            (Some(consequence), Some(alternative)) => {
+                collect_choices(language, consequence, source, choices)
+                    && collect_choices(language, alternative, source, choices)
+            }
+            // Like GNU C's `x ?: "none"`, where the value of `x` can be anything.
+            _ => false,
+        };
+    }
+    match string_literal_body(language, node, source) {
+        Some(body) => {
+            choices.push(crate::source_ref::literal_to_regex(false, language, body));
+            true
+        }
+        None => false,
+    }
+}
+
+/// The source text between the quotes of a plain string literal, one without a prefix,
+/// interpolation, or raw/multi-line quoting that would change how the text is decoded.
+fn string_literal_body<'s>(
+    language: SourceLanguage,
+    node: Node,
+    source: &'s str,
+) -> Option<&'s str> {
+    let text = &source[node.byte_range()];
+    let mut cursor = node.walk();
+    let mut children = node.named_children(&mut cursor);
+    match language {
+        SourceLanguage::C | SourceLanguage::Cpp | SourceLanguage::Java => {
+            let plain = node.kind() == "string_literal"
+                && text.len() >= 2
+                && text.starts_with('"')
+                && text.ends_with('"')
+                && !text.starts_with("\"\"\"")
+                && children.all(|c| {
+                    matches!(
+                        c.kind(),
+                        "string_content" | "string_fragment" | "escape_sequence"
+                    )
+                });
+            plain.then(|| &text[1..text.len() - 1])
+        }
+        SourceLanguage::Python => {
+            if node.kind() != "string" {
+                return None;
+            }
+            let start = node.named_child(0).filter(|c| c.kind() == "string_start")?;
+            let end = node
+                .named_child(node.named_child_count().checked_sub(1)?)
+                .filter(|c| c.kind() == "string_end")?;
+            let quote = &source[start.byte_range()];
+            let plain = matches!(quote, "\"" | "'")
+                && children.all(|c| {
+                    matches!(
+                        c.kind(),
+                        "string_start" | "string_content" | "escape_sequence" | "string_end"
+                    )
+                });
+            plain.then(|| &source[start.end_byte()..end.start_byte()])
+        }
+        SourceLanguage::Rust | SourceLanguage::Kotlin => None,
+    }
+}
+
 /// Find the first node of the given kind in a pre-order walk, which is the outermost one.
 fn find_node<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
     if node.kind() == kind {
@@ -553,7 +686,7 @@ fn balanced_ends(text: &str) -> Vec<usize> {
     retval
 }
 
-fn is_balanced(text: &str) -> bool {
+pub(crate) fn is_balanced(text: &str) -> bool {
     let mut last = 0;
     scan_balanced(text, |end| last = end);
     last == text.len()
@@ -616,19 +749,30 @@ pub(crate) enum SplitOrder {
     ShortestFirst,
 }
 
+/// The capture group for the placeholder at `index`, which is `default` unless the value can
+/// only be one of a few `choices`.
+fn capture_group<'a>(choices: &[Vec<String>], index: usize, default: &'a str) -> Cow<'a, str> {
+    match choices.get(index) {
+        Some(choices) if !choices.is_empty() => Cow::Owned(format!("({})", choices.join("|"))),
+        _ => Cow::Borrowed(default),
+    }
+}
+
 /// The source of the message matcher, which has a greedy capture for every placeholder.  The
 /// exception is a placeholder followed only by whitespace, which was trimmed to a last segment of
-/// `\s*` by `build_matcher()`, whose capture is lazy so the value leaves out the whitespace.
-pub(crate) fn pattern_source(segments: &[String]) -> String {
+/// `\s*` by `build_matcher()`, whose capture is lazy so the value leaves out the whitespace.  A
+/// placeholder with `choices` captures only those.
+pub(crate) fn pattern_source(segments: &[String], choices: &[Vec<String>]) -> String {
     let mut pattern = "(?s)^".to_string();
     for (index, segment) in segments.iter().enumerate() {
         if index > 0 {
             let last = index == segments.len() - 1;
-            pattern.push_str(if last && segment == "\\s*" {
+            let default = if last && segment == "\\s*" {
                 "(.*?)"
             } else {
                 ANY_CAPTURE
-            });
+            };
+            pattern.push_str(&capture_group(choices, index - 1, default));
         }
         pattern.push_str(segment);
     }
@@ -636,9 +780,39 @@ pub(crate) fn pattern_source(segments: &[String]) -> String {
     pattern
 }
 
-/// Compile a matcher for the message that uses `capture` for every placeholder.
-pub(crate) fn compile_matcher(segments: &[String], capture: &str) -> Option<Regex> {
-    Regex::new(&format!("(?s)^{}$", segments.join(capture))).ok()
+/// Compile a matcher for the message that uses `capture` for every placeholder that does not
+/// have `choices`.
+pub(crate) fn compile_matcher(
+    segments: &[String],
+    choices: &[Vec<String>],
+    capture: &str,
+) -> Option<Regex> {
+    let mut pattern = "(?s)^".to_string();
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            pattern.push_str(&capture_group(choices, index - 1, capture));
+        }
+        pattern.push_str(segment);
+    }
+    pattern.push('$');
+    Regex::new(&pattern).ok()
+}
+
+/// Compile anchored regexes for the `choices` of each placeholder, as needed by
+/// `split_values()`.
+pub(crate) fn compile_choices(choices: &[Vec<String>]) -> Option<Vec<Option<Regex>>> {
+    choices
+        .iter()
+        .map(|choices| {
+            if choices.is_empty() {
+                Some(None)
+            } else {
+                Regex::new(&format!("(?s)^(?:{})$", choices.join("|")))
+                    .ok()
+                    .map(Some)
+            }
+        })
+        .collect()
 }
 
 /// Compile unanchored regexes for the literal text after each placeholder, as needed by
@@ -680,6 +854,7 @@ pub(crate) fn split_values(
     text: &str,
     segments: &[Regex],
     kinds: &[ValueKind],
+    choices: &[Option<Regex>],
     order: SplitOrder,
 ) -> Option<Vec<Range<usize>>> {
     if segments.len() != kinds.len() + 1 {
@@ -690,6 +865,7 @@ pub(crate) fn split_values(
         text,
         segments,
         kinds,
+        choices,
         order,
         values: Vec::with_capacity(kinds.len()),
         failed: HashSet::new(),
@@ -706,6 +882,9 @@ struct SplitSearch<'a> {
     text: &'a str,
     segments: &'a [Regex],
     kinds: &'a [ValueKind],
+    /// The anchored regexes for the only values each placeholder can have, if any.  It can be
+    /// shorter than `kinds` when no placeholder has choices.
+    choices: &'a [Option<Regex>],
     order: SplitOrder,
     values: Vec<Range<usize>>,
     /// The (placeholder, offset) pairs that are known to not lead to a valid split.
@@ -741,6 +920,11 @@ impl SplitSearch<'_> {
             let Some(value) = kind.value_range(&rest[..end]) else {
                 continue;
             };
+            if let Some(Some(choices)) = self.choices.get(index) {
+                if !choices.is_match(&rest[value.clone()]) {
+                    continue;
+                }
+            }
             self.values.push(pos + value.start..pos + value.end);
             if self.search(index + 1, pos + end + sep.end()) {
                 return true;
@@ -781,6 +965,84 @@ mod tests {
         ValueKind::from_node(language, arg, &source)
     }
 
+    /// Parse `expr` as the second argument of a call and get the regexes for its choices.
+    fn choices_of(language: SourceLanguage, expr: &str) -> Vec<String> {
+        let (source, list_kind) = match language {
+            SourceLanguage::Java => (
+                format!("class A {{ void f() {{ log.info(\"x\", {expr}); }} }}"),
+                "argument_list",
+            ),
+            SourceLanguage::C | SourceLanguage::Cpp => {
+                (format!("void f() {{ f(\"x\", {expr}); }}"), "argument_list")
+            }
+            SourceLanguage::Python => (format!("f(\"x\", {expr})\n"), "argument_list"),
+            _ => unreachable!(),
+        };
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language.into()).unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let list = find_node(tree.root_node(), list_kind).unwrap();
+        let arg = list.named_child(1).unwrap();
+        value_choices(language, arg, &source)
+    }
+
+    #[test]
+    fn test_value_choices() {
+        use SourceLanguage::*;
+        let cases: &[(SourceLanguage, &str, &[&str])] = &[
+            (C, r#"color ? "colour" : "mono""#, &["colour", "mono"]),
+            (C, r#"(n == 1) ? "" : "s""#, &["", "s"]),
+            (C, r#"(a ? "x" : (b ? "y" : "x"))"#, &["x", "y"]),
+            (C, r#"a ? "a.b\n" : "c""#, &[r"a\.b\n", "c"]),
+            (C, r#"a ? "x" : name"#, &[]),
+            (C, r#"a ?: "none""#, &[]),
+            (C, r#"a ? "x" "y" : "z""#, &[]),
+            (C, r#"a ? L"x" : L"y""#, &[]),
+            // A lone literal is not worth the trouble.
+            (C, r#""x""#, &[]),
+            (Cpp, r#"ok ? "yes" : "no""#, &["no", "yes"]),
+            (Cpp, r#"ok ? R"(yes)" : "no""#, &[]),
+            (Java, r#"ok ? "yes" : "no""#, &["no", "yes"]),
+            (
+                Java,
+                r#"ok ? """
+                yes""" : "no""#,
+                &[],
+            ),
+            (Python, r#""yes" if ok else 'no'"#, &["no", "yes"]),
+            (Python, r#""yes" if ok else f"no {x}""#, &[]),
+            (Python, r#""yes" if ok else r"no""#, &[]),
+        ];
+        for (language, expr, expected) in cases {
+            assert_eq!(
+                choices_of(*language, expr),
+                *expected,
+                "{language:?} {expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_split_choices() {
+        use ValueKind::*;
+        let segments =
+            compile_segments(&["".to_string(), " ".to_string(), "".to_string()]).unwrap();
+        let choices = compile_choices(&[vec![], vec!["b c".to_string(), "c".to_string()]]).unwrap();
+        let split = |choices: &[Option<Regex>]| {
+            split_values(
+                "a b c",
+                &segments,
+                &[Any, Any],
+                choices,
+                SplitOrder::LongestFirst,
+            )
+        };
+        assert_eq!(split(&[]), Some(vec![0..3, 4..5]));
+        assert_eq!(split(&choices), Some(vec![0..3, 4..5]));
+        let choices = compile_choices(&[vec![], vec!["b c".to_string()]]).unwrap();
+        assert_eq!(split(&choices), Some(vec![0..1, 2..5]));
+    }
+
     fn kinds_of(language: SourceLanguage, exprs: &[&str]) -> Vec<ValueKind> {
         exprs.iter().map(|expr| kind_of(language, expr)).collect()
     }
@@ -806,6 +1068,16 @@ mod tests {
             (Python, "%a", Any),
             (Cpp, "%p", Pointer),
             (Cpp, "%-20p", Pointer),
+            // Linux kernel extensions of `%p`.
+            (C, "%pR", Any),
+            (C, "%pOFn", Any),
+            (C, "%pe", Any),
+            (C, "%pd", Any),
+            (C, "%p4cc", Any),
+            (C, "%*ph", Any),
+            (C, "%px", Pointer),
+            (C, "%pK", Pointer),
+            (C, "%pad", Pointer),
             (Cpp, "{:p}", Pointer),
             (Rust, "{:p}", Pointer),
             (Cpp, "{:d}", Integer),
@@ -983,7 +1255,7 @@ mod tests {
                 Regex::new(&format!("(?s)^(?:{seg}){end}")).unwrap()
             })
             .collect();
-        split_values(text, &segments, kinds, SplitOrder::LongestFirst).map(|ranges| {
+        split_values(text, &segments, kinds, &[], SplitOrder::LongestFirst).map(|ranges| {
             ranges
                 .into_iter()
                 .map(|range| text[range].to_string())
@@ -1075,7 +1347,7 @@ mod tests {
         .map(|seg| Regex::new(seg).unwrap())
         .collect();
         let values = |text: &str, order| {
-            split_values(text, &segments, &[Any, Any, Any], order).map(|ranges| {
+            split_values(text, &segments, &[Any, Any, Any], &[], order).map(|ranges| {
                 ranges
                     .into_iter()
                     .map(|range| text[range].to_string())

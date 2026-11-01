@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{sleep, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, fs, io, path::PathBuf};
 
 fn get_footer() -> String {
@@ -198,6 +198,7 @@ impl MessageAccumulator {
             .unwrap_or_else(move || LogMapping {
                 log_ref,
                 src_ref: None,
+                prefix: None,
                 variables: vec![],
                 exception_trace: vec![],
             })
@@ -307,22 +308,51 @@ struct ErrorWrapper {
     error: SerializableDiagnostic,
 }
 
-/// Print the progress updates from the tracker to stderr until it is dropped.
+/// Print the progress updates from the tracker to stderr until it is dropped.  A step shows a
+/// spinner with the time spent on it, and its current part, until it ends or has a known amount
+/// of work, which shows a progress bar instead.  Nothing is drawn if stderr is not a terminal,
+/// but the result of each step is still printed.
 fn spawn_progress_listener(tracker: &mut ProgressTracker) -> JoinHandle<()> {
     let listener = tracker.subscribe();
     std::thread::spawn(move || {
         let mut prefix = String::new();
+        let mut spinner: Option<ProgressBar> = None;
+        let mut step_start = Instant::now();
+        let new_spinner = |prefix: &str, message: &str, step_start: Instant| {
+            let spinner = ProgressBar::new_spinner()
+                .with_elapsed(step_start.elapsed())
+                .with_prefix(prefix.to_string())
+                .with_message(message.to_string())
+                .with_style(
+                    ProgressStyle::with_template("{prefix}... {spinner} {msg} ({elapsed})")
+                        .unwrap(),
+                );
+            spinner.enable_steady_tick(Duration::from_millis(100));
+            spinner
+        };
         for update in listener {
             match update {
-                ProgressUpdate::Step(msg) => eprintln!("{}", msg),
+                ProgressUpdate::Step(msg) => match &spinner {
+                    Some(spinner) => spinner.set_message(msg),
+                    None => eprintln!("{}", msg),
+                },
                 ProgressUpdate::BeginStep(msg) => {
+                    step_start = Instant::now();
+                    spinner = Some(new_spinner(&msg, "", step_start));
                     prefix = msg;
                 }
                 ProgressUpdate::EndStep(msg) => {
+                    if let Some(spinner) = spinner.take() {
+                        spinner.finish_and_clear();
+                    }
                     eprintln!("{}... {}", prefix, msg);
                     prefix.clear();
                 }
                 ProgressUpdate::Work(info) => {
+                    let message = spinner.take().map(|spinner| {
+                        spinner.finish_and_clear();
+                        spinner.message()
+                    });
                     // XXX Take the stdout lock so that the actual output does not interfere
                     // with the progress bar updates on stderr.
                     let _stdout_lock = stdout().lock();
@@ -339,6 +369,9 @@ fn spawn_progress_listener(tracker: &mut ProgressTracker) -> JoinHandle<()> {
                         sleep(Duration::from_millis(33));
                     }
                     bar.finish_and_clear();
+                    // The step can still have work to do after this, like the post-processing
+                    // after reading the cache.
+                    spinner = message.map(|message| new_spinner(&prefix, &message, step_start));
                 }
             }
         }
