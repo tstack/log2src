@@ -33,6 +33,12 @@ const MAX_DEPTH: usize = 6;
 /// Values shorter than this are not looked up, since they would match all sorts of statements.
 const MIN_VALUE_LEN: usize = 4;
 
+/// How many of the `": "` separators in a text are tried as the end of a prefix or the head of a
+/// chain.  Each one is a reading of the rest of the text, so trying all of them is quadratic in
+/// a large message, like a JSON document, which has one for every field.  A prefix or the head
+/// of a chain is a few words, so it is in front of the first few separators.
+const MAX_SPLITS: usize = 8;
+
 /// The least amount of literal text, not counting whitespace, that a statement has to share with
 /// a fragment of a message.
 const MIN_FRAGMENT_LEN: usize = 10;
@@ -85,6 +91,9 @@ pub(crate) fn best_log_source<'s>(
             .filter(|stmt| stmt.quality >= MIN_FALLBACK_QUALITY)
             .collect(),
     };
+    if finder.statements.is_empty() {
+        return None;
+    }
     let body = body.trim();
     let (score, sources) = finder.prefixed_resolve(body, body);
     if let [only] = sources.as_slice() {
@@ -136,7 +145,7 @@ impl<'s> Finder<'s> {
         if best.1.is_empty() && collapsed != message {
             best = self.resolve(collapsed, 0, true);
         }
-        for (pos, sep) in collapsed.match_indices(": ") {
+        for (pos, sep) in collapsed.match_indices(": ").take(MAX_SPLITS) {
             let (score, mut sources) = self.resolve(&collapsed[pos + sep.len()..], 0, true);
             if !sources.is_empty() && score > best.0 {
                 sources.insert(0, MessageSource::unknown(&collapsed[..pos]));
@@ -196,7 +205,7 @@ impl<'s> Finder<'s> {
         // A chain of messages, like `"outer: inner: leaf"`, where each part was made separately.
         // A statement that matches all of the text wins a tie, like `"Unable to start: {:#}"`
         // with the whole chain in its placeholder.
-        for (pos, sep) in text.match_indices(": ") {
+        for (pos, sep) in text.match_indices(": ").take(MAX_SPLITS) {
             let Some((head_score, head)) = self.source(&text[..pos], depth, top) else {
                 continue;
             };
