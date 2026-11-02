@@ -32,6 +32,8 @@ pub enum ValueKind {
     Char,
     Bool,
     Pointer,
+    /// An integer whose digits are grouped by the locale, like `1,000` for printf's `%'d`.
+    GroupedInteger,
 }
 
 /// The capture group used in a message matcher for a placeholder whose value can be anything.
@@ -46,7 +48,7 @@ static VALUE_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 impl ValueKind {
-    const ALL: [ValueKind; 10] = [
+    const ALL: [ValueKind; 11] = [
         ValueKind::Any,
         ValueKind::Integer,
         ValueKind::Hex,
@@ -57,6 +59,7 @@ impl ValueKind {
         ValueKind::Char,
         ValueKind::Bool,
         ValueKind::Pointer,
+        ValueKind::GroupedInteger,
     ];
 
     fn index(&self) -> usize {
@@ -84,15 +87,23 @@ impl ValueKind {
             // Most C libraries print "0x" and lowercase hex digits, but MSVC prints zero-padded
             // uppercase digits without the prefix, and glibc prints "(nil)" for null.
             ValueKind::Pointer => r"\s*((?:0[xX])?[0-9a-fA-F]+|\((?:nil|null)\))\s*",
+            // The separator depends on the locale, and it is not used for small numbers or in
+            // the "C" locale.  Some locales use a no-break space, like `1\u{202f}000`.
+            ValueKind::GroupedInteger => {
+                r"\s*([-+]?(?:\d{1,3}(?:[,.'_\x{a0}\x{202f}]\d{3})+|\d+))\s*"
+            }
         }
     }
 
     /// Derive the kind from the text of a placeholder in a format string, like `%5d` or `{:#x}`.
     pub fn from_placeholder(language: SourceLanguage, placeholder: &str) -> ValueKind {
         if let Some(spec) = placeholder.strip_prefix('%') {
-            if spec.contains('\'') {
-                // The digits are grouped, like `1,000`.
-                return ValueKind::Any;
+            if spec.contains(['\'', ',']) {
+                // The digits are grouped, like `1,000`, by `'` in C or `,` in Java.
+                return match spec.chars().last() {
+                    Some('d' | 'i' | 'u') => ValueKind::GroupedInteger,
+                    _ => ValueKind::Any,
+                };
             }
             if language.is_c_family() {
                 if let Some(ext) = crate::pointer_extension(spec) {
@@ -149,9 +160,16 @@ impl ValueKind {
             (Some('<' | '>' | '^'), _) => &spec[1..],
             _ => spec,
         };
-        if rest.contains([',', '_', 'L']) {
-            // Digit grouping/locale-specific formatting.
+        if rest.contains('L') {
+            // Locale-specific formatting.
             return ValueKind::Any;
+        }
+        if rest.contains([',', '_']) {
+            // Digit grouping, like Python's `{:,d}`.
+            return match rest.chars().last() {
+                Some('d') => ValueKind::GroupedInteger,
+                _ => ValueKind::Any,
+            };
         }
         match rest.chars().last() {
             Some('d') => ValueKind::Integer,
@@ -429,6 +447,19 @@ impl ValueKind {
                     .char_indices()
                     .filter(|(_, c)| !c.is_whitespace())
                     .nth(1)
+                    .map_or(text.len(), |(index, _)| index);
+                (1..=limit).filter(|&i| text.is_char_boundary(i)).collect()
+            }
+            ValueKind::GroupedInteger => {
+                // The separator could be a no-break space, so the value ends at the first
+                // character that cannot be in a grouped number.
+                let limit = text
+                    .char_indices()
+                    .find(|(_, c)| {
+                        !(c.is_ascii_digit()
+                            || c.is_whitespace()
+                            || matches!(c, ',' | '.' | '\'' | '_' | '+' | '-'))
+                    })
                     .map_or(text.len(), |(index, _)| index);
                 (1..=limit).filter(|&i| text.is_char_boundary(i)).collect()
             }
@@ -1052,6 +1083,10 @@ mod tests {
         use SourceLanguage::*;
         use ValueKind::*;
         let cases = [
+            (Cpp, "%'d", GroupedInteger),
+            (C, "%'lu", GroupedInteger),
+            (Java, "%,d", GroupedInteger),
+            (Cpp, "%'.2f", Any),
             (Cpp, "%d", Integer),
             (Cpp, "%-5lld", Integer),
             (Cpp, "%zu", Integer),
@@ -1115,8 +1150,11 @@ mod tests {
     #[test]
     fn test_from_format_spec_python() {
         assert_eq!(ValueKind::from_format_spec(">5.2f"), ValueKind::Float);
-        assert_eq!(ValueKind::from_format_spec(",d"), ValueKind::Any);
+        assert_eq!(ValueKind::from_format_spec(",d"), ValueKind::GroupedInteger);
+        assert_eq!(ValueKind::from_format_spec("_d"), ValueKind::GroupedInteger);
+        assert_eq!(ValueKind::from_format_spec(",.2f"), ValueKind::Any);
         assert_eq!(ValueKind::from_format_spec("_x"), ValueKind::Any);
+        assert_eq!(ValueKind::from_format_spec("Ld"), ValueKind::Any);
         assert_eq!(ValueKind::from_format_spec(".1%"), ValueKind::Any);
         assert_eq!(ValueKind::from_format_spec("n"), ValueKind::Any);
         assert_eq!(ValueKind::from_format_spec("=5d"), ValueKind::Any);
@@ -1499,6 +1537,32 @@ mod tests {
                 Pointer.value_range(text),
                 Some(0..text.len()),
                 "Pointer {text:?}"
+            );
+        }
+        for text in [
+            "0",
+            "999",
+            "-1,234",
+            "1,234,567",
+            "1.234",
+            "1'234",
+            "1_234",
+            "1\u{a0}234",
+            "1\u{202f}234",
+            // The "C" locale does not group the digits.
+            "1234567",
+        ] {
+            assert_eq!(
+                GroupedInteger.value_range(text),
+                Some(0..text.len()),
+                "GroupedInteger {text:?}"
+            );
+        }
+        for text in ["1,23", "1,2345", ",123", "1,234,", "1 234", "abc", "1.5"] {
+            assert_eq!(
+                GroupedInteger.value_range(text),
+                None,
+                "GroupedInteger {text:?}"
             );
         }
         // Padding is not part of the value.

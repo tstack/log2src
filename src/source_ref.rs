@@ -1,10 +1,11 @@
 use crate::java_symbols::MessageRef;
-use crate::value_kind::{self, ValueKind, ANY_CAPTURE};
+use crate::value_kind::{self, SplitOrder, ValueKind, ANY_CAPTURE};
 use crate::{pointer_extension, CodeSource, QueryResult, SourceLanguage};
 use core::fmt;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::ops::Range;
 use std::str::Chars;
 use std::sync::OnceLock;
 
@@ -392,8 +393,15 @@ impl MessageCategory {
                 "log" => MessageCategory::Log,
                 _ => MessageCategory::Other,
             },
-            // The Java query only finds calls on a logger.
-            SourceLanguage::Java | SourceLanguage::Kotlin => MessageCategory::Log,
+            // The other Java calls with a message are methods of a builder, like the `append`
+            // in `new StringBuilder().append("...")`.
+            SourceLanguage::Java => match Self::short_call_name(src_ref) {
+                // a level that is not known until runtime, like `logger.log(lvl, "...")`
+                "log" => MessageCategory::Log,
+                _ => MessageCategory::Other,
+            },
+            // The Kotlin query only finds calls on a logger.
+            SourceLanguage::Kotlin => MessageCategory::Log,
         }
     }
 
@@ -437,10 +445,12 @@ impl MessageCategory {
     }
 
     /// Check if a C or C++ call makes an error with the message, like a C++
-    /// `throw std::runtime_error("...")`, which is named `throw std::runtime_error`, or GLib's
-    /// `g_set_error()`.
+    /// `throw std::runtime_error("...")`, which is named `throw std::runtime_error`, GLib's
+    /// `g_set_error()`, or the `Err()` of a C++ `Result` type, like lnav's.
     pub(crate) fn is_c_error_call(name: &str) -> bool {
-        Self::is_exception_call(name) || matches!(name, "g_set_error" | "g_set_error_literal")
+        Self::is_exception_call(name)
+            || matches!(name, "g_set_error" | "g_set_error_literal")
+            || name.rsplit("::").next() == Some("Err")
     }
 
     /// Check if a call makes an exception with the message, like a C++ or Java
@@ -671,6 +681,11 @@ pub struct Statement {
     non_empty_matcher: OnceLock<Option<Regex>>,
     #[serde(skip)]
     choice_matchers: OnceLock<Option<Vec<Option<Regex>>>>,
+    /// `pattern` with each run of whitespace in the literal text matching any whitespace, for
+    /// text whose whitespace was changed, like a message copied from a GUI that wrapped it.
+    /// None if `pattern` already matches the same text, see `relaxed_pattern()`.
+    #[serde(skip)]
+    relaxed_pattern: OnceLock<Option<Regex>>,
 }
 
 struct MessageMatcher {
@@ -754,6 +769,7 @@ impl Statement {
                 separators: OnceLock::new(),
                 non_empty_matcher: OnceLock::new(),
                 choice_matchers: OnceLock::new(),
+                relaxed_pattern: OnceLock::new(),
             };
             if quality == 0 {
                 // A message without literal text matches anything, so it is only kept if it
@@ -824,6 +840,7 @@ impl Statement {
             separators: OnceLock::new(),
             non_empty_matcher: OnceLock::new(),
             choice_matchers: OnceLock::new(),
+            relaxed_pattern: OnceLock::new(),
         })
     }
 
@@ -906,6 +923,7 @@ impl Statement {
             separators: OnceLock::new(),
             non_empty_matcher: OnceLock::new(),
             choice_matchers: OnceLock::new(),
+            relaxed_pattern: OnceLock::new(),
         }
     }
 
@@ -1176,6 +1194,31 @@ impl Statement {
         })
     }
 
+    /// `pattern()` with each run of whitespace in the literal text, like the two spaces after a
+    /// sentence, matching any run of whitespace, for text whose whitespace was collapsed by
+    /// `collapse_whitespace()`.  It is compiled the first time it is needed.  Most statements
+    /// only have single spaces, which already match collapsed text, so `pattern()` is used for
+    /// those rather than compiling another regex for every statement.
+    pub fn relaxed_pattern(&self) -> &Regex {
+        self.relaxed_pattern
+            .get_or_init(|| {
+                let segments: Vec<String> = self
+                    .segments
+                    .iter()
+                    .map(|segment| relax_whitespace(segment))
+                    .collect();
+                // A single space became a `\s+`, which matches the same collapsed text.
+                let same = std::iter::zip(&segments, &self.segments)
+                    .all(|(relaxed, segment)| *relaxed == segment.replace(' ', "\\s+"));
+                if same {
+                    return None;
+                }
+                Regex::new(&value_kind::pattern_source(&segments, &self.choices)).ok()
+            })
+            .as_ref()
+            .unwrap_or_else(|| self.pattern())
+    }
+
     /// The source of `pattern()`, which does not need to compile it.  It is borrowed from the
     /// regex if that was already compiled.
     pub fn pattern_source(&self) -> Cow<'_, str> {
@@ -1257,6 +1300,50 @@ impl Statement {
         self.separators
             .get_or_init(|| value_kind::compile_separators(&self.segments))
             .as_deref()
+    }
+
+    /// Check if the values that `pattern`, this statement's pattern or `relaxed_pattern()`,
+    /// captures from `text` look like the kinds of values in the format string, like a number
+    /// for `%d`.  The kinds guessed from the argument expressions are not used, since they are
+    /// only guesses.  Returns true if `text` does not match, since that is not the question.
+    pub(crate) fn values_fit_kinds(&self, pattern: &Regex, text: &str) -> bool {
+        if self.kinds.iter().all(|kind| *kind == ValueKind::Any) {
+            return true;
+        }
+        let Some(captures) = pattern.captures(text) else {
+            return true;
+        };
+        let values: Vec<Range<usize>> = captures
+            .iter()
+            .skip(1)
+            .map(|value| value.map_or(0..0, |value| value.range()))
+            .collect();
+        if values.len() != self.kinds.len() {
+            return true;
+        }
+        let fits = |values: &[Range<usize>]| {
+            std::iter::zip(values, &self.kinds).all(|(range, kind)| {
+                *kind == ValueKind::Any || kind.value_range(&text[range.clone()]).is_some()
+            })
+        };
+        if fits(&values) {
+            return true;
+        }
+        // The greedy captures give everything to the first of two placeholders that are next
+        // to each other, so another split could fit.  The segment matchers need the exact
+        // whitespace, so this only works for text that matches the pattern.
+        self.pattern().is_match(text)
+            && self.segment_matchers().is_some_and(|segments| {
+                let choices = self.choice_matchers().unwrap_or_default();
+                value_kind::split_values(
+                    text,
+                    segments,
+                    &self.kinds,
+                    choices,
+                    SplitOrder::LongestFirst,
+                )
+                .is_some()
+            })
     }
 
     /// Check if `body` matches this statement with a non-empty value for every placeholder.
@@ -1430,19 +1517,63 @@ fn push_regex_literal(out: &mut String, c: char) {
     }
 }
 
+/// Replace each run of whitespace in a regex built by `push_regex_literal()`, like a segment of a
+/// matcher, with `\s+`, so it matches text that was wrapped or had its whitespace collapsed.  A
+/// run that is only the optional trailing whitespace added by `build_matcher()` stays optional.
+fn relax_whitespace(regex: &str) -> String {
+    let mut retval = String::new();
+    // Whether there is a run of whitespace that has not been added yet, and whether it is all
+    // optional.
+    let mut run: Option<bool> = None;
+    let mut chars = regex.chars().peekable();
+    while let Some(c) = chars.next() {
+        let (space, optional, token) = match c {
+            '\\' => match chars.next() {
+                Some('n' | 'r' | 't') => (true, false, String::new()),
+                Some('s') => {
+                    chars.next_if_eq(&'*');
+                    (true, true, String::new())
+                }
+                Some(next) => (false, false, format!("\\{next}")),
+                None => (false, false, "\\".to_string()),
+            },
+            c if c.is_whitespace() => (true, false, String::new()),
+            c => (false, false, c.to_string()),
+        };
+        if space {
+            run = Some(run.unwrap_or(true) && optional);
+            continue;
+        }
+        if let Some(optional) = run.take() {
+            retval.push_str(if optional { "\\s*" } else { "\\s+" });
+        }
+        retval.push_str(&token);
+    }
+    if let Some(optional) = run {
+        retval.push_str(if optional { "\\s*" } else { "\\s+" });
+    }
+    retval
+}
+
 /// The literal text matched by a regex built by `push_regex_literal()`, like a segment of a
 /// matcher.  An unescaped `.`, which `literal_to_regex()` uses for a character that it could not
 /// decode, matches anything, so the text is split there and the pieces are returned.
 pub(crate) fn regex_literal_pieces(regex: &str) -> Vec<String> {
     let mut pieces = vec![];
     let mut piece = String::new();
-    let mut chars = regex.chars();
+    let mut chars = regex.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '\\' => match chars.next() {
                 Some('n') => piece.push('\n'),
                 Some('r') => piece.push('\r'),
                 Some('t') => piece.push('\t'),
+                // The optional trailing whitespace added by `build_matcher()`, which is not
+                // literal text.  A literal `s` is never escaped by `push_regex_literal()`.
+                Some('s') => {
+                    chars.next_if_eq(&'*');
+                    pieces.push(std::mem::take(&mut piece));
+                }
                 Some('x') => {
                     let hex: String = chars.by_ref().take(2).collect();
                     piece.extend(u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32));
@@ -1690,7 +1821,18 @@ pub(crate) fn literal_to_regex(raw: bool, language: SourceLanguage, segment: &st
 
 #[cfg(test)]
 mod tests {
-    use super::{c_parameter_names, push_regex_literal, regex_literal_pieces};
+    use super::{c_parameter_names, push_regex_literal, regex_literal_pieces, relax_whitespace};
+
+    #[test]
+    fn test_relax_whitespace() {
+        assert_eq!(relax_whitespace(r"a\.  b c"), r"a\.\s+b\s+c");
+        assert_eq!(relax_whitespace(r"a \n\tb"), r"a\s+b");
+        // The optional trailing whitespace stays optional, unless there is other whitespace.
+        assert_eq!(relax_whitespace(r"done\s*"), r"done\s*");
+        assert_eq!(relax_whitespace(r"done \s*"), r"done\s+");
+        // An escaped backslash is not the start of an escape.
+        assert_eq!(relax_whitespace(r"a\\n b"), r"a\\n\s+b");
+    }
 
     #[test]
     fn test_c_parameter_names() {

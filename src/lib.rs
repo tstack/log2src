@@ -156,7 +156,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "45")]
+    #[serde(rename = "50")]
     Current,
 }
 
@@ -1839,6 +1839,16 @@ static RUST_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 const JAVA_LOGGER_OBJECT: &str = "log(ger)?|LOG(GER)?";
 const JAVA_LEVEL_METHODS: &str = "fine|^config$|debug|info|warn|trace|error|severe|fatal";
 
+/// The methods that are not given to the patterns for builders in the Java query, since a
+/// level name would make a call on something that is not a logger, like `parser.error("...")`,
+/// look like logging.  The calls on a logger are found by the other patterns.
+const JAVA_NOT_BUILDER_METHODS: &str =
+    "^(log|fine|finer|finest|config|debug|info|warn|warning|trace|error|severe|fatal)$";
+
+/// The comments that can come before an argument, like the `// language=sql` in front of SQL,
+/// for the patterns with an anchor.
+const JAVA_COMMENTS: &str = "[(line_comment) (block_comment)]*";
+
 static JAVA_QUERY: LazyLock<String> = LazyLock::new(|| {
     format!(
         r#"
@@ -1917,6 +1927,36 @@ static JAVA_QUERY: LazyLock<String> = LazyLock::new(|| {
                             ]
                         )
                     )
+                    ; Text passed to a method of a builder, like the `.append(" is not valid")`
+                    ; in `new StringBuilder().append(name).append(" is not valid")`, or the
+                    ; first link of a chain, like `sql.append(" OR (").append(clause)`
+                    (method_invocation
+                        object: [(method_invocation) (object_creation_expression)]
+                        name: (identifier) @method-name
+                        arguments: (argument_list . {JAVA_COMMENTS} . [(string_literal) (binary_expression)] @arguments)
+                        (#not-match? @method-name "{JAVA_NOT_BUILDER_METHODS}")
+                    )
+                    (method_invocation
+                        object: (method_invocation
+                            name: (identifier) @method-name
+                            arguments: (argument_list . {JAVA_COMMENTS} . [(string_literal) (binary_expression)] @arguments)
+                        )
+                        (#not-match? @method-name "{JAVA_NOT_BUILDER_METHODS}")
+                    )
+                    ; Text passed to a constructor, like `new StringBuilder("SELECT ...")`.  The
+                    ; name of an exception that is thrown is changed by `exception_call_name()`.
+                    (object_creation_expression
+                        type: (_) @type-name
+                        arguments: (argument_list . {JAVA_COMMENTS} . [(string_literal) (binary_expression)] @arguments)
+                    )
+                    ; Text passed to a method by itself, like `sql.append(" ORDER BY 1");`
+                    (expression_statement
+                        (method_invocation
+                            name: (identifier) @method-name
+                            arguments: (argument_list . {JAVA_COMMENTS} . [(string_literal) (binary_expression)] @arguments)
+                        )
+                        (#not-match? @method-name "{JAVA_NOT_BUILDER_METHODS}")
+                    )
                 "#
     )
 });
@@ -1964,13 +2004,41 @@ static PYTHON_PLACEHOLDER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Calls that take string-literals that are not messages, like `strcpy` or `getenv`.
 const C_NOT_LOGGING_CALLS: &str = "(^|::)(strcpy|strncpy|strcat|strncat|strcmp|strncmp|strcasecmp|strncasecmp|strstr|strchr|strrchr|strdup|strtok|setenv|getenv|fopen|open|access|stat)$";
 
+/// Names with a word about errors or messages, like `make_error`, `user_message::error`,
+/// `Err`, or `zErrMsg`, where a word starts after a non-letter or is a capitalized part of
+/// a camel-case name.
+const C_MESSAGE_NAME: &str = "((^|[^A-Za-z])(?i:err|error|fail|failure|warn|warning|msg|message|exception)|[a-z0-9](Err|Error|Fail|Failure|Warn|Warning|Msg|Message|Exception))s?([^a-z]|$)";
+
 /// The query for C and C++ calls with a message, where `literals` are the kinds of nodes that
 /// are messages.  C++ also has the messages of the exceptions that are thrown, like
-/// `throw std::runtime_error("...")`.
+/// `throw std::runtime_error("...")`, and the messages passed to a method of a builder that
+/// is part of a larger expression, like the `.append("...")` in
+/// `report(attr_line_t().append_quoted(x).append(" is not valid"))`, or that start a chain,
+/// like the `" OR ("` in `sql.append(" OR (").append(clause);`, and the text passed to a
+/// constructor, like `std::string sql("SELECT ...");`.
 fn c_family_query(literals: &str, cpp: bool) -> String {
-    let throw = if cpp {
+    let cpp_only = if cpp {
         format!(
             r#"
+            (call_expression
+                function: (field_expression argument: (call_expression)) @fname
+                arguments: (argument_list [{literals}] @arguments)
+            )
+            ; the first link of a chain, like `sql.append(" OR (").append(x)` or
+            ; `attr_line_t("invalid value ").append(x)`
+            (field_expression
+                argument: (call_expression
+                    function: (_) @fname
+                    arguments: (argument_list [{literals}] @arguments)
+                )
+            )
+            ; a constructor, like `std::string sql("SELECT ...");`
+            (declaration
+                type: (_) @fname
+                declarator: (init_declarator
+                    value: (argument_list [{literals}] @arguments)
+                )
+            )
             (throw_statement
                 (call_expression
                     function: (_) @fname
@@ -2009,7 +2077,37 @@ fn c_family_query(literals: &str, cpp: bool) -> String {
                 )
                 (#not-match? @fname "{C_NOT_LOGGING_CALLS}")
             )
-            {throw}
+            ; A message for a call whose result is used, like `return ec.make_error("...")`,
+            ; `msg = user_message::error("...")`, or `return Err(fmt::format("...", x))`.  The
+            ; results of all sorts of calls are used, like `auto msg = fmt::format("...")` or
+            ; `auto it = m.find("key")`, so only calls named for errors and messages are kept.
+            (
+                (call_expression
+                    function: (_) @fname
+                    arguments: (argument_list [{literals}] @arguments)
+                )
+                (#match? @fname "{C_MESSAGE_NAME}")
+            )
+            (
+                (call_expression
+                    function: (_) @fname
+                    arguments: (argument_list (call_expression) @message-call)
+                )
+                (#match? @fname "{C_MESSAGE_NAME}")
+            )
+            ; A message assigned to an error, like `tab->zErrMsg = sqlite3_mprintf("...")`
+            (
+                (assignment_expression
+                    left: (_) @_lhs
+                    right: (call_expression
+                        function: (_) @fname
+                        arguments: (argument_list [{literals}] @arguments)
+                    )
+                )
+                (#match? @_lhs "{C_MESSAGE_NAME}")
+                (#not-match? @fname "{C_NOT_LOGGING_CALLS}")
+            )
+            {cpp_only}
         "#
     )
 }
@@ -4728,6 +4826,101 @@ void load() {
         assert_eq!(src_refs[1].level, LogLevel::Error);
     }
 
+    #[test]
+    fn test_java_builder_chain() {
+        let code = CodeSource::from_string(
+            &PathBuf::from("in-mem.java"),
+            r#"
+class Options {
+    void check(String value) {
+        String msg = new StringBuilder()
+            .append(value)
+            .append(" is not a valid value for option ")
+            .toString();
+        logger.info("checked " + value);
+        sql.append(" OR ( ").append(clause).append(" ) ");
+        sql.append(" ORDER BY 1");
+        parser.error("not a log message");
+    }
+}
+"#,
+        );
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let found: Vec<(usize, &str, MessageCategory)> = sif
+            .log_statements
+            .iter()
+            .map(|s| (s.line_no, s.text.as_str(), s.category))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    6,
+                    "\" is not a valid value for option \"",
+                    MessageCategory::Other
+                ),
+                (8, "\"checked \" + value", MessageCategory::Log),
+                (9, "\" OR ( \"", MessageCategory::Other),
+                (9, "\" ) \"", MessageCategory::Other),
+                (10, "\" ORDER BY 1\"", MessageCategory::Other),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cpp_builder_chain() {
+        let code = CodeSource::from_string(
+            &PathBuf::from("in-mem.cc"),
+            r#"
+void check(ypc_t* ypc, const std::string& value) {
+    ypc->report_error(user_message::error(
+        attr_line_t()
+            .append_quoted(value)
+            .append(" is not a valid value for option ")
+            .append_quoted(ypc->get_full_path())));
+    auto um = attr_line_t().append("unable to open file");
+    attr_line_t().append("only once");
+    sql.append(" OR ( ").append(clause).append(" ) ");
+}
+static const handlers h = {
+    yajlpp::property_handler("pattern")
+        .with_description("A regular expression that matches a frame"),
+};
+"#,
+        );
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let found: Vec<(usize, &str, Option<&str>)> = sif
+            .log_statements
+            .iter()
+            .map(|s| (s.line_no, s.text.as_str(), s.call_name.as_deref()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    6,
+                    "\" is not a valid value for option \"",
+                    Some("attr_line_t().append_quoted().append")
+                ),
+                (8, "\"unable to open file\"", Some("attr_line_t().append")),
+                (9, "\"only once\"", Some("attr_line_t().append")),
+                (10, "\" OR ( \"", Some("sql.append")),
+                (10, "\" ) \"", Some("sql.append().append().append")),
+                // A method of a builder that initializes a static, but not the call at the
+                // start of the chain, which could be a macro.
+                (
+                    14,
+                    "\"A regular expression that matches a frame\"",
+                    Some("yajlpp::property_handler().with_description")
+                ),
+            ]
+        );
+    }
+
     const PYTHON_FORMATTED_SOURCE: &str = r#"
 def main(name, count, err, user, d, a, b, off, old_id):
     logger.info("user %s has %d items" % (name, count))
@@ -5050,6 +5243,298 @@ void connect() {
         assert_eq!(src_refs[7].vars, vec!["\"file.txt\""]);
         assert_eq!(src_refs[0].vars, vec!["family", "addr"]);
         assert_eq!(src_refs[3].vars, vec!["count"]);
+    }
+
+    #[test]
+    fn test_cpp_returned_message() {
+        let code = CodeSource::from_string(
+            &PathBuf::from("in-mem.cc"),
+            r#"
+Result<std::string, user_message> com_unix_time(exec_context& ec) {
+    if (bad) {
+        return ec.make_error("invalid unix time -- {}", args[1]);
+    }
+    if (url.empty()) {
+        return Err(lnav::console::user_message::error(
+            "expecting a regex101.com URL to import"));
+    }
+    if (missing) {
+        return Err(fmt::format(FMT_STRING("failed to find file: {} -- {}"), path, err));
+    }
+    msg = lnav::console::user_message::error("unexpected JSON value");
+    tab->zErrMsg = sqlite3_mprintf("Environment variable names cannot contain '='");
+    auto msg = fmt::format("not logged {}", count);
+    auto it = m.find("key");
+    auto rc = get_preferred("not an error");
+    name = sqlite3_mprintf("not an error %s", x);
+    return std::string("not a message");
+}
+"#,
+        );
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let found: Vec<(&str, Option<&str>)> = sif
+            .log_statements
+            .iter()
+            .map(|s| (s.pattern().as_str(), s.call_name.as_deref()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("(?s)^invalid unix time -- (.*)$", Some("ec.make_error")),
+                (
+                    "(?s)^expecting a regex101\\.com URL to import$",
+                    Some("lnav::console::user_message::error")
+                ),
+                ("(?s)^failed to find file: (.*) -- (.*)$", Some("Err")),
+                (
+                    "(?s)^unexpected JSON value$",
+                    Some("lnav::console::user_message::error")
+                ),
+                (
+                    "(?s)^Environment variable names cannot contain '='$",
+                    Some("sqlite3_mprintf")
+                ),
+            ]
+        );
+        // `Err` makes an error, it is not a log call with a level.
+        let err = &sif.log_statements[2];
+        assert_eq!(err.category, MessageCategory::Error);
+        assert_eq!(err.level, LogLevel::Unknown);
+    }
+
+    /// The patterns of the statements found in a C++ snippet.
+    fn cpp_patterns(source: &str) -> Vec<String> {
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), source);
+        // A file without any statements has no entry.
+        extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .map(|sif| {
+                sif.log_statements
+                    .iter()
+                    .map(|s| s.pattern().as_str().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The text of each source of a message found in a C++ snippet, with the line of its best
+    /// candidate.
+    fn cpp_find(source: &str, message: &str) -> Vec<(String, Option<usize>)> {
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), source);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        find_message_sources(sif.statements(), message)
+            .iter()
+            .map(|source| {
+                (
+                    source.text.clone(),
+                    source.candidates.first().map(|stmt| stmt.line_no),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_cpp_find_rewrapped_message() {
+        // The message has two spaces after a sentence, but it was copied from a man page that
+        // wrapped and indented it.  A generic statement matches the text as is, so the exact
+        // whitespace is not enough.
+        let source = r#"
+void f() {
+    help_text(":add-source-path")
+        .with_summary(
+            "Add a path to the source code that generated log messages.  "
+            "Adding source allows lnav to more accurately extract values "
+            "from log messages");
+    status.set_value("%'d messages ", count);
+}
+"#;
+        assert_eq!(
+            cpp_find(
+                source,
+                "           Add a path to the source code that generated log messages.  Adding
+           source allows lnav to more accurately extract values from log
+           messages
+"
+            ),
+            vec![(
+                "Add a path to the source code that generated log messages. Adding source \
+                 allows lnav to more accurately extract values from log messages"
+                    .to_string(),
+                Some(5)
+            )]
+        );
+    }
+
+    #[test]
+    fn test_cpp_find_checks_value_kinds() {
+        let source = r#"
+void f() {
+    status.set_value("%'d messages ", count);
+    help_text(":filter-in").with_summary("Only show lines that match the given messages");
+}
+"#;
+        // A grouped number is a value of `%'d`.
+        assert_eq!(
+            cpp_find(source, "1,234 messages"),
+            vec![("1,234 messages".to_string(), Some(3))]
+        );
+        // Text is not, so the fragment of the other message is found instead.
+        assert_eq!(
+            cpp_find(source, "show lines that match the given messages"),
+            vec![(
+                "show lines that match the given messages".to_string(),
+                Some(4)
+            )]
+        );
+        // But it is better than nothing.
+        assert_eq!(
+            cpp_find(source, "Some other messages"),
+            vec![("Some other messages".to_string(), Some(3))]
+        );
+    }
+
+    #[test]
+    fn test_cpp_find_fragment_skips_weaker_overlaps() {
+        let source = r#"
+void f() {
+    um_error(attr_line_t().append_quoted(name).append(" is already a named search"));
+    um_error(attr_line_t().append_quoted(name).append(" is already a named search"));
+    um_error("a named search must have a name");
+    log_info("%s: using %zu named search hits in [%d:%d)", a, b, c, d);
+    um_error("Unable to open file");
+}
+"#;
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), source);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let found =
+            find_message_sources(sif.statements(), "✘ error: “dup” is already a named search");
+        let lines: Vec<(bool, Vec<usize>)> = found
+            .iter()
+            .map(|source| {
+                (
+                    source.partial,
+                    source.candidates.iter().map(|stmt| stmt.line_no).collect(),
+                )
+            })
+            .collect();
+        // The statements that only share "a named search" or " named search", which the best
+        // ones share too, are left out, but the ones that are as good are kept.
+        assert_eq!(lines, vec![(true, vec![3, 4])]);
+    }
+
+    // The tests below are known gaps, found by running `log2src find` on the expected error
+    // output of lnav's tests.  They are expected to fail, so remove the `should_panic` when one
+    // is fixed.
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn test_cpp_message_in_conditional_xfail() {
+        // Each branch of the conditional is a message.
+        let found = cpp_patterns(
+            r#"
+void list() {
+    auto um = console::user_message::error(
+        total == 0 ? "no running lnav instances were found"
+                   : "no running lnav instances matched");
+}
+"#,
+        );
+        assert_eq!(
+            found,
+            vec![
+                "(?s)^no running lnav instances were found$",
+                "(?s)^no running lnav instances matched$",
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn test_cpp_message_in_brace_init_xfail() {
+        // A result type that is made with a brace initializer.
+        let found = cpp_patterns(
+            r#"
+scan_result scan(string_fragment line_frag) {
+    if (!line_frag.startswith("{")) {
+        return scan_no_match{"line is not a JSON object"};
+    }
+}
+"#,
+        );
+        assert_eq!(found, vec!["(?s)^line is not a JSON object$"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn test_cpp_message_wrapped_in_builder_arg_xfail() {
+        // The literal is wrapped in a constructor that is the argument of a builder method.
+        let found = cpp_patterns(
+            r#"
+void check() {
+    errors.emplace_back(
+        lnav::console::user_message::error("invalid sample")
+            .with_help(attr_line_t(
+                "A timestamp needs to be captured in order for a "
+                "line to be recognized as a log message")));
+}
+"#,
+        );
+        assert_eq!(
+            found,
+            vec![
+                "(?s)^invalid sample$",
+                "(?s)^A timestamp needs to be captured in order for a line to be recognized as a log message$",
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn test_find_prefers_longer_prefix_xfail() {
+        // The statement with the `: ` covers more of the message than the one without it, so
+        // it should win, rather than splitting the message at the end of the shorter one.
+        let found = cpp_find(
+            r#"
+Result<void, user_message> exec(exec_context& ec) {
+    return ec.make_error("unable to open file");
+}
+void open_files() {
+    auto um = lnav::console::user_message::error(
+        attr_line_t("unable to open file: ").append(lnav::roles::file(fn)));
+}
+"#,
+            "unable to open file: badfilename",
+        );
+        assert_eq!(
+            found,
+            vec![("unable to open file: badfilename".to_string(), Some(7))]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn test_find_ignores_single_words_in_values_xfail() {
+        // Statements that are a single word, like `"level"`, should not be matched to words
+        // inside a quoted value, like a path.
+        let sources = cpp_find(
+            r#"
+void report() {
+    errors.emplace_back(attr_line_t("invalid value ").append_quoted(path));
+    out.append("value");
+    out.append("level");
+}
+"#,
+            "invalid value “/invalid_props_log/value/log_level”",
+        );
+        assert!(sources
+            .iter()
+            .all(|(text, line)| line.is_none() || text.starts_with("invalid value")));
     }
 
     const CPP_SPLIT_ELSE_SOURCE: &str = r#"
@@ -7006,6 +7491,7 @@ fn load(path: &str) -> Result<()> {
     bail!("cannot open the settings file at {}", path);
     warn!("Unable to read file: {}", err);
     bail!("cannot open config.toml (read-only) at {}", path);
+    warn!(" is not a valid value for option ");
 }
 "#,
         );
@@ -7062,8 +7548,81 @@ fn load(path: &str) -> Result<()> {
             find("config.toml (read-only) at"),
             vec![("config.toml (read-only) at".to_string(), Some(6), true)]
         );
+        // A message with values on both sides of a literal that ends with whitespace, whose
+        // optional match is not part of the literal text.
+        assert_eq!(
+            find("“foolang” is not a valid value for option “/log/languages#”"),
+            vec![(
+                "“foolang” is not a valid value for option “/log/languages#”".to_string(),
+                Some(7),
+                true
+            )]
+        );
         // Too little in common.
         assert_eq!(find("the cache"), vec![]);
+    }
+
+    #[test]
+    fn test_find_assembled_message() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.java"),
+            r#"
+class Meta {
+    String procs(String schema) {
+        StringBuilder sql = new StringBuilder("SELECT p.proname FROM pg_proc p WHERE p.oid > 0");
+        if (schema != null) {
+            sql.append(" AND n.nspname LIKE ?");
+        }
+        sql.append(" ORDER BY p.proname");
+        return sql.toString();
+    }
+    String any(String table) {
+        StringBuilder sql = new StringBuilder("SELECT " + table);
+        sql.append(" AND n.nspname LIKE ?");
+        return sql.toString();
+    }
+}
+"#,
+        );
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let find = |message: &str| -> Vec<(String, Option<usize>)> {
+            find_message_sources(sif.statements(), message)
+                .iter()
+                .map(|source| {
+                    (
+                        source.text.clone(),
+                        source.candidates.first().map(|stmt| stmt.line_no),
+                    )
+                })
+                .collect()
+        };
+
+        // The pieces are from the function that built the text, even though another function
+        // has one of them and a generic statement matches all of it.
+        assert_eq!(
+            find("SELECT p.proname FROM pg_proc p WHERE p.oid > 0 AND n.nspname LIKE ? ORDER BY p.proname"),
+            vec![
+                (
+                    "SELECT p.proname FROM pg_proc p WHERE p.oid > 0".to_string(),
+                    Some(4)
+                ),
+                ("AND n.nspname LIKE ?".to_string(), Some(6)),
+                ("ORDER BY p.proname".to_string(), Some(8)),
+            ]
+        );
+        // The text between the pieces is from somewhere else, like the value of the
+        // placeholder at the end of `"SELECT " + table`.
+        assert_eq!(
+            find("SELECT pg_class AND n.nspname LIKE ? AND x = 1"),
+            vec![
+                ("SELECT".to_string(), Some(12)),
+                ("pg_class".to_string(), None),
+                ("AND n.nspname LIKE ?".to_string(), Some(13)),
+                ("AND x = 1".to_string(), None),
+            ]
+        );
     }
 
     #[test]

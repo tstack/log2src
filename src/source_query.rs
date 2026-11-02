@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 use tree_sitter::{
@@ -364,6 +365,9 @@ impl<'a> SourceQuery<'a> {
         let filter_idx = node_kind.and_then(|kind| query.capture_index_for_name(kind));
         let mut cursor = QueryCursor::new();
         let mut results = Vec::new();
+        // The messages that were already found, since a call can match more than one pattern,
+        // like a builder method that is also a whole statement, `x().append("...");`.
+        let mut seen: HashSet<Range<usize>> = HashSet::new();
         let matches = cursor.matches(query, self.tree.root_node(), self.source.as_bytes());
         matches.for_each(|m| {
             let mut got_string_literal = false;
@@ -505,9 +509,14 @@ impl<'a> SourceQuery<'a> {
                         got_string_literal = true;
                     }
                     "string_literal" | "string" | "concatenated_string" | "binary_expression" => {
-                        if self.source_language.is_c_family() && !Self::in_function_body(child) {
+                        if self.source_language.is_c_family()
+                            && !Self::in_function_body(child)
+                            && !Self::is_method_arg(child)
+                        {
                             // Calls at file scope are macros like TEST_CASE("...") or
-                            // _Pragma("...") and not log statements.
+                            // _Pragma("...") and not log statements.  A method can not be one
+                            // of those, like the `.with_description("...")` of a builder that
+                            // initializes a static.
                             break;
                         }
                         if child.kind() == "concatenated_string"
@@ -598,6 +607,9 @@ impl<'a> SourceQuery<'a> {
                 }
                 let mut arg_start: Option<(usize, Point)> = None;
 
+                if !seen.insert(child.byte_range()) {
+                    break;
+                }
                 if filter_idx.is_none() || filter_idx.is_some_and(|f| f == capture.index) {
                     let anchor = Self::statement_anchor(outer);
                     let (name, qualified_name) = self.names(anchor);
@@ -1572,7 +1584,8 @@ impl<'a> SourceQuery<'a> {
                 let function = &self.source[call.child_by_field_name("function")?.byte_range()];
                 let kind = match function {
                     "format" | "fmt::format" | "std::format" => MessageCall::Format,
-                    "_" | "N_" | "gettext" | "tr" | "fmt::runtime" => MessageCall::Passthrough,
+                    "_" | "N_" | "gettext" | "tr" | "fmt::runtime" | "FMT_STRING"
+                    | "FMT_COMPILE" => MessageCall::Passthrough,
                     _ => return None,
                 };
                 (kind, call.child_by_field_name("arguments")?)
@@ -1642,6 +1655,16 @@ impl<'a> SourceQuery<'a> {
     /// `snprintf()`, although it is not logging.
     fn is_c_message_call(call_name: Option<&str>) -> bool {
         call_name.is_some_and(|name| MessageCategory::from_c_call(name).is_some())
+    }
+
+    /// Check if a C++ node is an argument of a method call, like `x.with_description("...")`.
+    fn is_method_arg(node: Node) -> bool {
+        node.parent()
+            .filter(|args| args.kind() == "argument_list")
+            .and_then(|args| args.parent())
+            .filter(|call| call.kind() == "call_expression")
+            .and_then(|call| call.child_by_field_name("function"))
+            .is_some_and(|function| function.kind() == "field_expression")
     }
 
     fn in_function_body(node: Node) -> bool {
@@ -1974,11 +1997,52 @@ impl<'a> SourceQuery<'a> {
     fn special_call_name(&self, name: Node) -> Option<String> {
         match self.source_language {
             SourceLanguage::Rust => self.rust_call_name(name),
-            SourceLanguage::Cpp | SourceLanguage::Java | SourceLanguage::Python => {
-                self.exception_call_name(name)
-            }
+            SourceLanguage::Cpp => self
+                .exception_call_name(name)
+                .or_else(|| self.cpp_chain_call_name(name)),
+            SourceLanguage::Java | SourceLanguage::Python => self.exception_call_name(name),
             _ => None,
         }
+    }
+
+    /// The name of a C++ method called on the result of another call, without the arguments
+    /// of the calls before it, like `sql.append().append` for the last call in
+    /// `sql.append(" OR (").append(clause).append(")")`.  Returns None if the method is not
+    /// called on the result of a call.
+    fn cpp_chain_call_name(&self, name: Node) -> Option<String> {
+        fn strip(source: &str, node: Node, out: &mut String) {
+            match node.kind() {
+                "call_expression" => match node.child_by_field_name("function") {
+                    Some(function) => {
+                        strip(source, function, out);
+                        out.push_str("()");
+                    }
+                    None => out.push_str(&source[node.byte_range()]),
+                },
+                "field_expression" => match (
+                    node.child_by_field_name("argument"),
+                    node.child_by_field_name("field"),
+                ) {
+                    (Some(argument), Some(field)) => {
+                        strip(source, argument, out);
+                        // The operator, like `.` or `->`.
+                        out.push_str(source[argument.end_byte()..field.start_byte()].trim());
+                        out.push_str(&source[field.byte_range()]);
+                    }
+                    _ => out.push_str(&source[node.byte_range()]),
+                },
+                _ => out.push_str(&source[node.byte_range()]),
+            }
+        }
+        let receiver = name
+            .child_by_field_name("argument")
+            .filter(|_| name.kind() == "field_expression")?;
+        if receiver.kind() != "call_expression" {
+            return None;
+        }
+        let mut retval = String::new();
+        strip(self.source, name, &mut retval);
+        Some(retval)
     }
 
     /// The name to use for a call whose message is used for an exception, like
