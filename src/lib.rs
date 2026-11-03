@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsStr;
@@ -24,6 +24,7 @@ use tree_sitter::{Language, Query};
 mod code_source;
 mod java_symbols;
 mod log_format;
+mod match_stats;
 mod message_source;
 mod prefilter;
 mod progress;
@@ -38,10 +39,13 @@ use crate::java_symbols::{JavaSymbols, MessageRef, StringConstant};
 use crate::prefilter::{Prefilter, StatementID};
 use crate::progress::{ProgressReader, WorkGuard};
 use crate::source_hier::{ScanEvent, SourceFileID, SourceHierContent, SourceHierTree};
-use crate::source_ref::{CallSite, ChainFrame, FormatArgument, Splice};
+use crate::source_query::ConcatPart;
+use crate::source_ref::{ChainFrame, FormatArgument, Splice};
 use crate::value_kind::SplitOrder;
 pub use code_source::CodeSource;
 pub use log_format::LogFormat;
+pub use match_stats::{match_stats, take_match_stats, MatchStats, PhaseStats};
+use match_stats::{Outcome, Step};
 pub use message_source::{find_message_sources, MessageSource};
 pub use progress::ProgressTracker;
 pub use progress::ProgressUpdate;
@@ -156,7 +160,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "50")]
+    #[serde(rename = "52")]
     Current,
 }
 
@@ -256,8 +260,9 @@ pub struct StatementsInFile {
     /// argument, like `syslog(LOG_ERR, ...)`, instead of the name of the call.  Those levels
     /// are never pruned by `prune_log_calls()`.
     arg_levels: BTreeSet<(usize, usize)>,
-    /// The statements whose message is a constant.  The constants are usually defined in other
-    /// files, so these are rebuilt by `SourceTree::resolve_message_refs()` instead of cached.
+    /// The statements whose message is a constant, or a concatenation with constants in it.
+    /// The constants are usually defined in other files, so these are rebuilt by
+    /// `SourceTree::resolve_message_refs()` instead of cached.
     #[serde(skip)]
     resolved_statements: Vec<Statement>,
     /// The statements derived from the ones in this file for calls that pass a string for a
@@ -276,6 +281,19 @@ pub struct StatementsInFile {
     constants: Vec<StringConstant>,
     /// The Java log calls in this file whose message is a constant.
     message_refs: Vec<MessageRef>,
+    /// The Java log statements in this file whose message is a concatenation with a piece that
+    /// could be a constant, like `PREFIX + ": " + name`.
+    constant_concats: Vec<ConstantConcat>,
+}
+
+/// A Java log statement whose message is a concatenation with a piece that could be a
+/// constant.  Until the constants are known, every piece that is not a literal is a
+/// placeholder, so `LOAD_BALANCING_PREFIX + ": " + node` would be `"{}: {}"`, which matches
+/// nearly anything.  See `Statement::with_constants()`.
+#[derive(Debug, Serialize, Deserialize)]
+struct ConstantConcat {
+    stmt: Statement,
+    parts: Vec<ConcatPart>,
 }
 
 impl StatementsInFile {
@@ -346,17 +364,41 @@ pub struct SourceTree {
     /// to the source file IDs to speed up matches.
     #[serde(skip)]
     pub file_name_to_sources: HashMap<String, Vec<SourceFileID>>,
-    /// Finds the candidate statements for a log message.  It is reset whenever the statements
-    /// change and built the first time it is needed, since building it for a big tree takes a
-    /// while and the statements usually change more than once before then, like after loading
-    /// the cache and again after deriving the statements for calls through wrappers.
+    /// Finds the candidate statements for matching all of a log message: the logging calls.
+    /// The prefilters are reset whenever the statements change and built the first time they
+    /// are needed, since building them for a big tree takes a while and the statements usually
+    /// change more than once before then, like after loading the cache and again after deriving
+    /// the statements for calls through wrappers.
     #[serde(skip)]
-    prefilter: OnceLock<Prefilter>,
+    log_prefilter: OnceLock<Prefilter>,
+    /// Finds the statements that are not logging calls that can be matched to all of a log
+    /// message when no logging call matches, like a `println!()` or the message of an
+    /// exception that was logged, but only when that is asked for, see
+    /// [`LogMatchOptions::fallback`].
+    #[serde(skip)]
+    fallback_prefilter: OnceLock<Prefilter>,
+    /// Finds the candidate statements for the parts of a log message, for
+    /// [`message_source::best_log_source`], which only uses the ones with enough literal text.
+    #[serde(skip)]
+    find_prefilter: OnceLock<Prefilter>,
     /// The statements that matched log messages with a given file name and line number.  They
-    /// are tried before the prefilter when another message has the same file and line.  Cleared
-    /// whenever the statements change.
+    /// are tried before the prefilter when another message has the same file and line.  An
+    /// entry without statements is for a message that matched nothing, so the next ones with
+    /// the same file and line are not looked for again.  Cleared whenever the statements change.
     #[serde(skip)]
     line_cache: RwLock<LineCache>,
+    /// The source files that a file name in a log message refers to, sorted, for the names that
+    /// were looked up.  A name that is not the name of any file, like a partial path, is looked
+    /// for in all of the paths, which is too slow to do for every statement found by the
+    /// prefilter.  Cleared whenever the statements change.
+    #[serde(skip)]
+    files_by_name: RwLock<HashMap<String, Arc<[SourceFileID]>>>,
+    /// The prefixes that were found in front of the messages of a statement, like the device
+    /// name that the Linux kernel's `dev_info()` adds, so the next message from the statement
+    /// is matched without looking for the prefix again, see `learned_match()`.  Cleared
+    /// whenever the statements change.
+    #[serde(skip)]
+    learned_prefixes: RwLock<HashMap<StatementID, Vec<LearnedPrefix>>>,
     /// The logging functions/macros/methods called by the statements under this root, keyed by
     /// the name of the call.  Rebuilt after loading/extracting.
     #[serde(skip)]
@@ -484,8 +526,30 @@ fn prune_log_calls(
     log_calls
 }
 
-/// Maps a file name and line number from a log message to the statements that matched it.
-type LineCache = HashMap<String, HashMap<usize, Vec<StatementID>>>;
+/// The most file names that `SourceTree::files_by_name` remembers.
+const MAX_FILES_BY_NAME: usize = 4096;
+
+/// Maps the source file that the file name in a log message refers to, and the message's line
+/// number, to the statements that matched it.  No statements means that a message with that
+/// file and line matched nothing without [`LogMatchOptions::fallback`], see
+/// `LogMatcher::known_unmatched()`.
+type LineCache = HashMap<(SourceFileID, usize), Vec<StatementID>>;
+
+/// A prefix that was found in front of a message from a statement, see
+/// `SourceTree::learned_prefixes`.  Only the separator is kept, since the prefix itself is
+/// different for each message, like the name of the device.
+#[derive(Debug)]
+struct LearnedPrefix {
+    /// The text between the prefix and the statement's text, like `": "`.
+    separator: String,
+}
+
+/// A statement that a log message was matched to with a prefix in front of it, from
+/// `LogMatcher::explain_log_body()`, so the prefix can be learned.
+struct Learnable<'s> {
+    tree: &'s SourceTree,
+    id: StatementID,
+}
 
 /// The outcome of resolving the log calls that use message constants.
 #[derive(Default)]
@@ -522,6 +586,15 @@ impl SourceTree {
                     None => summary.no_text += 1,
                 }
             }
+            for concat in &sif.constant_concats {
+                if let Some(src_ref) =
+                    concat
+                        .stmt
+                        .with_constants(&concat.parts, &constants, sif.language)
+                {
+                    sif.resolved_statements.push(src_ref);
+                }
+            }
         }
         summary
     }
@@ -545,106 +618,335 @@ impl SourceTree {
     }
 
     fn rebuild_prefilter(&mut self) {
-        self.prefilter = OnceLock::new();
+        self.log_prefilter = OnceLock::new();
+        self.fallback_prefilter = OnceLock::new();
+        self.find_prefilter = OnceLock::new();
         // The statement IDs in the cache may now refer to different statements.
         self.line_cache
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.files_by_name
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.learned_prefixes
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Remember that a message from the statement had a prefix in front of it that ended with
+    /// `separator`, see `learned_match()`.
+    fn learn_prefix(&self, id: StatementID, separator: &str) {
+        let known = |learned: &HashMap<StatementID, Vec<LearnedPrefix>>| {
+            learned
+                .get(&id)
+                .is_some_and(|prefixes| prefixes.iter().any(|lp| lp.separator == separator))
+        };
+        if known(
+            &self
+                .learned_prefixes
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        ) {
+            return;
+        }
+        let mut learned = self
+            .learned_prefixes
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !known(&learned) {
+            learned.entry(id).or_default().push(LearnedPrefix {
+                separator: separator.to_string(),
+            });
+        }
+    }
+
+    /// Find the statement for a log message whose text is after a prefix, like an earlier
+    /// message from the statement had, so the prefix does not have to be looked for again by
+    /// `LogMatcher::explain_log_body()`.  Each place after the separator is tried, see
+    /// `message_source::learned_prefix_starts()`.  The prefix has to end like one, see
+    /// `message_source::prefix_end()`, and the statement has to explain enough of the rest of the
+    /// message, the same as when the whole message is matched, or else the message is left to be
+    /// read the slow way, which could find a better reading of it.  Returns the statement, where
+    /// its text starts in the trimmed body, and the score of the reading, the same as
+    /// `message_source::best_log_source()` would give it without the values, so it can be
+    /// compared the same way.  Like the line cache, this depends on the messages that were
+    /// matched before, so a reading that the slow way would prefer, like a chain of messages,
+    /// can be missed.  Without `fallback`, only logging calls are used, see
+    /// [`LogMatchOptions::fallback`].
+    fn learned_match(
+        &self,
+        log_ref: &LogRef,
+        fallback: bool,
+    ) -> Option<(StatementRef<'_>, usize, usize)> {
+        let learned = self
+            .learned_prefixes
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if learned.is_empty() {
+            return None;
+        }
+        let body = log_ref.body().trim();
+        let lineno = log_ref.details.as_ref().and_then(|details| details.lineno);
+        let level = log_ref.level();
+        // The prefix was learned from a reading by `explain_log_body()`, which only uses the
+        // statements in this prefilter, found in the head of the message.
+        let prefilter = self.find_prefilter();
+        let mut candidates: Vec<(StatementID, StatementRef)> = self
+            .prefiltered_candidates(prefilter, log_ref, message_source::log_head(body))
+            .into_iter()
+            .filter(|(id, src_ref)| {
+                learned.contains_key(id) && (fallback || src_ref.category == MessageCategory::Log)
+            })
+            .collect();
+        candidates.sort_by_cached_key(|((file_id, _), src_ref)| {
+            candidate_key(src_ref, prefilter.rank(*file_id), lineno, level)
+        });
+        candidates.into_iter().find_map(|(id, src_ref)| {
+            learned.get(&id)?.iter().find_map(|lp| {
+                message_source::learned_prefix_starts(body, &lp.separator).find_map(|start| {
+                    let rest = &body[start..];
+                    match_stats::record_pattern_check();
+                    if !src_ref.pattern().is_match(rest) || !explains_enough(Some(&src_ref), rest) {
+                        return None;
+                    }
+                    let score = if src_ref.values_fit_kinds(src_ref.pattern(), rest) {
+                        src_ref.quality
+                    } else {
+                        0
+                    };
+                    Some((src_ref, start, score))
+                })
+            })
+        })
+    }
+
+    /// The source files that the file name in a log message refers to: the ones with that name,
+    /// or else the ones whose path contains it.
+    fn files_named(&self, name: &str) -> Arc<[SourceFileID]> {
+        if let Some(ids) = self
+            .files_by_name
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+        {
+            return ids.clone();
+        }
+        let mut ids: Vec<SourceFileID> = match self.file_name_to_sources.get(name) {
+            Some(ids) => ids.clone(),
+            None => self
+                .files_with_statements
+                .values()
+                .filter(|sif| sif.path.contains(name))
+                .map(|sif| sif.id)
+                .collect(),
+        };
+        ids.sort_unstable();
+        let ids: Arc<[SourceFileID]> = ids.into();
+        let mut cache = self
+            .files_by_name
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A long-running reader can see all sorts of file names, like temporary paths, so the
+        // cache is started over instead of growing without a limit.
+        if cache.len() >= MAX_FILES_BY_NAME {
+            cache.clear();
+        }
+        cache.insert(name.to_string(), ids.clone());
+        ids
     }
 
     /// The line cache key for a log message, if it has a file name and line number and the
-    /// file name refers to a single source file.  Messages for file names shared by several
-    /// source files are not cached, since a statement in one could hide a better match in another.
-    fn line_cache_key<'a>(&self, log_ref: &LogRef<'a>) -> Option<(&'a str, usize)> {
+    /// file name refers to a single source file: that file and the line number.  Messages for
+    /// file names shared by several source files are not cached, since a statement in one could
+    /// hide a better match in another.
+    fn line_cache_key(&self, log_ref: &LogRef) -> Option<(SourceFileID, usize)> {
         let (filename, lineno) = log_ref.file_and_line()?;
-        match self.file_name_to_sources.get(filename) {
-            Some(ids) if ids.len() == 1 => Some((filename, lineno)),
+        match self.file_name_to_sources.get(filename)?.as_slice() {
+            [id] => Some((*id, lineno)),
             _ => None,
         }
     }
 
+    /// What the line cache knows about matching a log message in this tree without
+    /// [`LogMatchOptions::fallback`]: `Some(true)` if an earlier message with the same file and
+    /// line matched nothing, `Some(false)` if the message's file name refers to no files here,
+    /// so nothing here can match it, and `None` if it has to be looked for.
+    fn known_unmatched(&self, log_ref: &LogRef) -> Option<bool> {
+        let (filename, _) = log_ref.file_and_line()?;
+        if let Some(key) = self.line_cache_key(log_ref) {
+            let cache = self
+                .line_cache
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            return cache.get(&key).filter(|ids| ids.is_empty()).map(|_| true);
+        }
+        self.files_named(filename).is_empty().then_some(false)
+    }
+
+    /// Remember that a log message matched nothing, if it has a file name and line number that
+    /// can be cached and no earlier message with them matched anything.  An entry with
+    /// statements is left alone, since those may match the next message.
+    fn remember_unmatched(&self, log_ref: &LogRef) {
+        if let Some(key) = self.line_cache_key(log_ref) {
+            self.line_cache
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(key)
+                .or_default();
+        }
+    }
+
     /// Find the highest quality statement that previously matched a log message with the same
-    /// file name and line number as this one, and matches this one too.
-    fn find_cached_match(&self, log_ref: &LogRef) -> Option<StatementRef<'_>> {
-        let (filename, lineno) = self.line_cache_key(log_ref)?;
+    /// file name and line number as this one, and matches this one too.  Without `fallback`,
+    /// only logging calls are used, see [`LogMatchOptions::fallback`].
+    fn find_cached_match(
+        &self,
+        log_ref: &LogRef,
+        fallback: bool,
+    ) -> Option<(StatementRef<'_>, bool)> {
+        let key = self.line_cache_key(log_ref)?;
+        let lineno = key.1;
         let body = log_ref.body();
         let cache = self
             .line_cache
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         let candidates = cache
-            .get(filename)?
-            .get(&lineno)?
+            .get(&key)?
             .iter()
             .filter_map(|(file_id, index)| {
                 self.files_with_statements.get(file_id)?.statement(*index)
             })
+            .filter(|src_ref| fallback || src_ref.category == MessageCategory::Log)
             .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, Some(lineno), log_ref.level()));
-        first_match(candidates, body, Some(lineno), |src_ref| src_ref.stmt)
+        let found = first_match_full(candidates, body, Some(lineno), |src_ref| src_ref.stmt);
+        if found.is_some() {
+            match_stats::record_line_cache_hit();
+        }
+        found
     }
 
     /// Find the highest quality statement that matches the given log message, preferring the one
-    /// closest to the message's line number for a tie.  If the message has a file name and line
-    /// number, the statement is added to the cache for them.
-    fn find_best_match(&self, log_ref: &LogRef) -> Option<StatementRef<'_>> {
-        let body = log_ref.body();
-        let mut candidates = self.prefiltered_candidates(log_ref);
-        let lineno = log_ref.details.as_ref().and_then(|details| details.lineno);
-        let level = log_ref.level();
-        candidates.sort_by(|lhs, rhs| compare_candidates(&lhs.1, &rhs.1, lineno, level));
-        let (stmt_id, src_ref) =
-            first_match(candidates, body, lineno, |(_, src_ref)| src_ref.stmt)?;
-        if let Some((filename, lineno)) = self.line_cache_key(log_ref) {
+    /// closest to the message's line number for a tie.  The logging calls are tried first, and
+    /// then, with `fallback`, the other statements, see [`LogMatchOptions::fallback`].  This is
+    /// the same as [`first_match`] with all of them in order, since it only goes on to the
+    /// statements that are not logging calls when none of the logging calls match.  If the
+    /// message has a file name and line number, the statement is added to the cache for them.
+    fn find_best_match(
+        &self,
+        log_ref: &LogRef,
+        fallback: bool,
+    ) -> Option<(StatementRef<'_>, bool)> {
+        let ((stmt_id, src_ref), without_empty_values) =
+            self.first_match_in(self.log_prefilter(), log_ref)
+                .or_else(|| {
+                    fallback
+                        .then(|| self.first_match_in(self.fallback_prefilter(), log_ref))
+                        .flatten()
+                })?;
+        if let Some(key) = self.line_cache_key(log_ref) {
             let mut cache = self
                 .line_cache
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
-            let ids = cache
-                .entry(filename.to_string())
-                .or_default()
-                .entry(lineno)
-                .or_default();
+            let ids = cache.entry(key).or_default();
             if !ids.contains(&stmt_id) {
                 ids.push(stmt_id);
             }
         }
-        Some(src_ref)
+        Some((src_ref, without_empty_values))
     }
 
-    /// The prefilter for the current statements, which is built if it has not been yet.
-    fn prefilter(&self) -> &Prefilter {
-        self.prefilter
-            .get_or_init(|| Prefilter::new(self.files_with_statements.values()))
+    /// The [`first_match`] for a log message of the statements in `prefilter`.
+    fn first_match_in(
+        &self,
+        prefilter: &Prefilter,
+        log_ref: &LogRef,
+    ) -> Option<((StatementID, StatementRef<'_>), bool)> {
+        let body = log_ref.body();
+        let lineno = log_ref.details.as_ref().and_then(|details| details.lineno);
+        let level = log_ref.level();
+        let mut candidates = self.prefiltered_candidates(prefilter, log_ref, body);
+        match_stats::record_prefilter_candidates(candidates.len());
+        // A long message, like a JSON object, has the key literals of a lot of the statements, so
+        // they are ordered by a key, instead of by comparing their paths over and over.
+        candidates.sort_by_cached_key(|((file_id, _), src_ref)| {
+            candidate_key(src_ref, prefilter.rank(*file_id), lineno, level)
+        });
+        debug_assert!(candidates.is_sorted_by(|lhs, rhs| {
+            compare_candidates(&lhs.1, &rhs.1, lineno, level) != Ordering::Greater
+        }));
+        first_match_full(candidates, body, lineno, |(_, src_ref)| src_ref.stmt)
     }
 
-    /// The statements that might match some or all of the body of the log message, since their
-    /// key literal is in it, limited to the source files with the message's file name, if it
-    /// has one.  A statement that matches part of the body has its key literal in that part, so
-    /// these are also the candidates for the parts of a message, like the value of a
-    /// placeholder or the text after a prefix.
-    fn prefiltered_candidates(&self, log_ref: &LogRef) -> Vec<(StatementID, StatementRef<'_>)> {
+    /// The prefilter for matching all of a log message, which is built if it has not been yet.
+    fn log_prefilter(&self) -> &Prefilter {
+        self.log_prefilter.get_or_init(|| {
+            Prefilter::new(self.files_with_statements.values(), |stmt| {
+                stmt.category == MessageCategory::Log
+            })
+        })
+    }
+
+    /// The prefilter for matching all of a log message to a statement that is not a logging
+    /// call, which is built if it has not been yet.  It is not built with the others, since it is
+    /// only used when asked for.
+    fn fallback_prefilter(&self) -> &Prefilter {
+        self.fallback_prefilter.get_or_init(|| {
+            Prefilter::new(self.files_with_statements.values(), |stmt| {
+                stmt.category != MessageCategory::Log && stmt.quality >= MIN_FALLBACK_QUALITY
+            })
+        })
+    }
+
+    /// The prefilter for the parts of a log message, which is built if it has not been yet.
+    fn find_prefilter(&self) -> &Prefilter {
+        self.find_prefilter.get_or_init(|| {
+            Prefilter::new(self.files_with_statements.values(), |stmt| {
+                stmt.quality >= MIN_FALLBACK_QUALITY
+            })
+        })
+    }
+
+    /// The statements in `prefilter` that might match some or all of `text`, which is the body
+    /// of the log message or the start of it, since their key literal is in it, limited to the
+    /// source files with the message's file name, if it has one.  A statement that matches part
+    /// of the text has its key literal in that part, so these are also the candidates for the
+    /// parts of a message, like the value of a placeholder or the text after a prefix.
+    fn prefiltered_candidates(
+        &self,
+        prefilter: &Prefilter,
+        log_ref: &LogRef,
+        text: &str,
+    ) -> Vec<(StatementID, StatementRef<'_>)> {
         let mut candidates = Vec::new();
-        let prefilter = self.prefilter();
-        let filename = match log_ref.details {
+        let file_ids = match log_ref.details {
             Some(LogDetails {
                 file: Some(filename),
                 ..
-            }) => Some(filename),
+            }) => Some(self.files_named(filename)),
             _ => None,
         };
-        let file_ids = filename.and_then(|name| self.file_name_to_sources.get(name));
-        prefilter.candidates(log_ref.body(), |(file_id, index)| {
-            let Some(sif) = self.files_with_statements.get(&file_id) else {
+        // None of the statements are in the message's file, like one from a library.
+        if file_ids.as_ref().is_some_and(|ids| ids.is_empty()) {
+            return candidates;
+        }
+        prefilter.candidates(text, |(file_id, index)| {
+            if file_ids
+                .as_ref()
+                .is_some_and(|ids| ids.binary_search(&file_id).is_err())
+            {
                 return;
-            };
-            let in_file = match (filename, file_ids) {
-                (None, _) => true,
-                (Some(_), Some(ids)) => ids.contains(&file_id),
-                (Some(name), None) => sif.path.contains(name),
-            };
-            if in_file {
-                candidates.extend(sif.statement(index).map(|stmt| ((file_id, index), stmt)));
+            }
+            if let Some(stmt) = self
+                .files_with_statements
+                .get(&file_id)
+                .and_then(|sif| sif.statement(index))
+            {
+                candidates.push(((file_id, index), stmt));
             }
         });
         candidates
@@ -1042,6 +1344,35 @@ fn first_match<'a, T>(
     lineno: Option<usize>,
     src_ref: impl Fn(&T) -> &'a Statement,
 ) -> Option<T> {
+    first_match_full(candidates, body, lineno, src_ref).map(|(candidate, _)| candidate)
+}
+
+/// [`first_match`], and whether the candidate matched without an empty value, so the choice can
+/// be made again between the matches from several roots without matching them again, see
+/// [`choose_match`].
+fn first_match_full<'a, T>(
+    candidates: impl IntoIterator<Item = T>,
+    body: &str,
+    lineno: Option<usize>,
+    src_ref: impl Fn(&T) -> &'a Statement,
+) -> Option<(T, bool)> {
+    choose_match(candidates, lineno, &src_ref, |candidate| {
+        let stmt = src_ref(candidate);
+        match_stats::record_pattern_check();
+        stmt.pattern()
+            .is_match(body)
+            .then(|| stmt.matches_without_empty_values(body))
+    })
+}
+
+/// The choice made by [`first_match`] among the ordered candidates, where `matches` says if a
+/// candidate matches the message, and if so, whether it does without an empty value.
+fn choose_match<'a, T>(
+    candidates: impl IntoIterator<Item = T>,
+    lineno: Option<usize>,
+    src_ref: impl Fn(&T) -> &'a Statement,
+    mut matches: impl FnMut(&T) -> Option<bool>,
+) -> Option<(T, bool)> {
     let mut with_empty_value: Option<T> = None;
     for candidate in candidates {
         let stmt = src_ref(&candidate);
@@ -1053,22 +1384,22 @@ fn first_match<'a, T>(
         if stmt.category != MessageCategory::Log && stmt.quality < MIN_FALLBACK_QUALITY {
             continue;
         }
-        if !stmt.pattern().is_match(body) {
+        let Some(without_empty_values) = matches(&candidate) else {
             continue;
-        }
-        if stmt.matches_without_empty_values(body) {
+        };
+        if without_empty_values {
             return match with_empty_value {
                 Some(prior)
                     if line_distance(src_ref(&prior), lineno) < line_distance(stmt, lineno) =>
                 {
-                    Some(prior)
+                    Some((prior, false))
                 }
-                _ => Some(candidate),
+                _ => Some((candidate, true)),
             };
         }
         with_empty_value.get_or_insert(candidate);
     }
-    with_empty_value
+    with_empty_value.map(|candidate| (candidate, false))
 }
 
 /// The least amount of literal text, not counting whitespace, for a statement that is not `Log` to
@@ -1119,6 +1450,27 @@ fn compare_candidates(
         })
 }
 
+/// The key that orders candidates in a single root the same as [`compare_candidates`], where
+/// `path_rank` is the position of the statement's file in the order of the paths of the files in
+/// the root, from [`Prefilter::rank`].
+fn candidate_key(
+    src_ref: &StatementRef,
+    path_rank: u32,
+    lineno: Option<usize>,
+    level: Option<LogLevel>,
+) -> (u8, Reverse<usize>, bool, usize, usize, u32, usize, usize) {
+    (
+        src_ref.category.match_priority(),
+        Reverse(src_ref.quality),
+        level != Some(src_ref.level),
+        line_distance(src_ref, lineno),
+        src_ref.kinds.len(),
+        path_rank,
+        src_ref.line_no,
+        src_ref.column,
+    )
+}
+
 /// Collection of root paths to their tree of source files
 /// that contain log statements.
 #[derive(Default)]
@@ -1131,12 +1483,20 @@ pub struct LogMatcher {
 pub struct LogMatchOptions {
     /// Whether to extract variables from log statements.
     pub extract_variables: bool,
+    /// Whether a log message can be matched to a statement that is not a logging call when no
+    /// logging call matches it, like a `println!()`, a thread dump written to a stream, or the
+    /// message of an exception that is logged as is with `log.error(e.getMessage())`.  There are
+    /// a lot of those statements, like every string passed to a function, so looking through them
+    /// is slow, and they rarely explain a log message, so this is only for when the source of a
+    /// message is asked for, not for scanning a whole log.
+    pub fallback: bool,
 }
 
 impl Default for LogMatchOptions {
     fn default() -> Self {
         Self {
             extract_variables: true,
+            fallback: false,
         }
     }
 }
@@ -1408,8 +1768,12 @@ impl LogMatcher {
                     tree: SourceHierTree::from(&path),
                     files_with_statements: HashMap::new(),
                     file_name_to_sources: HashMap::new(),
-                    prefilter: OnceLock::new(),
+                    log_prefilter: OnceLock::new(),
+                    fallback_prefilter: OnceLock::new(),
+                    find_prefilter: OnceLock::new(),
                     line_cache: RwLock::default(),
+                    files_by_name: RwLock::default(),
+                    learned_prefixes: RwLock::default(),
                     log_calls: BTreeMap::new(),
                     languages: BTreeSet::new(),
                 });
@@ -1542,7 +1906,7 @@ impl LogMatcher {
         // with the rest of the work of loading the statements.
         tracker.step("indexing the statements".to_string());
         self.roots.par_iter().for_each(|(_path, coll)| {
-            coll.prefilter();
+            rayon::join(|| coll.log_prefilter(), || coll.find_prefilter());
         });
         let mut found = format!("{} found", self.statements().count());
         if derived > 0 {
@@ -1659,11 +2023,54 @@ impl LogMatcher {
     /// of those is chosen the same way as within a root, so a generic statement in one root,
     /// like `"%s\n"`, does not hide a better one in another, and the result does not depend on
     /// the order of the roots.
+    ///
+    /// Without [`LogMatchOptions::fallback`], a message that matches nothing is remembered by its
+    /// file name and line number, and the next messages with the same ones are not looked for,
+    /// so the time spent on a log with a lot of messages from code that is not in the roots, or
+    /// that log2src does not understand, is not spent over and over.  Like the cache of the
+    /// statements that matched, this depends on the order of the messages: a message that would
+    /// match is not found if one with the same file and line that did not match came first.
     pub fn match_log_statement<'a, 's>(
         &'s self,
         log_ref: &LogRef<'a>,
         options: &LogMatchOptions,
     ) -> Option<LogMapping<'a, 's>> {
+        let start = std::time::Instant::now();
+        if !options.fallback && self.known_unmatched(log_ref) {
+            match_stats::record_line_cache_negative_hit();
+            match_stats::record_message(start, Outcome::Unmatched, log_ref.body());
+            return None;
+        }
+        let (mapping, outcome) = self.match_log_statement_inner(log_ref, options);
+        if !options.fallback && matches!(outcome, Outcome::Unmatched) {
+            self.roots
+                .values()
+                .for_each(|coll| coll.remember_unmatched(log_ref));
+        }
+        match_stats::record_message(start, outcome, log_ref.body());
+        mapping
+    }
+
+    /// Check if an earlier message with the same file name and line number as this one matched
+    /// nothing, and nothing else could match it: every root either remembers that, or has no
+    /// files with that name.
+    fn known_unmatched(&self, log_ref: &LogRef) -> bool {
+        let mut remembered = false;
+        for coll in self.roots.values() {
+            match coll.known_unmatched(log_ref) {
+                Some(true) => remembered = true,
+                Some(false) => {}
+                None => return false,
+            }
+        }
+        remembered
+    }
+
+    fn match_log_statement_inner<'a, 's>(
+        &'s self,
+        log_ref: &LogRef<'a>,
+        options: &LogMatchOptions,
+    ) -> (Option<LogMapping<'a, 's>>, Outcome) {
         let lineno = log_ref.details.as_ref().and_then(|details| details.lineno);
         let level = log_ref.level();
         let body = log_ref.body();
@@ -1671,25 +2078,74 @@ impl LogMatcher {
             .roots
             .values()
             .filter_map(|coll| {
-                coll.find_cached_match(log_ref)
-                    .or_else(|| coll.find_best_match(log_ref))
+                match_stats::timed(Step::LineCache, || {
+                    coll.find_cached_match(log_ref, options.fallback)
+                })
+                .or_else(|| {
+                    match_stats::timed(Step::Prefilter, || {
+                        coll.find_best_match(log_ref, options.fallback)
+                    })
+                })
             })
-            .sorted_by(|lhs, rhs| compare_candidates(lhs, rhs, lineno, level));
-        let best = first_match(candidates, body, lineno, |src_ref| src_ref.stmt);
+            .sorted_by(|lhs, rhs| compare_candidates(&lhs.0, &rhs.0, lineno, level));
+        // Each root's statement already matched, so only the choice between them is made again.
+        let best = choose_match(
+            candidates,
+            lineno,
+            |(src_ref, _)| src_ref.stmt,
+            |(_, without_empty_values)| Some(*without_empty_values),
+        )
+        .map(|((src_ref, _), _)| src_ref);
         if !explains_enough(best.as_ref(), body) {
-            if let Some(source) = self.explain_log_body(log_ref) {
+            // A prefix that was found in front of an earlier message from the statement.
+            let learned = match_stats::timed(Step::Learned, || {
+                self.roots
+                    .values()
+                    .filter_map(|coll| coll.learned_match(log_ref, options.fallback))
+                    .min_by(|lhs, rhs| compare_candidates(&lhs.0, &rhs.0, lineno, level))
+            });
+            // The same test as for the slow way's reading below.
+            if let Some((src_ref, start, score)) = learned {
+                if best.as_ref().is_none_or(|best| score > best.quality) {
+                    let body = body.trim();
+                    let mut mapping =
+                        self.to_log_mapping(log_ref, src_ref, &body[start..], options);
+                    mapping.prefix = message_source::prefix_end(body, start)
+                        .and_then(|end| trim_prefix(&body[..end]));
+                    return (Some(mapping), Outcome::Learned);
+                }
+            }
+            let explained = match_stats::timed(Step::Explain, || {
+                self.explain_log_body(log_ref, options.fallback, best.as_ref())
+            });
+            if let Some((source, learnable)) = explained {
                 if best.as_ref().is_none_or(|best| source.score > best.quality) {
+                    if let (Some(learnable), Some(prefix), Some(start)) =
+                        (learnable, source.prefix.as_deref(), source.start)
+                    {
+                        if let Some(separator) = body.trim().get(prefix.len()..start) {
+                            learnable.tree.learn_prefix(learnable.id, separator);
+                        }
+                    }
                     let mut mapping =
                         self.to_log_mapping(log_ref, source.stmt, &source.text, options);
                     mapping.prefix = source.prefix.as_deref().and_then(|prefix| {
                         let body = body.trim_start();
                         trim_prefix(body.get(..prefix.len()).filter(|start| *start == prefix)?)
                     });
-                    return Some(mapping);
+                    return (Some(mapping), Outcome::Explained);
                 }
             }
         }
-        best.map(|src_ref| self.to_log_mapping(log_ref, src_ref, body, options))
+        let outcome = if best.is_some() {
+            Outcome::Direct
+        } else {
+            Outcome::Unmatched
+        };
+        (
+            best.map(|src_ref| self.to_log_mapping(log_ref, src_ref, body, options)),
+            outcome,
+        )
     }
 
     /// Find the statement that produced the most of a log message when none matches enough of
@@ -1697,14 +2153,59 @@ impl LogMatcher {
     /// name that the Linux kernel's `dev_info()` adds, or one that wraps a message made
     /// somewhere else.  See [`message_source::best_log_source`].  Only the statements found by
     /// the prefilters are used, which keeps this fast, since the statement for any part of the
-    /// message has its key literal in the message.
-    fn explain_log_body<'s>(&'s self, log_ref: &LogRef) -> Option<message_source::LogSource<'s>> {
-        let statements = self
+    /// message has its key literal in that part.  Only the start of a long message is read, so
+    /// only that is prefiltered.  When the reading is a prefix and a statement, the statement is
+    /// returned too, so the prefix can be learned.
+    fn explain_log_body<'s>(
+        &'s self,
+        log_ref: &LogRef,
+        fallback: bool,
+        best: Option<&StatementRef>,
+    ) -> Option<(message_source::LogSource<'s>, Option<Learnable<'s>>)> {
+        let head = message_source::log_head(log_ref.body().trim());
+        // Without `fallback`, the reading has to be from a logging call, and the statements in
+        // the other categories that can make the values in it are errors and formatted
+        // messages, so the rest are never used.
+        let candidates: Vec<(&SourceTree, Vec<(StatementID, StatementRef)>)> = self
             .roots
             .values()
-            .flat_map(|coll| coll.prefiltered_candidates(log_ref))
-            .map(|(_, stmt)| stmt);
-        message_source::best_log_source(statements, log_ref.body())
+            .map(|coll| {
+                let mut found = coll.prefiltered_candidates(coll.find_prefilter(), log_ref, head);
+                if !fallback {
+                    found.retain(|(_, stmt)| stmt.category != MessageCategory::Other);
+                }
+                (coll, found)
+            })
+            .collect();
+        match_stats::record_explain_candidates(
+            candidates.iter().map(|(_, found)| found.len()).sum(),
+        );
+        // A reading is only used if it explains more literal text than `best`, which it can
+        // only do with another statement: `best` by itself, even after a prefix, explains the
+        // same text.  So, when no other statement's key literal is in the message, which is
+        // most of the time, the message does not have to be read.  A chain of `best` with
+        // itself, like `"retry: retry"`, is missed, but that is not worth reading every
+        // message for.
+        let others = candidates.iter().flat_map(|(_, found)| found).any(|(_, stmt)| {
+            best.is_none_or(|best| !std::ptr::eq(stmt.stmt, best.stmt))
+        });
+        if !others {
+            match_stats::record_explain_skipped();
+            return None;
+        }
+        let statements = candidates
+            .iter()
+            .flat_map(|(_, found)| found.iter().map(|(_, stmt)| *stmt));
+        let source = message_source::best_log_source(statements, log_ref.body(), fallback)?;
+        let learnable = source.start.and_then(|_| {
+            candidates.iter().find_map(|(tree, found)| {
+                found
+                    .iter()
+                    .find(|(_, stmt)| std::ptr::eq(stmt.stmt, source.stmt.stmt))
+                    .map(|(id, _)| Learnable { tree, id: *id })
+            })
+        });
+        Some((source, learnable))
     }
 
     #[doc(hidden)]
@@ -1759,18 +2260,8 @@ impl LogMatcher {
         text: &str,
         options: &LogMatchOptions,
     ) -> LogMapping<'a, 's> {
-        let exception_trace = match log_ref {
-            LogRef {
-                details:
-                    Some(LogDetails {
-                        trace: Some(trace), ..
-                    }),
-                ..
-            } => trace.exception_call_sites(self),
-            _ => Vec::new(),
-        };
         let variables = if options.extract_variables {
-            extract_variables_from(text, src_ref.stmt)
+            match_stats::timed(Step::Variables, || extract_variables_from(text, src_ref.stmt))
         } else {
             Vec::new()
         };
@@ -1779,7 +2270,6 @@ impl LogMatcher {
             src_ref: Some(src_ref),
             prefix: None,
             variables,
-            exception_trace,
         }
     }
 }
@@ -2125,65 +2615,6 @@ static CPP_QUERY: LazyLock<String> = LazyLock::new(|| {
 static PATH_TO_NAME_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[/\\]([^/\\]+)$"#).unwrap());
 
-static BACKTRACE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?smx)
-    (?<python>
-        # Match the initial 'Traceback' line
-        ^Traceback\s+\(most\s+recent\s+call\s+last\):\s*$\n?
-
-        # Match all stack frames
-        (?:
-            # File line: '  File "path", line N, in function'
-            ^\s{2}File\s+"[^"]*",\s+line\s+\d+,\s+in\s+\S+\s*$\n?
-
-            # Code line (optional): '    code_here'
-            (?:^\s{4}.*$\n?)?
-        )+
-
-        # Match the final exception line
-        ^[a-zA-Z_][a-zA-Z0-9_.]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*:.*$
-    )
-    |
-    (?<java>
-        # Match exception header(s)
-        (?:^\S*?(?:Exception|Error)(?::\s*.*?)?$\n?)+
-
-        # Match all stack trace components
-        (?:
-            # Stack frame: at package.Class.method(Source.java:123)
-            (?:^\s*at\s+
-                (?:[a-zA-Z_$][a-zA-Z0-9_$]*\.)*  # Package names
-                [a-zA-Z_$][a-zA-Z0-9_$]*         # Class name
-                (?:\.[a-zA-Z_$][a-zA-Z0-9_$]*)?  # Method name
-                (?:\([^)]*\))?                    # Source info
-                (?:\s*~\[[^\]]+\])?              # Module info
-                (?:\s*@[a-fA-F0-9]+)?$\n?        # Memory address
-            )
-            |
-            # Suppressed frames: ... N more
-            (?:^\s*\.{3}\s*\d+\s+
-                (?:more|common\s+frames?\s+omitted)$\n?
-            )
-            |
-            # Caused by chain
-            (?:^\s*Caused\s+by:\s*
-                [a-zA-Z_$][a-zA-Z0-9_$.]*       # Exception class
-                (?::\s*.*?)?$\n?                 # Optional message
-            )
-            |
-            # Suppressed exceptions
-            (?:^\s*Suppressed:\s*
-                [a-zA-Z_$][a-zA-Z0-9_$.]*       # Exception class
-                (?::\s*.*?)?$\n?                 # Optional message
-            )
-        )*
-    )
-"#,
-    )
-    .unwrap()
-});
-
 impl SourceLanguage {
     /// C and C++ share most of their grammar and logging conventions.
     pub fn is_c_family(&self) -> bool {
@@ -2494,9 +2925,6 @@ pub struct LogMapping<'a, 's> {
     pub log_ref: LogRef<'a>,
     #[serde(rename(serialize = "srcRef"))]
     pub src_ref: Option<StatementRef<'s>>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(rename(serialize = "exceptionTrace"))]
-    pub exception_trace: Vec<CallSite>,
     /// The text at the start of the message that no statement produced, like the device name
     /// that the Linux kernel's `dev_info()` adds, when the statement only produced the rest.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2517,82 +2945,8 @@ fn is_only_body(details: &Option<LogDetails>) -> bool {
         details.thread.is_none()
             && details.file.is_none()
             && details.lineno.is_none()
-            && details.trace.is_none()
     } else {
         true
-    }
-}
-
-static PYTHON_CALLER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?smx)
-    (?:
-        ^\s+File\s+"(?<path>[^"]+)",\s+line\s+(?<line>\d+),\s+in\s+(?<name>[^\n]+)$\n?
-    )
-"#,
-    )
-    .unwrap()
-});
-
-static JAVA_CALLER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?smx)
-    (?:
-        ^\s+at\s+(?:[^\s/(]*/)*(?<pkg>(?:[\w$]+\.)*)(?<class>[\w$]+)\.(?<name>[\w$<>-]+)\((?<file>[^:()\n]+):(?<line>\d+)\)\s*$\n?
-    )
-"#,
-    )
-        .unwrap()
-});
-
-#[derive(Copy, Clone, Debug, PartialEq, Serialize)]
-pub struct StackTrace<'a> {
-    pub language: SourceLanguage,
-    pub content: &'a str,
-}
-
-impl<'a> StackTrace<'a> {
-    fn exception_call_sites(&self, log_matcher: &LogMatcher) -> Vec<CallSite> {
-        let mut retval = Vec::new();
-        match self.language {
-            SourceLanguage::Rust => {}
-            SourceLanguage::Java => {
-                for cap in JAVA_CALLER_REGEX.captures_iter(self.content) {
-                    // The Java stack trace does not contain the full path to the source file.
-                    // So, we need to construct a path from the package and class name.  Then,
-                    // we use SourceHierTree::find_file() to find the actual path.
-                    let path_for_pkg = cap
-                        .name("pkg")
-                        .map(|m| PathBuf::from(m.as_str().replace(".", "/")))
-                        .unwrap_or_default();
-                    let path_for_class = path_for_pkg.join(cap.name("file").unwrap().as_str());
-                    let full_path = log_matcher.find_file(&path_for_class);
-                    if let Some(full_path) = full_path {
-                        retval.push(CallSite {
-                            name: cap.name("name").unwrap().as_str().to_string(),
-                            source_path: full_path.to_string_lossy().to_string(),
-                            // The trace could also be from Kotlin or another JVM language.
-                            language: SourceLanguage::from_path(&full_path)
-                                .unwrap_or(SourceLanguage::Java),
-                            line_no: cap.name("line").unwrap().as_str().parse::<usize>().unwrap(),
-                        });
-                    }
-                }
-            }
-            // JVM traces are always recognized as Java.
-            SourceLanguage::C | SourceLanguage::Cpp | SourceLanguage::Kotlin => {}
-            SourceLanguage::Python => {
-                for cap in PYTHON_CALLER_REGEX.captures_iter(self.content) {
-                    retval.push(CallSite {
-                        name: cap.name("name").unwrap().as_str().to_string(),
-                        source_path: cap.name("path").unwrap().as_str().to_string(),
-                        language: SourceLanguage::Python,
-                        line_no: cap.name("line").unwrap().as_str().parse::<usize>().unwrap(),
-                    });
-                }
-            }
-        }
-        retval
     }
 }
 
@@ -2608,8 +2962,6 @@ pub struct LogDetails<'a> {
     pub level: Option<LogLevel>,
     #[serde(skip_serializing)]
     pub body: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trace: Option<StackTrace<'a>>,
 }
 
 impl<'a> LogDetails<'a> {
@@ -2619,7 +2971,6 @@ impl<'a> LogDetails<'a> {
             && self.lineno.is_none()
             && self.level.is_none()
             && self.body.is_none()
-            && self.trace.is_none()
     }
 }
 
@@ -2670,31 +3021,12 @@ impl<'a> LogRefBuilder<'a> {
     }
 
     pub fn with_body(mut self, body: Option<&'a str>) -> Self {
-        let (body, trace) = if let Some(body) = body {
-            if let Some(trace) = BACKTRACE_REGEX.captures(body) {
-                let language = if trace.name("python").is_some() {
-                    SourceLanguage::Python
-                } else if trace.name("java").is_some() {
-                    SourceLanguage::Java
-                } else {
-                    unreachable!();
-                };
-                let cap0 = trace.get(0).unwrap();
-                (
-                    Some(body[0..cap0.range().start].trim_end()),
-                    Some(StackTrace {
-                        language,
-                        content: cap0.as_str(),
-                    }),
-                )
-            } else {
-                (Some(body), None)
-            }
-        } else {
-            (None, None)
-        };
-        self.details.body = body;
-        self.details.trace = trace;
+        // A stack trace after the message is not from the statement, like the exception that
+        // was passed to `log.error("Failed to connect", e)`, so it is left out.
+        self.details.body = body.map(|body| match trace_start(body) {
+            Some(start) => body[..start].trim_end(),
+            None => body,
+        });
         self
     }
 
@@ -2706,6 +3038,60 @@ impl<'a> LogRefBuilder<'a> {
         };
         LogRef { line, details }
     }
+}
+
+/// Where a Java or Python stack trace starts in the body of a log message, if it has one.  A
+/// Java trace is one or more lines with an exception, like `java.io.IOException: closed` or
+/// `Caused by: ...`, followed by a frame, like `\tat com.example.Foo.run(Foo.java:12)`.  A
+/// Python trace starts with `Traceback (most recent call last):` followed by a frame, like
+/// `  File "foo.py", line 12, in run`.  Only the start is found, since the frames are left to
+/// the caller, like lnav, which finds them in the whole message.
+fn trace_start(body: &str) -> Option<usize> {
+    // A trace has more than one line, and most messages have only one.
+    if !body.contains('\n') {
+        return None;
+    }
+    let mut offset = 0;
+    // Where the run of exception lines in front of the current line starts.
+    let mut exceptions_start = None;
+    let mut traceback_start = None;
+    for line in body.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let line = line.trim_end();
+        if traceback_start.is_some() && line.trim_start().starts_with("File \"") {
+            return traceback_start;
+        }
+        traceback_start = (line == "Traceback (most recent call last):").then_some(start);
+        if exceptions_start.is_some() && is_java_frame(line) {
+            return exceptions_start;
+        }
+        exceptions_start = if is_java_exception(line) {
+            exceptions_start.or(Some(start))
+        } else {
+            None
+        };
+    }
+    None
+}
+
+/// Check if a line of a Java stack trace is a frame, like `\tat com.example.Foo.run(...)`.
+fn is_java_frame(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.len() < line.len() && trimmed.starts_with("at ")
+}
+
+/// Check if a line of a Java stack trace names an exception, like `java.io.IOException: closed`,
+/// `MyError`, or `Caused by: ...`.
+fn is_java_exception(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("Caused by:") || trimmed.starts_with("Suppressed:") {
+        return true;
+    }
+    let class = line.split(':').next().unwrap_or(line);
+    !class.is_empty()
+        && !class.contains(char::is_whitespace)
+        && (class.ends_with("Exception") || class.ends_with("Error"))
 }
 
 impl<'a> LogRef<'a> {
@@ -2891,6 +3277,18 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                     "string_literal" | "string" | "concatenated_string" | "binary_expression" => {
                         args_target = ArgsTarget::None;
                         let from_arg = result.arg_level().is_some();
+                        let mut result = result;
+                        for part in &mut result.concat_parts {
+                            if let ConcatPart::Expr {
+                                text,
+                                candidates,
+                                constant_at: Some(at),
+                                ..
+                            } = part
+                            {
+                                *candidates = symbols.candidates(text, *at);
+                            }
+                        }
                         if let Some(src_ref) = Statement::new(code, result) {
                             if from_arg {
                                 arg_levels.insert((src_ref.line_no, src_ref.column));
@@ -2971,10 +3369,22 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
             bare_continuations
                 .iter_mut()
                 .for_each(Statement::resolve_choices);
+            // The concatenations with constants are rebuilt once the constants are known.
+            let (concats, matched): (Vec<_>, Vec<_>) = matched
+                .into_iter()
+                .partition(|stmt| !stmt.concat.is_empty());
+            let constant_concats: Vec<ConstantConcat> = concats
+                .into_iter()
+                .map(|mut stmt| {
+                    let parts = std::mem::take(&mut stmt.concat);
+                    ConstantConcat { stmt, parts }
+                })
+                .collect();
             let macros = src_query.macro_wrappers();
             guard.inc(1);
             if matched.is_empty()
                 && message_refs.is_empty()
+                && constant_concats.is_empty()
                 && symbols.constants.is_empty()
                 && macros.is_empty()
             {
@@ -2992,6 +3402,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                     macros,
                     constants: symbols.constants,
                     message_refs,
+                    constant_concats,
                 })
             }
         })
@@ -3046,7 +3457,6 @@ mod tests {
             lineno: Some(146),
             level: Some(LogLevel::Info),
             body: Some("JvmPauseMonitor-n0: Started"),
-            trace: None,
         });
         assert_eq!(
             result,
@@ -3539,9 +3949,9 @@ class Dup {
         let cached_lines = |matcher: &LogMatcher| {
             let coll = matcher.roots.values().next().unwrap();
             let cache = coll.line_cache.read().unwrap();
+            let file_id = coll.file_name_to_sources["Dup.java"][0];
             let mut lines: Vec<usize> = cache
-                .get("Dup.java")
-                .and_then(|by_line| by_line.get(&6))
+                .get(&(file_id, 6))
                 .into_iter()
                 .flatten()
                 .map(|(file_id, index)| {
@@ -3574,6 +3984,54 @@ class Dup {
         assert_eq!(cached_lines(&matcher), Vec::<usize>::new());
         assert_eq!(match_line(&matcher, "count is 3"), Some(6));
         assert_eq!(cached_lines(&matcher), vec![6]);
+    }
+
+    #[test]
+    fn test_line_cache_unmatched() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("com/example/Dup.java");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, DUP_SRC).unwrap();
+        let mut matcher = matcher_for(temp_dir.path());
+
+        let match_line = |matcher: &LogMatcher, msg: &str, fallback: bool| {
+            let log_ref = LogRefBuilder::new()
+                .with_file(Some("Dup.java"))
+                .with_lineno(Some(20))
+                .with_body(Some(msg))
+                .build(msg);
+            let options = LogMatchOptions {
+                fallback,
+                ..LogMatchOptions::default()
+            };
+            matcher
+                .match_log_statement(&log_ref, &options)
+                .and_then(|mapping| mapping.src_ref)
+                .map(|src_ref| src_ref.line_no)
+        };
+        let cached = |matcher: &LogMatcher| {
+            let coll = matcher.roots.values().next().unwrap();
+            let file_id = coll.file_name_to_sources["Dup.java"][0];
+            coll.line_cache.read().unwrap().get(&(file_id, 20)).cloned()
+        };
+
+        // Not remembered when looking for other kinds of statements too.
+        assert_eq!(match_line(&matcher, "nothing like it", true), None);
+        assert_eq!(cached(&matcher), None);
+        assert_eq!(match_line(&matcher, "nothing like it", false), None);
+        assert_eq!(cached(&matcher), Some(vec![]));
+        // Remembered, so a message with the same file and line is not looked for...
+        assert_eq!(match_line(&matcher, "count is 3", false), None);
+        // ...unless other kinds of statements are wanted too.
+        assert_eq!(match_line(&matcher, "count is 3", true), Some(5));
+
+        // A change to the source forgets it.
+        fs::write(&path, DUP_SRC.replace("class Dup {", "class Dup {\n")).unwrap();
+        let tracker = ProgressTracker::new();
+        assert!(matcher.discover_sources(&tracker).is_empty());
+        matcher.extract_log_statements(&tracker);
+        assert_eq!(cached(&matcher), None);
+        assert_eq!(match_line(&matcher, "count is 3", false), Some(6));
     }
 
     #[test]
@@ -3610,6 +4068,49 @@ class Dup {
             .ends_with("com/b/Dup.java"));
         let coll = matcher.roots.values().next().unwrap();
         assert!(coll.line_cache.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_match_file_name_is_part_of_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let generic = temp_dir.path().join("com/a/Dup.java");
+        let specific = temp_dir.path().join("com/b/Dup.java");
+        fs::create_dir_all(generic.parent().unwrap()).unwrap();
+        fs::create_dir_all(specific.parent().unwrap()).unwrap();
+        fs::write(
+            &generic,
+            "package com.a;\n\nclass Dup {\n    void run(String msg) {\n        log.info(\"count {}\", msg);\n    }\n}\n",
+        )
+        .unwrap();
+        fs::write(&specific, DUP_SRC).unwrap();
+        let matcher = matcher_for(temp_dir.path());
+
+        let match_path = |file: &str, msg: &str| {
+            let log_ref = LogRefBuilder::new()
+                .with_file(Some(file))
+                .with_body(Some(msg))
+                .build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| mapping.src_ref)
+                .map(|src_ref| src_ref.source_path().to_string())
+        };
+
+        // A file name that is not the name of a file is looked for in the paths.
+        assert!(match_path("a/Dup.java", "count is 3")
+            .unwrap()
+            .ends_with("com/a/Dup.java"));
+        assert!(match_path("b/Dup.java", "count is 3")
+            .unwrap()
+            .ends_with("com/b/Dup.java"));
+        // Asked again, the files for the name are remembered.
+        assert!(match_path("a/Dup.java", "count xyz")
+            .unwrap()
+            .ends_with("com/a/Dup.java"));
+        // No statement is in a file that is not in the tree, like one in a library.
+        assert_eq!(match_path("Other.java", "count is 3"), None);
+        let coll = matcher.roots.values().next().unwrap();
+        assert_eq!(coll.files_by_name.read().unwrap().len(), 3);
     }
 
     const SAME_TEXT_SRC: &str = r#"package com.example;
@@ -3790,6 +4291,93 @@ class Same {
         assert_eq!(matcher.statements().count(), 3);
     }
 
+    const CONCAT_CALLER_SRC: &str = r#"package com.example.cc;
+
+class Balancer {
+    static final String LOAD_BALANCING_PREFIX = "LOAD_BALANCING";
+
+    void run(String node, String name, int port) {
+        log.info(LOAD_BALANCING_PREFIX + ": " + node);
+        log.info(Messages.LOG_KEY_FILE + " (from " + name + ")", node);
+        log.info(Library.TAG + ": " + node);
+        log.info(Library.TAG + node);
+        log.info("Prefix is " + LOAD_BALANCING_PREFIX);
+    }
+}
+"#;
+
+    fn write_concat_tree(root: &Path) {
+        write_message_tree(root);
+        let path = root.join("com/example/cc/Balancer.java");
+        fs::write(path, CONCAT_CALLER_SRC).unwrap();
+    }
+
+    #[test]
+    fn test_message_constant_concatenation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_concat_tree(temp_dir.path());
+        let matcher = matcher_for(temp_dir.path());
+        let balancer = |matcher: &LogMatcher| -> Vec<String> {
+            let mut patterns: Vec<String> = matcher
+                .statements()
+                .filter(|stmt| stmt.source_path().ends_with("Balancer.java"))
+                .map(|stmt| stmt.pattern().as_str().to_string())
+                .collect();
+            patterns.sort();
+            patterns
+        };
+        let match_message = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .map(|mapping| {
+                    let src_ref = mapping.src_ref.unwrap();
+                    assert!(src_ref.source_path().ends_with("Balancer.java"));
+                    let vars: Vec<(String, String)> = mapping
+                        .variables
+                        .into_iter()
+                        .map(|var| (var.expr, var.value))
+                        .collect();
+                    (src_ref.line_no, vars)
+                })
+        };
+
+        // A constant in the same class, one in another file, and one that is not in the tree,
+        // which is left as a placeholder, unless that leaves no literal text at all.
+        assert_eq!(
+            balancer(&matcher),
+            vec![
+                "(?s)^(.*): (.*)$",
+                "(?s)^Key material file: (.*) \\(from (.*)\\)$",
+                "(?s)^LOAD_BALANCING: (.*)$",
+                "(?s)^Prefix is LOAD_BALANCING$",
+            ]
+        );
+        assert_eq!(
+            match_message("LOAD_BALANCING: node-1"),
+            Some((7, vars(&[("node", "node-1")])))
+        );
+        // The placeholder from the constant takes the call's argument, and the expression
+        // concatenated after it is its own value.
+        assert_eq!(
+            match_message("Key material file: /etc/key.pem (from proxy)"),
+            Some((8, vars(&[("node", "/etc/key.pem"), ("name", "proxy")])))
+        );
+
+        // From the cache, the constants are resolved again.
+        let cache = Cache {
+            location: temp_dir.path().join("cache"),
+        };
+        let tracker = ProgressTracker::new();
+        matcher.cache_to(&cache, &tracker).unwrap();
+        let mut cached = LogMatcher::new();
+        cached.add_root(temp_dir.path()).unwrap();
+        assert!(cached.load_from_cache(&cache, &tracker).is_empty());
+        let _ = cached.discover_sources(&tracker);
+        assert_eq!(cached.extract_log_statements(&tracker).changes(), 0);
+        assert_eq!(balancer(&cached), balancer(&matcher));
+    }
+
     /// Get the totals of the deterministic work reported to the listener so far.
     fn work_totals(listener: &progress::ProgressListener) -> Vec<(u64, String)> {
         let mut retval = Vec::new();
@@ -3940,6 +4528,92 @@ class Same {
     }
 
     #[test]
+    fn test_match_explains_rest_of_long_message() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("dump.rs"),
+            r#"fn dump(dev: &str, mfr: &str, count: u32, when: &str) {
+    warn!("{}: {}", dev, mfr);
+    info!("New USB device strings: Mfr={}", mfr);
+    info!("Dump of {} threads at {}", count, when);
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let matched = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            let mapping = matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .unwrap();
+            let vars: Vec<(String, String)> = mapping
+                .variables
+                .into_iter()
+                .map(|var| (var.expr, var.value))
+                .collect();
+            (mapping.src_ref.unwrap().line_no, vars)
+        };
+
+        // A statement that matches all of a long message is still found, though only its
+        // start is read for a prefix or a chain.
+        let threads = "\"main\": running\n\"worker-1\": waiting\n".repeat(50);
+        let when = format!("noon\n\n{threads}");
+        assert_eq!(
+            matched(&format!("Dump of 100 threads at {when}")),
+            (
+                4,
+                vec![
+                    ("count".to_string(), "100".to_string()),
+                    ("when".to_string(), when)
+                ]
+            )
+        );
+        // Only the start of the line is read, but the statement after the prefix produced the
+        // rest too, so its values are taken from all of it.
+        let mfr = "3".repeat(2 * message_source::MAX_LOG_HEAD_LEN);
+        assert_eq!(
+            matched(&format!("usb 1-5: New USB device strings: Mfr={mfr}")),
+            (3, vec![("mfr".to_string(), mfr.clone())])
+        );
+        // The head of a long message is cut at a line break, without the '\r' of a CRLF.
+        let lines = "more\r\n".repeat(400);
+        assert_eq!(
+            matched(&format!(
+                "usb 1-5: New USB device strings: Mfr=3\r\n{lines}"
+            )),
+            (
+                3,
+                vec![(
+                    "mfr".to_string(),
+                    format!("3\r\n{lines}").trim_end().to_string()
+                )]
+            )
+        );
+    }
+
+    #[test]
+    fn test_match_prefixed_multi_line_message() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("multi.rs"),
+            r#"fn multi(dev: &str, mfr: &str, count: u32) {
+    warn!("{}: {}", dev, mfr);
+    info!("Line one\nLine two {}", count);
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let msg = "usb 1-5: Line one\nLine two 42";
+        let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+        let mapping = matcher
+            .match_log_statement(&log_ref, &LogMatchOptions::default())
+            .unwrap();
+        assert_eq!(mapping.src_ref.unwrap().line_no, 3);
+        assert_eq!(mapping.variables[0].value, "42");
+    }
+
+    #[test]
     fn test_match_explains_rest_of_message_keeps_evidence() {
         let temp_dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -3955,29 +4629,35 @@ class Same {
         )
         .unwrap();
         let matcher = matcher_for(temp_dir.path());
-        let matched = |msg: &str, lineno: Option<usize>| {
+        let matched_with = |msg: &str, lineno: Option<usize>, fallback: bool| {
             let log_ref = LogRefBuilder::new()
                 .with_body(Some(msg))
                 .with_lineno(lineno)
                 .build(msg);
-            let mapping = matcher
-                .match_log_statement(&log_ref, &LogMatchOptions::default())
-                .unwrap();
-            (
+            let options = LogMatchOptions {
+                fallback,
+                ..LogMatchOptions::default()
+            };
+            let mapping = matcher.match_log_statement(&log_ref, &options)?;
+            Some((
                 mapping.src_ref.unwrap().line_no,
                 mapping.prefix.map(str::to_string),
-            )
+            ))
         };
+        let matched = |msg: &str, lineno: Option<usize>| matched_with(msg, lineno, false).unwrap();
         // The values of the line are explained by other statements, but the reading of all of
         // it does not change which of the statements that match all of it is the best.
         let msg = "Got disk failure on sda1 from controller zero";
         assert_eq!(matched(msg, Some(5)), (5, None));
         assert_eq!(matched(msg, Some(2)), (2, None));
-        // The text in front of a chain of messages is not from any statement.
+        // The text in front of a chain of messages is not from any statement.  The chain is
+        // from formatted messages, not a logging call, so it is only used with the fallback.
+        let chain = "usb 1-5: disk failure on sda1: Controller one reset";
         assert_eq!(
-            matched("usb 1-5: disk failure on sda1: Controller one reset", None),
-            (3, Some("usb 1-5".to_string()))
+            matched_with(chain, None, true),
+            Some((3, Some("usb 1-5".to_string())))
         );
+        assert_eq!(matched_with(chain, None, false), None);
     }
 
     #[test]
@@ -4049,6 +4729,338 @@ static void announce(int dev, const char *product)
     }
 
     #[test]
+    fn test_match_linux_dev_info_prefix() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // From drivers/usb/core/hub.c in the Linux kernel.  The functions after the ones that
+        // announce a device have the other levels of the `dev_` calls, so they are recognized as
+        // logging, like in the whole kernel.
+        fs::write(
+            temp_dir.path().join("hub.c"),
+            r#"static void show_string(struct usb_device *udev, char *id, char *string)
+{
+	if (!string)
+		return;
+	dev_info(&udev->dev, "%s: %s\n", id, string);
+}
+
+static void announce_device_ids(struct usb_device *udev)
+{
+	u16 bcdDevice = le16_to_cpu(udev->descriptor.bcdDevice);
+
+	dev_info(&udev->dev,
+		"New USB device found: idVendor=%04x, idProduct=%04x, bcdDevice=%x.%02x\n",
+		le16_to_cpu(udev->descriptor.idVendor),
+		le16_to_cpu(udev->descriptor.idProduct),
+		bcdDevice >> 8, bcdDevice & 0xff);
+}
+
+static void announce_device_strings(struct usb_device *udev)
+{
+	dev_info(&udev->dev,
+		"New USB device strings: Mfr=%d, Product=%d, SerialNumber=%d\n",
+		udev->descriptor.iManufacturer,
+		udev->descriptor.iProduct,
+		udev->descriptor.iSerialNumber);
+	show_string(udev, "Product", udev->product);
+	show_string(udev, "Manufacturer", udev->manufacturer);
+	show_string(udev, "SerialNumber", udev->serial);
+}
+
+static int hub_port_disable(struct usb_hub *hub, int port1, int set_state)
+{
+	struct usb_port *port_dev = hub->ports[port1 - 1];
+	struct usb_device *hdev = hub->hdev;
+	int ret = 0;
+
+	if (!hub->error) {
+		if (hub_is_superspeed(hub->hdev)) {
+			hub_usb3_port_prepare_disable(hub, port_dev);
+			ret = hub_set_port_link_state(hub, port_dev->portnum,
+						      USB_SS_PORT_LS_U3);
+		} else {
+			ret = usb_clear_port_feature(hdev, port1,
+					USB_PORT_FEAT_ENABLE);
+		}
+	}
+	if (port_dev->child && set_state)
+		usb_set_device_state(port_dev->child, USB_STATE_NOTATTACHED);
+	if (ret && ret != -ENODEV)
+		dev_err(&port_dev->dev, "cannot disable (err = %d)\n", ret);
+	return ret;
+}
+
+static int usb_set_device_initiated_lpm(struct usb_device *udev,
+		enum usb3_link_state state, bool enable)
+{
+	int ret;
+	int feature;
+
+	switch (state) {
+	case USB3_LPM_U1:
+		feature = USB_DEVICE_U1_ENABLE;
+		break;
+	case USB3_LPM_U2:
+		feature = USB_DEVICE_U2_ENABLE;
+		break;
+	default:
+		dev_warn(&udev->dev, "%s: Can't %s non-U1 or U2 state.\n",
+				__func__, str_enable_disable(enable));
+		return -EINVAL;
+	}
+
+	if (udev->state != USB_STATE_CONFIGURED) {
+		dev_dbg(&udev->dev, "%s: Can't %s %s state "
+				"for unconfigured device.\n",
+				__func__, str_enable_disable(enable),
+				usb3_lpm_names[state]);
+		return -EINVAL;
+	}
+
+	if (enable) {
+		/*
+		 * Now send the control transfer to enable device-initiated LPM
+		 * for either U1 or U2.
+		 */
+		ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
+				USB_REQ_SET_FEATURE,
+				USB_RECIP_DEVICE,
+				feature,
+				0, NULL, 0,
+				USB_CTRL_SET_TIMEOUT);
+	} else {
+		ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
+				USB_REQ_CLEAR_FEATURE,
+				USB_RECIP_DEVICE,
+				feature,
+				0, NULL, 0,
+				USB_CTRL_SET_TIMEOUT);
+	}
+	if (ret < 0) {
+		dev_warn(&udev->dev, "%s of device-initiated %s failed.\n",
+			 str_enable_disable(enable), usb3_lpm_names[state]);
+		return -EBUSY;
+	}
+	return 0;
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let matched = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            let mapping = matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .unwrap();
+            let vars: Vec<(String, String)> = mapping
+                .variables
+                .iter()
+                .map(|var| (var.expr.clone(), var.value.clone()))
+                .collect();
+            (
+                mapping.src_ref.unwrap().line_no,
+                vars,
+                mapping.prefix.map(str::to_string),
+            )
+        };
+        let vars = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(expr, value)| (expr.to_string(), value.to_string()))
+                .collect()
+        };
+
+        // The device name that `dev_info()` adds is not in the format string, so it is the
+        // prefix, and the values are taken from the text after it.
+        assert_eq!(
+            matched(
+                "usb 1-5: New USB device found: idVendor=05e3, idProduct=0610, bcdDevice=60.60"
+            ),
+            (
+                13,
+                vars(&[
+                    ("le16_to_cpu(udev->descriptor.idVendor)", "05e3"),
+                    ("le16_to_cpu(udev->descriptor.idProduct)", "0610"),
+                    ("bcdDevice >> 8", "60"),
+                    ("bcdDevice & 0xff", "60"),
+                ]),
+                Some("usb 1-5".to_string())
+            )
+        );
+        assert_eq!(
+            matched("usb 1-5: New USB device strings: Mfr=0, Product=1, SerialNumber=0"),
+            (
+                22,
+                vars(&[
+                    ("udev->descriptor.iManufacturer", "0"),
+                    ("udev->descriptor.iProduct", "1"),
+                    ("udev->descriptor.iSerialNumber", "0"),
+                ]),
+                Some("usb 1-5".to_string())
+            )
+        );
+        // Printed by `show_string()`, so it is matched to the call that has the text.
+        assert_eq!(
+            matched("usb 1-5: Product: USB2.0 Hub"),
+            (
+                26,
+                vars(&[("udev->product", "USB2.0 Hub")]),
+                Some("usb 1-5".to_string())
+            )
+        );
+    }
+
+    const PREFIX_SRC: &str = r#"fn work(id: u32, count: u32, path: &str) {
+    info!("Started worker {} with {} tasks", id, count);
+    info!("open file: {}", path);
+}
+"#;
+
+    /// The line number, variables, and prefix of the statement matched to a message.
+    type PrefixedMatch = (usize, Vec<(String, String)>, Option<String>);
+
+    /// Match the message and return the line number, variables, and prefix of the statement.
+    fn match_with_prefix(matcher: &LogMatcher, msg: &str) -> Option<PrefixedMatch> {
+        let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+        let mapping = matcher.match_log_statement(&log_ref, &LogMatchOptions::default())?;
+        let vars = mapping
+            .variables
+            .iter()
+            .map(|var| (var.expr.clone(), var.value.clone()))
+            .collect();
+        Some((
+            mapping.src_ref?.line_no,
+            vars,
+            mapping.prefix.map(str::to_string),
+        ))
+    }
+
+    #[test]
+    fn test_match_prefix_separators() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("work.rs"), PREFIX_SRC).unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let started = |prefix: &str| {
+            Some((
+                2,
+                vec![
+                    ("id".to_string(), "3".to_string()),
+                    ("count".to_string(), "10".to_string()),
+                ],
+                Some(prefix.to_string()),
+            ))
+        };
+
+        // The prefix can end with any punctuation, so the separator does not have to be known.
+        // A closing bracket is part of the prefix, but a separator like `|` is not.
+        for (msg, prefix) in [
+            ("[main] Started worker 3 with 10 tasks", "[main]"),
+            ("<12>Started worker 3 with 10 tasks", "<12>"),
+            ("svc | Started worker 3 with 10 tasks", "svc"),
+            ("host1\tStarted worker 3 with 10 tasks", "host1"),
+        ] {
+            assert_eq!(match_with_prefix(&matcher, msg), started(prefix), "{msg}");
+        }
+        // A statement whose text starts after a space between words is a fragment of another
+        // message, not the text after a prefix.
+        assert_eq!(
+            match_with_prefix(&matcher, "Failed to open file: /tmp/x"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_match_long_message_partly_explained() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("work.rs"), PREFIX_SRC).unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        // Only the head of a long message is read, but a statement that explains the head and
+        // not the rest is not used, since its values would be cut off.
+        let lines = "more\n".repeat(400);
+        for msg in [
+            format!("Started worker 3 with 10 tasks\n{lines}"),
+            format!("[main] Started worker 3 with 10 tasks\n{lines}"),
+        ] {
+            assert_eq!(match_with_prefix(&matcher, &msg), None);
+        }
+    }
+
+    #[test]
+    fn test_match_learned_prefix() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("work.rs"), PREFIX_SRC).unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let coll = matcher.roots.values().next().unwrap();
+        let learned = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            coll.learned_match(&log_ref, false)
+                .map(|(src_ref, start, _)| (src_ref.line_no, start))
+        };
+        let separators = || -> Vec<String> {
+            coll.learned_prefixes
+                .read()
+                .unwrap()
+                .values()
+                .flatten()
+                .map(|lp| lp.separator.clone())
+                .collect()
+        };
+
+        assert_eq!(learned("[pool-2] Started worker 4 with 1 tasks"), None);
+        // Found the slow way, and the separator after the prefix is remembered.
+        assert_eq!(
+            match_with_prefix(&matcher, "[main] Started worker 3 with 10 tasks"),
+            Some((
+                2,
+                vec![
+                    ("id".to_string(), "3".to_string()),
+                    ("count".to_string(), "10".to_string()),
+                ],
+                Some("[main]".to_string())
+            ))
+        );
+        assert_eq!(separators(), vec![" ".to_string()]);
+        // Another message from the statement, with a different prefix, is found with it, and
+        // the result is the same as the slow way.
+        assert_eq!(
+            learned("[pool-2] Started worker 4 with 1 tasks"),
+            Some((2, 9))
+        );
+        assert_eq!(
+            match_with_prefix(&matcher, "[pool-2] Started worker 4 with 1 tasks"),
+            Some((
+                2,
+                vec![
+                    ("id".to_string(), "4".to_string()),
+                    ("count".to_string(), "1".to_string()),
+                ],
+                Some("[pool-2]".to_string())
+            ))
+        );
+        // Each place after the separator is tried, not just the first one that the statement
+        // matches after.
+        assert_eq!(
+            learned("dev Started worker [x] Started worker 4 with 1 tasks"),
+            Some((2, 23))
+        );
+        // The prefix still has to end like one.
+        assert_eq!(learned("just Started worker 4 with 1 tasks"), None);
+        // The statement has to explain enough of the rest of the message.
+        assert_eq!(
+            learned(
+                "[main] Started worker 3 with 10 tasks, and then a whole lot more text after it"
+            ),
+            None
+        );
+        assert_eq!(separators(), vec![" ".to_string()]);
+
+        // A change to the statements forgets them, since the statement IDs can change.
+        let mut matcher = matcher;
+        matcher.rebuild_prefilters();
+        let coll = matcher.roots.values().next().unwrap();
+        assert!(coll.learned_prefixes.read().unwrap().is_empty());
+    }
+
+    #[test]
     fn test_match_through_format_wrappers() {
         let temp_dir = tempfile::tempdir().unwrap();
         let include = temp_dir.path().join("include");
@@ -4103,7 +5115,13 @@ static int add_power_resource(void *handle, int count)
         let msg = "ACPI: \\_SB_.PWRS: PM: New power resource 2";
         let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
         let mapping = matcher
-            .match_log_statement(&log_ref, &LogMatchOptions::default())
+            .match_log_statement(
+                &log_ref,
+                &LogMatchOptions {
+                    fallback: true,
+                    ..LogMatchOptions::default()
+                },
+            )
             .unwrap();
         let src_ref = mapping.src_ref.unwrap();
         // The call where the message was written, which explains all of the line.
@@ -4182,7 +5200,13 @@ void start(void)
         let matched = |msg: &str| {
             let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
             let mapping = matcher
-                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .match_log_statement(
+                    &log_ref,
+                    &LogMatchOptions {
+                        fallback: true,
+                        ..LogMatchOptions::default()
+                    },
+                )
                 .unwrap();
             let src_ref = mapping.src_ref.unwrap();
             let file = Path::new(src_ref.source_path()).file_name().unwrap();
@@ -4259,7 +5283,13 @@ void start(void)
             let msg = "enabled with IRQ 122";
             let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
             let src_ref = matcher
-                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .match_log_statement(
+                    &log_ref,
+                    &LogMatchOptions {
+                        fallback: true,
+                        ..LogMatchOptions::default()
+                    },
+                )
                 .and_then(|mapping| mapping.src_ref)
                 .unwrap();
             assert!(src_ref.source_path().ends_with("aer.c"));
@@ -4268,7 +5298,13 @@ void start(void)
             let msg = "requested with IRQ 5";
             let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
             let src_ref = matcher
-                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .match_log_statement(
+                    &log_ref,
+                    &LogMatchOptions {
+                        fallback: true,
+                        ..LogMatchOptions::default()
+                    },
+                )
                 .and_then(|mapping| mapping.src_ref)
                 .unwrap();
             assert!(src_ref.source_path().ends_with("dock.c"));
@@ -4487,7 +5523,13 @@ void show(int on)
         let matched = |msg: &str| {
             let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
             let mapping = matcher
-                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .match_log_statement(
+                    &log_ref,
+                    &LogMatchOptions {
+                        fallback: true,
+                        ..LogMatchOptions::default()
+                    },
+                )
                 .unwrap();
             let src_ref = mapping.src_ref.unwrap();
             let conts: Vec<usize> = src_ref
@@ -7191,6 +8233,84 @@ def main(x, t, pct):
     }
 
     #[test]
+    fn test_kernel_level_args() {
+        let code = CodeSource::from_string(
+            Path::new("sd.c"),
+            r#"
+void sd(struct scsi_disk *sdkp, struct scsi_device *sdp, int wp, const char *name) {
+    sd_printk(KERN_NOTICE, sdkp, "Write Protect is %s\n", wp ? "on" : "off");
+    sdev_printk(KERN_ERR, sdp, "Unable to read %s\n", name);
+    printk(KERN_INFO "Booting paravirtualized kernel on %s\n", name);
+    printk(KERN_WARNING "disk %s is slow\n", name);
+    printk(LOG_ERR "syslog style %s\n", name);
+    printk(KERN_CONT " and more\n");
+    printk(KERN_DEFAULT "no level %s\n", name);
+    printk(PREFIX "not a level %s\n", name);
+}
+"#,
+        );
+        let mut sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        prune_log_calls(sif.statements_for_pruning().collect());
+        let found: Vec<(String, LogLevel, MessageCategory)> = sif
+            .log_statements
+            .iter()
+            .map(|stmt| (stmt.text.clone(), stmt.level, stmt.category))
+            .collect();
+        let expected = |text: &str, level, category| (text.to_string(), level, category);
+        assert_eq!(
+            found,
+            vec![
+                // The level is the argument in front of the message, so the call is logging
+                // although its name has no level and its family has only one.
+                expected(
+                    "\"Write Protect is %s\\n\"",
+                    LogLevel::Info,
+                    MessageCategory::Log
+                ),
+                expected(
+                    "\"Unable to read %s\\n\"",
+                    LogLevel::Error,
+                    MessageCategory::Log
+                ),
+                // The level is a macro in front of the string.
+                expected(
+                    "KERN_INFO \"Booting paravirtualized kernel on %s\\n\"",
+                    LogLevel::Info,
+                    MessageCategory::Log
+                ),
+                expected(
+                    "KERN_WARNING \"disk %s is slow\\n\"",
+                    LogLevel::Warn,
+                    MessageCategory::Log
+                ),
+                expected(
+                    "LOG_ERR \"syslog style %s\\n\"",
+                    LogLevel::Error,
+                    MessageCategory::Log
+                ),
+                // `KERN_CONT` and `KERN_DEFAULT` are not levels, and neither is any other macro.
+                expected(
+                    "KERN_CONT \" and more\\n\"",
+                    LogLevel::Unknown,
+                    MessageCategory::Other
+                ),
+                expected(
+                    "KERN_DEFAULT \"no level %s\\n\"",
+                    LogLevel::Unknown,
+                    MessageCategory::Other
+                ),
+                expected(
+                    "PREFIX \"not a level %s\\n\"",
+                    LogLevel::Unknown,
+                    MessageCategory::Other
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn test_prune_log_calls() {
         let codes = [
             CodeSource::from_string(
@@ -7224,8 +8344,12 @@ void dissect(void) {
             tree: SourceHierTree::from(Path::new("in-mem")),
             files_with_statements: HashMap::new(),
             file_name_to_sources: HashMap::new(),
-            prefilter: OnceLock::new(),
+            log_prefilter: OnceLock::new(),
+            fallback_prefilter: OnceLock::new(),
+            find_prefilter: OnceLock::new(),
             line_cache: RwLock::default(),
+            files_by_name: RwLock::default(),
+            learned_prefixes: RwLock::default(),
             log_calls: BTreeMap::new(),
             languages: BTreeSet::new(),
         };
@@ -8055,8 +9179,12 @@ int main(int argc, char *argv[]) {
             tree: SourceHierTree::from(Path::new("in-mem")),
             files_with_statements: HashMap::new(),
             file_name_to_sources: HashMap::new(),
-            prefilter: OnceLock::new(),
+            log_prefilter: OnceLock::new(),
+            fallback_prefilter: OnceLock::new(),
+            find_prefilter: OnceLock::new(),
             line_cache: RwLock::default(),
+            files_by_name: RwLock::default(),
+            learned_prefixes: RwLock::default(),
             log_calls: BTreeMap::new(),
             languages: BTreeSet::new(),
         };
@@ -8065,11 +9193,12 @@ int main(int argc, char *argv[]) {
         }
         tree.prune_log_calls();
         tree.rebuild_prefilter();
-        let best = |line: &str| {
+        let best_with = |line: &str, fallback: bool| {
             let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
-            tree.find_best_match(&log_ref)
-                .map(|src_ref| (src_ref.line_no, src_ref.category))
+            tree.find_best_match(&log_ref, fallback)
+                .map(|(src_ref, _)| (src_ref.line_no, src_ref.category))
         };
+        let best = |line: &str| best_with(line, true);
         // The `luaL` family is pruned, so the log statement wins although the other one has
         // more literal text.
         assert_eq!(
@@ -8081,6 +9210,12 @@ int main(int argc, char *argv[]) {
         // A log statement is used even if it only matches with an empty value and the other
         // statement matches without one.
         assert_eq!(best("server ready"), Some((6, MessageCategory::Log)));
+        // Without the fallback, only the logging calls are used.
+        assert_eq!(best_with("cannot parse foo", false), None);
+        assert_eq!(
+            best_with("cannot open file foo", false),
+            Some((4, MessageCategory::Log))
+        );
     }
 
     #[test]
@@ -8098,8 +9233,12 @@ void f(const char *key, int value) {
             tree: SourceHierTree::from(Path::new("in-mem")),
             files_with_statements: HashMap::new(),
             file_name_to_sources: HashMap::new(),
-            prefilter: OnceLock::new(),
+            log_prefilter: OnceLock::new(),
+            fallback_prefilter: OnceLock::new(),
+            find_prefilter: OnceLock::new(),
             line_cache: RwLock::default(),
+            files_by_name: RwLock::default(),
+            learned_prefixes: RwLock::default(),
             log_calls: BTreeMap::new(),
             languages: BTreeSet::new(),
         };
@@ -8107,20 +9246,23 @@ void f(const char *key, int value) {
             tree.files_with_statements.insert(sif.id, sif);
         }
         tree.rebuild_prefilter();
-        let candidates = |line: &str| {
+        let candidates_in = |prefilter: &Prefilter, line: &str| {
             let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
-            tree.prefiltered_candidates(&log_ref)
+            tree.prefiltered_candidates(prefilter, &log_ref, line)
                 .into_iter()
                 .map(|(_, stmt)| stmt.line_no)
                 .sorted()
                 .collect::<Vec<_>>()
         };
+        let candidates = |line: &str| candidates_in(tree.log_prefilter(), line);
         // The literal of the first statement is a single byte, which is looked up by byte
         // instead of in the automaton.
         assert_eq!(candidates("a=1"), vec![3]);
         assert_eq!(candidates("a: 1"), vec![4]);
         assert_eq!(candidates("a=b: 1="), vec![3, 4]);
         assert!(candidates("nothing").is_empty());
+        // Neither has enough literal text to explain a part of a message.
+        assert!(candidates_in(tree.find_prefilter(), "a=b: 1=").is_empty());
     }
 
     #[test]
@@ -8386,37 +9528,6 @@ java.lang.IllegalStateException: simulated failure for demo
         assert_yaml_snapshot!(vars);
     }
 
-    #[test]
-    fn test_kotlin_trace() {
-        let content = r#"java.lang.IllegalStateException: boom
-    at org.example.Worker.run(Basic.kt:13)
-    at org.example.BasicKt.main(Basic.kt:21)
-"#;
-        let mut log_matcher = LogMatcher::new();
-        log_matcher
-            .add_root(&Path::new("tests").join("kotlin"))
-            .unwrap();
-        assert!(log_matcher
-            .discover_sources(&ProgressTracker::new())
-            .is_empty());
-        let stacktrace = StackTrace {
-            language: SourceLanguage::Java,
-            content,
-        };
-        let trace: Vec<_> = stacktrace
-            .exception_call_sites(&log_matcher)
-            .into_iter()
-            .map(|site| (site.name, site.language, site.line_no))
-            .collect();
-        assert_eq!(
-            trace,
-            vec![
-                ("run".to_string(), SourceLanguage::Kotlin, 13),
-                ("main".to_string(), SourceLanguage::Kotlin, 21),
-            ]
-        );
-    }
-
     fn find_file_matcher() -> (tempfile::TempDir, LogMatcher) {
         let dir = tempfile::tempdir().unwrap();
         for rel in [
@@ -8525,58 +9636,6 @@ java.lang.IllegalStateException: simulated failure for demo
         assert_eq!(LogMatcher::from_windows_path(path), None);
     }
 
-    #[test]
-    fn test_java_trace_inner_classes() {
-        let content = r#"java.lang.IllegalStateException: boom
-	at com.foo.Bar$1.run(Bar.java:42)
-	at com.foo.Bar$Inner$2.call(Bar.java:55)
-	at com.foo.Bar.lambda$main$0(Bar.java:12)
-	at app//com.foo.Bar$1.<init>(Bar.java:40)
-	at com.foo.Bar$$Lambda$14/0x0000000800c03000.run(Unknown Source)
-	at com.zzz.Bar.run(Bar.java:7)
-	at com.MyCo.app.UserId.box-impl(UserId.kt:5)
-	at java.base/java.lang.Thread.run(Thread.java:833)
-"#;
-        let (dir, log_matcher) = find_file_matcher();
-        let bar = dir
-            .path()
-            .join("src/main/java/com/foo/Bar.java")
-            .canonicalize()
-            .unwrap();
-        let user_id = dir
-            .path()
-            .join("src/main/kotlin/com/MyCo/app/UserId.kt")
-            .canonicalize()
-            .unwrap();
-        let stacktrace = StackTrace {
-            language: SourceLanguage::Java,
-            content,
-        };
-        let trace: Vec<_> = stacktrace
-            .exception_call_sites(&log_matcher)
-            .into_iter()
-            .map(|site| {
-                (
-                    site.name,
-                    PathBuf::from(site.source_path).canonicalize().unwrap(),
-                    site.line_no,
-                )
-            })
-            .collect();
-        // com/other/Bar.java has the same name, so the package has to be split off correctly.
-        // com.zzz.Bar is in neither package, so it is dropped instead of guessing.
-        assert_eq!(
-            trace,
-            vec![
-                ("run".to_string(), bar.clone(), 42),
-                ("call".to_string(), bar.clone(), 55),
-                ("lambda$main$0".to_string(), bar.clone(), 12),
-                ("<init>".to_string(), bar.clone(), 40),
-                ("box-impl".to_string(), user_id, 5),
-            ]
-        );
-    }
-
     const PYTHON_TRACE: &str = r#"\
 Traceback (most recent call last):
   File "python-logging-example/python_logging_example/__main__.py", line 26, in main
@@ -8589,14 +9648,36 @@ ZeroDivisionError: division by zero
 "#;
 
     #[test]
-    fn test_python_trace() {
-        let stacktrace = StackTrace {
-            language: SourceLanguage::Python,
-            content: PYTHON_TRACE,
-        };
-
-        let log_matcher = LogMatcher::new();
-        let trace = stacktrace.exception_call_sites(&log_matcher);
-        assert_yaml_snapshot!(trace);
+    fn test_trace_start() {
+        fn body(text: &str) -> Option<&str> {
+            LogRefBuilder::new()
+                .with_body(Some(text))
+                .build(text)
+                .details
+                .and_then(|details| details.body)
+        }
+        assert_eq!(body(TRACE), Some("JvmPauseMonitor-n0: Started"));
+        assert_eq!(
+            body(&format!("Failed to divide\n{}", PYTHON_TRACE.trim_start_matches("\\\n"))),
+            Some("Failed to divide")
+        );
+        // The trace can be all of the message, like for `log.error("", e)`.
+        assert_eq!(body(PYTHON_TRACE.trim_start_matches("\\\n")), Some(""));
+        // A chain of causes, with tabs.
+        assert_eq!(
+            body("Request failed\nWrapperException: outer\n\tat a.B.c(B.java:1)\nCaused by: java.io.IOException: inner\n\tat d.E.f(E.java:2)\n"),
+            Some("Request failed")
+        );
+        // Without a frame after it, an exception's name is just part of the message.
+        assert_eq!(body("ConnectionError: timeout"), Some("ConnectionError: timeout"));
+        assert_eq!(
+            body("Retrying\nConnectionError: timeout"),
+            Some("Retrying\nConnectionError: timeout")
+        );
+        // A frame needs an exception in front of it.
+        assert_eq!(
+            body("Steps:\n  at home\n  at work"),
+            Some("Steps:\n  at home\n  at work")
+        );
     }
 }

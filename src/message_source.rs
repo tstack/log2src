@@ -9,10 +9,11 @@ use crate::{
     compare_candidates, first_match, MessageCategory, Statement, StatementRef, MIN_FALLBACK_QUALITY,
 };
 use serde::Serialize;
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 /// The statements that could have produced some text in a message.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct MessageSource<'s> {
     /// The text that was looked up.
     pub text: String,
@@ -41,6 +42,18 @@ const MIN_VALUE_LEN: usize = 4;
 /// a large message, like a JSON document, which has one for every field.  A prefix or the head
 /// of a chain is a few words, so it is in front of the first few separators.
 const MAX_SPLITS: usize = 8;
+
+/// The longest prefix, in bytes, that is looked for in front of where a statement's text starts,
+/// see `Finder::prefix_splits()`.  A prefix is a few words, like the device name that the Linux
+/// kernel's `dev_info()` adds, `"[worker-3]"`, or `"<12>"`, while a statement's text can be found
+/// almost anywhere in a long message that has a lot of punctuation, like a JSON document.
+const MAX_PREFIX_LEN: usize = 64;
+
+/// How much of a log message [`best_log_source`] reads for a prefix or the head of a chain.
+/// Those are at the start of a message, and the rest can be very long, like a dump of a
+/// service's status that is hundreds of kilobytes, where every reading runs the statements'
+/// regexes over all of it.  A message that is not longer than this is read whole.
+pub(crate) const MAX_LOG_HEAD_LEN: usize = 1024;
 
 /// The least amount of literal text, not counting whitespace, that a statement has to share with
 /// a fragment of a message.
@@ -75,6 +88,8 @@ pub fn find_message_sources<'s>(
             .filter(|stmt| stmt.quality >= MIN_FALLBACK_QUALITY)
             .collect(),
         relaxed: false,
+        top_log_only: false,
+        memo: RefCell::default(),
     };
     let message = message.trim();
     let collapsed = collapse_whitespace(message);
@@ -85,6 +100,8 @@ pub fn find_message_sources<'s>(
     let relaxed = Finder {
         statements: finder.statements.clone(),
         relaxed: true,
+        top_log_only: false,
+        memo: RefCell::default(),
     };
     let loose = relaxed.prefixed_resolve(&collapsed);
     if loose.0 > best.0 || (best.1.is_empty() && !loose.1.is_empty()) {
@@ -130,6 +147,7 @@ pub fn find_message_sources<'s>(
 pub(crate) fn best_log_source<'s>(
     statements: impl IntoIterator<Item = StatementRef<'s>>,
     body: &str,
+    fallback: bool,
 ) -> Option<LogSource<'s>> {
     let finder = Finder {
         statements: statements
@@ -137,33 +155,73 @@ pub(crate) fn best_log_source<'s>(
             .filter(|stmt| stmt.quality >= MIN_FALLBACK_QUALITY)
             .collect(),
         relaxed: false,
+        top_log_only: !fallback,
+        memo: RefCell::default(),
     };
     if finder.statements.is_empty() {
         return None;
     }
     let body = body.trim();
-    let (score, sources) = finder.prefixed_resolve(body);
-    if let [only] = sources.as_slice() {
-        if only.text == body {
-            return None;
-        }
+    let head = log_head(body);
+    let (score, sources) = finder.prefixed_resolve(head);
+    // A reading of the whole message is left to the caller, see above, even when only the
+    // head was read.
+    if sources.len() == 1 {
+        return None;
     }
     // A prefix that is not from any statement is only ever the first in the reading.
     let prefix = sources
         .first()
         .filter(|source| source.candidates.is_empty())
         .map(|source| source.text.clone());
-    sources.into_iter().find_map(|source| {
-        let MessageSource {
-            text, candidates, ..
-        } = source;
-        candidates.into_iter().next().map(|stmt| LogSource {
-            score,
-            stmt,
-            text,
-            prefix: prefix.clone(),
-        })
+    // The sources are the parts of the head, in order, so only the last one runs to its end.
+    let last = sources.len().saturating_sub(1);
+    let prefixed_statement = prefix.is_some() && sources.len() == 2;
+    let (index, source) = sources
+        .into_iter()
+        .enumerate()
+        .find(|(_, source)| !source.candidates.is_empty())?;
+    let MessageSource {
+        text, candidates, ..
+    } = source;
+    let stmt = candidates.into_iter().next()?;
+    let text = if index == last && head.len() != body.len() {
+        let head_len = text.len();
+        let text = finder.whole_text(stmt, text, head, body);
+        // The statement did not produce the rest of the message, so its values would be cut
+        // off at the end of the head, which is no better than not explaining the message.
+        if text.len() == head_len {
+            return None;
+        }
+        text
+    } else {
+        text
+    };
+    // The prefix and this statement are all of the message.
+    let start = prefixed_statement.then(|| body.len() - text.len());
+    Some(LogSource {
+        score,
+        stmt,
+        text,
+        prefix,
+        start,
     })
+}
+
+/// The part of a log message's body that [`best_log_source`] reads: all of it, if it is not
+/// longer than [`MAX_LOG_HEAD_LEN`] bytes, or else the lines that fit, or the start of the first
+/// line if it does not fit.  It is always the start of the body, so the rest is
+/// `&body[head.len()..]`.
+pub(crate) fn log_head(body: &str) -> &str {
+    if body.len() <= MAX_LOG_HEAD_LEN {
+        return body;
+    }
+    let end = body.floor_char_boundary(MAX_LOG_HEAD_LEN);
+    let start = &body[..end];
+    match start.rfind('\n') {
+        Some(pos) => start[..pos].trim_end_matches('\r'),
+        None => start,
+    }
 }
 
 /// The statement that produced the most of a log message, from [`best_log_source`].
@@ -176,6 +234,58 @@ pub(crate) struct LogSource<'s> {
     pub text: String,
     /// The text at the start of the message that no statement produced, if any.
     pub prefix: Option<String>,
+    /// Where the statement's text starts in the trimmed message, when the reading is only the
+    /// prefix and the statement, so the same reading can be found for other messages from the
+    /// statement with a pattern for the prefix, see `SourceTree::learned_match()`.
+    pub start: Option<usize>,
+}
+
+/// Where a prefix that is not from any statement ends in `message`, without its separator, if
+/// the text at `start` can follow one.  The prefix has to end with punctuation and then
+/// whitespace, like `"usb 1-5: "` or `"svc | "`, a closing bracket, like `"[worker-3]"` or
+/// `"<12>"`, or a tab, so the separator does not have to be known.  A statement whose text
+/// starts after a space between words, like `"open file: %s"` in `"Failed to open file: x"`, is
+/// a fragment of another message, and one right after other punctuation, like the
+/// `"properties"` in `"jcc.properties"` or a value in a JSON document, is part of a word or a
+/// value, not what follows a prefix.  A separator, like the `:` or `|`, is not part of the
+/// prefix, but a closing bracket is.
+/// Where the text after a prefix could start in a trimmed log message, for a prefix that was
+/// learned to end with `separator`, see `SourceTree::learned_match()`.  These are after the
+/// first few times the separator is in the message, the same as the `": "` that are tried by
+/// [`best_log_source`], and only where a prefix could end, see [`prefix_end`].
+pub(crate) fn learned_prefix_starts<'a>(
+    message: &'a str,
+    separator: &'a str,
+) -> impl Iterator<Item = usize> + 'a {
+    message
+        .match_indices(separator)
+        .take(MAX_SPLITS)
+        .map(move |(pos, sep)| pos + sep.len())
+        .filter(move |start| prefix_end(message, *start).is_some())
+}
+
+pub(crate) fn prefix_end(message: &str, start: usize) -> Option<usize> {
+    let before = message.get(..start)?;
+    let trimmed = before.trim_end();
+    let last = trimmed.chars().next_back()?;
+    let space = &before[trimmed.len()..];
+    let ends_prefix = if space.contains('\t') {
+        true
+    } else if space.is_empty() {
+        matches!(last, ']' | ')' | '>' | '}')
+    } else {
+        !last.is_alphanumeric()
+    };
+    if !ends_prefix {
+        return None;
+    }
+    let end = if matches!(last, ':' | '|' | ';' | ',' | '-' | '=' | '~') {
+        trimmed.len() - last.len_utf8()
+    } else {
+        trimmed.len()
+    };
+    let prefix = message[..end].trim_end();
+    (!prefix.is_empty()).then_some(prefix.len())
 }
 
 impl<'s> Finder<'s> {
@@ -186,15 +296,80 @@ impl<'s> Finder<'s> {
     /// all of the message, like `"%s [%s]"`, does not hide a better one for the rest of it.  The
     /// whole message wins a tie, like a wrapper whose value is explained too.
     fn prefixed_resolve(&self, message: &str) -> (usize, Vec<MessageSource<'s>>) {
+        self.memo.borrow_mut().reset(message);
         let mut best = self.resolve(message, 0, true);
-        for (pos, sep) in message.match_indices(": ").take(MAX_SPLITS) {
-            let (score, mut sources) = self.resolve(&message[pos + sep.len()..], 0, true);
+        for (start, prefix_len) in self.prefix_splits(message) {
+            let (score, mut sources) = self.resolve(&message[start..], 0, true);
             if !sources.is_empty() && score > best.0 {
-                sources.insert(0, MessageSource::unknown(&message[..pos]));
+                sources.insert(0, MessageSource::unknown(&message[..prefix_len]));
                 best = (score, sources);
             }
         }
         best
+    }
+
+    /// Where the text after a prefix could start in `message`, with the length of the prefix,
+    /// see [`prefix_end`].  These are after the first few `": "`, which can also start a chain
+    /// of messages, like `"usb 1-5: Unable to start: No such file"`, and where the leading
+    /// literal text of a statement is, whatever the separator in front of it is, like
+    /// `"[worker-3] "`, which only has to be found, not matched, since the text after the prefix
+    /// is resolved anyway.
+    fn prefix_splits(&self, message: &str) -> Vec<(usize, usize)> {
+        let mut starts: Vec<usize> = message
+            .match_indices(": ")
+            .take(MAX_SPLITS)
+            .map(|(pos, sep)| pos + sep.len())
+            .collect();
+        // A relaxed pattern can match where the literal text is not.  A statement whose
+        // text starts with whitespace, like `.append(" is already a named search")`, is a piece
+        // added to some other text, not the start of a message after a prefix.
+        if !self.relaxed {
+            // The places a prefix can end are few, so each statement only has to be checked
+            // for starting at one of them, and once all of them were found, the rest of the
+            // statements do not have to be checked.
+            let mut places: Vec<(usize, bool)> = (1..=MAX_PREFIX_LEN.min(message.len()))
+                .filter(|start| message.is_char_boundary(*start))
+                .filter(|start| prefix_end(message, *start).is_some())
+                .map(|start| (start, false))
+                .collect();
+            let mut remaining = places.len();
+            for stmt in self
+                .statements
+                .iter()
+                .filter(|stmt| self.usable(stmt, true))
+            {
+                if remaining == 0 {
+                    break;
+                }
+                let Some(literal) = stmt
+                    .leading_literal()
+                    .filter(|literal| !literal.starts_with(char::is_whitespace))
+                else {
+                    continue;
+                };
+                // The text has to fit after the prefix, but the rest of the statement is checked
+                // when the text is resolved.
+                if let Some(place) = places
+                    .iter_mut()
+                    .find(|(start, _)| message[*start..].starts_with(literal))
+                    .filter(|(_, found)| !*found)
+                {
+                    place.1 = true;
+                    remaining -= 1;
+                }
+            }
+            starts.extend(
+                places
+                    .into_iter()
+                    .filter_map(|(start, found)| found.then_some(start)),
+            );
+        }
+        starts.sort_unstable();
+        starts.dedup();
+        starts
+            .into_iter()
+            .filter_map(|start| Some((start, prefix_end(message, start)?)))
+            .collect()
     }
 }
 
@@ -203,9 +378,68 @@ struct Finder<'s> {
     /// Use `Statement::relaxed_pattern()`, which ignores differences in whitespace, for text
     /// whose whitespace was collapsed.
     relaxed: bool,
+    /// Only use logging calls for the whole text, not just for the parts of it, like when
+    /// matching a log line without [`crate::LogMatchOptions::fallback`].
+    top_log_only: bool,
+    /// The answers already worked out for this message.  The readings of a message overlap a
+    /// lot: each `": "` is tried as the end of a prefix and as the end of the head of a chain,
+    /// and the tails of those are tried again a level down, so the same text is looked up many
+    /// times.
+    memo: RefCell<Memo<'s>>,
+}
+
+/// What [`Finder`] has already worked out for the message given to
+/// [`Finder::prefixed_resolve`].  The texts that are looked up are all slices of that message, so
+/// they are keyed by where they are in it ([`Memo::key`]), instead of copying and hashing them.
+/// Indexed by `top`, since that changes the statements that are used.
+#[derive(Default)]
+struct Memo<'s> {
+    /// Where the message is, as the address of its first byte and its length.
+    message: (usize, usize),
+    /// [`Finder::candidates`].
+    candidates: [HashMap<(usize, usize), Vec<StatementRef<'s>>>; 2],
+    /// [`Finder::resolve`], by depth too, since that limits how far down the values are looked
+    /// up.
+    resolved: [HashMap<(usize, usize, usize), (usize, Vec<MessageSource<'s>>)>; 2],
+}
+
+impl Memo<'_> {
+    /// Forget everything and remember the answers for `message` from now on.
+    fn reset(&mut self, message: &str) {
+        *self = Memo {
+            message: (message.as_ptr() as usize, message.len()),
+            ..Memo::default()
+        };
+    }
+
+    /// The offset and length of `text` in the message, or None if it is not a slice of it, so
+    /// it is not remembered.
+    fn key(&self, text: &str) -> Option<(usize, usize)> {
+        let (start, len) = self.message;
+        let offset = (text.as_ptr() as usize).checked_sub(start)?;
+        (offset + text.len() <= len).then_some((offset, text.len()))
+    }
 }
 
 impl<'s> Finder<'s> {
+    /// The text that `stmt` produced, given the part at the end of the [`log_head`] that it
+    /// explains.  The statement most likely produced the rest of the message too, like the lines
+    /// of a stack trace in its last placeholder, so the rest is added if the statement matches it
+    /// and its values still fit, so its values are extracted from all of it.
+    fn whole_text(&self, stmt: StatementRef, text: String, head: &str, body: &str) -> String {
+        if head.len() == body.len() {
+            return text;
+        }
+        let whole = format!("{text}{}", &body[head.len()..]);
+        if self.pattern(&stmt).is_match(&whole)
+            && (self.fits(&stmt, &whole) || !self.fits(&stmt, &text))
+        {
+            whole
+        } else {
+            text
+        }
+    }
+
     /// The regex for matching text to a statement.
     fn pattern<'a>(&self, stmt: &'a Statement) -> &'a regex::Regex {
         if self.relaxed {
@@ -221,16 +455,43 @@ impl<'s> Finder<'s> {
     /// statements are ordered, and the best one is chosen, the same way as when matching a log
     /// line, so the answer agrees with `LogMatcher::match_log_statement()`.
     fn candidates(&self, text: &str, top: bool) -> Vec<StatementRef<'s>> {
+        let key = self.memo.borrow().key(text);
+        if let Some(found) = key.and_then(|key| {
+            self.memo.borrow().candidates[top as usize]
+                .get(&key)
+                .cloned()
+        }) {
+            return found;
+        }
+        let retval = self.find_candidates(text, top);
+        if let Some(key) = key {
+            self.memo.borrow_mut().candidates[top as usize].insert(key, retval.clone());
+        }
+        retval
+    }
+
+    /// Check if the statement can be used for the whole text, with `top`, or for a part of it.
+    /// The message itself could have come from anywhere, so all categories are used, unless
+    /// only logging calls are wanted.  A value of a placeholder is a message that was made
+    /// somewhere else, so only the errors and formatted messages are used for those.
+    fn usable(&self, stmt: &Statement, top: bool) -> bool {
+        if top {
+            !self.top_log_only || stmt.category == MessageCategory::Log
+        } else {
+            matches!(
+                stmt.category,
+                MessageCategory::Error | MessageCategory::Format
+            )
+        }
+    }
+
+    /// [`Self::candidates`], without the memo.
+    fn find_candidates(&self, text: &str, top: bool) -> Vec<StatementRef<'s>> {
         let mut retval: Vec<StatementRef<'s>> = self
             .statements
             .iter()
             .copied()
-            .filter(|stmt| {
-                top || matches!(
-                    stmt.category,
-                    MessageCategory::Error | MessageCategory::Format
-                )
-            })
+            .filter(|stmt| self.usable(stmt, top))
             .filter(|stmt| self.pattern(stmt).is_match(text))
             .collect();
         retval.sort_by(|lhs, rhs| compare_candidates(lhs, rhs, None, None));
@@ -270,6 +531,30 @@ impl<'s> Finder<'s> {
         if depth > MAX_DEPTH || text.len() < MIN_VALUE_LEN {
             return (0, vec![]);
         }
+        let key = self
+            .memo
+            .borrow()
+            .key(text)
+            .map(|(offset, len)| (offset, len, depth));
+        if let Some(found) =
+            key.and_then(|key| self.memo.borrow().resolved[top as usize].get(&key).cloned())
+        {
+            return found;
+        }
+        let retval = self.find_resolution(text, depth, top);
+        if let Some(key) = key {
+            self.memo.borrow_mut().resolved[top as usize].insert(key, retval.clone());
+        }
+        retval
+    }
+
+    /// [`Self::resolve`], without the memo.
+    fn find_resolution(
+        &self,
+        text: &str,
+        depth: usize,
+        top: bool,
+    ) -> (usize, Vec<MessageSource<'s>>) {
         let mut best = match self.source(text, depth, top) {
             Some((score, source)) => (score, vec![source]),
             None => (0, vec![]),

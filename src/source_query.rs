@@ -11,6 +11,7 @@ use crate::value_kind::{self, ValueKind};
 use crate::wrappers::MacroWrapper;
 use crate::{CodeSource, SourceLanguage};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 pub struct SourceQuery<'a> {
@@ -22,6 +23,65 @@ pub struct SourceQuery<'a> {
 
 /// An argument for a placeholder and the kind of value its expression produces.
 pub(crate) type Arg = (FormatArgument, ValueKind);
+
+/// A piece of a Java message that is a concatenation, like the `LOAD_BALANCING_PREFIX`, `": "`,
+/// and `node.toString()` in `LOAD_BALANCING_PREFIX + ": " + node.toString()`.  These are kept
+/// for a statement with a piece that could be a constant, so the statement can be rebuilt with
+/// the constant's value once the constants in the whole tree are known, see
+/// `SourceTree::resolve_message_refs()`.  Until then, every expression is a placeholder.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) enum ConcatPart {
+    /// The contents of a string-literal, still in source form, like a constant's value.
+    Literal(String),
+    Expr {
+        /// The expression as written in the source.
+        text: String,
+        kind: ValueKind,
+        /// The fully-qualified names of the constant the expression could refer to, in the
+        /// order Java checks them, if it is a name or a field access.  Filled in by
+        /// `extract_logging_guarded()`, which knows the file's imports and classes.
+        candidates: Vec<String>,
+        /// Where the expression starts in the file, if it could be a constant, for finding the
+        /// candidates.
+        #[serde(skip)]
+        constant_at: Option<usize>,
+    },
+}
+
+/// Check if a Java name, like `PREFIX` or `Messages.PREFIX`, is named like a constant, which
+/// is all capitals, digits, and underscores.
+fn is_constant_name(name: &str) -> bool {
+    let last = name.rsplit('.').next().unwrap_or(name).trim();
+    last.starts_with(|c: char| c.is_ascii_uppercase())
+        && last
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The format string and arguments for a concatenation: each literal is added as is, with its
+/// own placeholders, and each expression is a placeholder for its value.
+pub(crate) fn concat_parts_pattern(
+    language: SourceLanguage,
+    parts: &[ConcatPart],
+) -> (String, Vec<Arg>) {
+    let mut pattern = String::new();
+    let mut args = Vec::new();
+    for part in parts {
+        match part {
+            ConcatPart::Literal(text) => {
+                for cap in language.get_placeholder_regex().captures_iter(text) {
+                    args.push((language.captures_to_format_arg(&cap), ValueKind::Any));
+                }
+                pattern.push_str(text);
+            }
+            ConcatPart::Expr { text, kind, .. } => {
+                pattern.push_str("{}");
+                args.push((FormatArgument::Named(text.clone()), *kind));
+            }
+        }
+    }
+    (pattern, args)
+}
 
 pub(crate) struct QueryResult {
     pub kind: String,
@@ -46,6 +106,9 @@ pub(crate) struct QueryResult {
     /// For a C or C++ message, the position of the argument that holds it in the call, like 1
     /// for the `"Product"` in `show_string(udev, "Product", udev->product)`.
     pub arg_position: Option<usize>,
+    /// For a Java message that is a concatenation with a piece that could be a constant, the
+    /// pieces, see [`ConcatPart`].  Empty otherwise.
+    pub concat_parts: Vec<ConcatPart>,
 }
 
 impl QueryResult {
@@ -380,6 +443,7 @@ impl<'a> SourceQuery<'a> {
                 let mut child = capture.node;
                 let mut concat_pattern = None;
                 let mut concat_args = vec![];
+                let mut concat_parts = vec![];
                 // Computed on demand since only some captures need them.
                 let mut leading_args: Option<Vec<String>> = None;
                 let mut kind = child.kind();
@@ -563,6 +627,7 @@ impl<'a> SourceQuery<'a> {
                                 Some((pattern, args)) => {
                                     concat_pattern = Some(pattern);
                                     concat_args = args;
+                                    concat_parts = self.constant_concat_parts(child);
                                 }
                                 None => break,
                             }
@@ -577,6 +642,9 @@ impl<'a> SourceQuery<'a> {
                             {
                                 break;
                             }
+                            // The constants would have to be resolved before the conversions
+                            // are found, which is not done.
+                            concat_parts.clear();
                             let Some(text) = concat_pattern
                                 .take()
                                 .map(Cow::Owned)
@@ -644,6 +712,7 @@ impl<'a> SourceQuery<'a> {
                             .take()
                             .unwrap_or_else(|| self.leading_args(outer)),
                         arg_position: self.arg_position(outer),
+                        concat_parts: std::mem::take(&mut concat_parts),
                     });
                     if let Some(anchor) = args_anchor {
                         child = anchor;
@@ -709,6 +778,7 @@ impl<'a> SourceQuery<'a> {
                                         call_name: None,
                                         leading_args: vec![],
                                         arg_position: None,
+                                        concat_parts: vec![],
                                     });
                                 }
                             }
@@ -1448,29 +1518,55 @@ impl<'a> SourceQuery<'a> {
         {
             return None;
         }
-        let mut pattern = String::new();
-        let mut args = Vec::new();
-        for piece in pieces {
-            match piece {
-                ConcatPiece::Literal(text) => {
-                    let language = self.source_language;
-                    for cap in language.get_placeholder_regex().captures_iter(&text) {
-                        args.push((language.captures_to_format_arg(&cap), ValueKind::Any));
-                    }
-                    pattern.push_str(&text);
-                }
-                ConcatPiece::Expr(expr) => {
-                    pattern.push_str("{}");
-                    args.push((
-                        FormatArgument::Named(
-                            self.source[expr.start_byte()..expr.end_byte()].to_string(),
-                        ),
-                        self.value_kind(expr),
-                    ));
-                }
-            }
+        let parts = self.concat_parts(pieces);
+        Some(concat_parts_pattern(self.source_language, &parts))
+    }
+
+    /// The pieces of a concatenation, see [`ConcatPart`].
+    fn concat_parts(&self, pieces: Vec<ConcatPiece>) -> Vec<ConcatPart> {
+        pieces
+            .into_iter()
+            .map(|piece| match piece {
+                ConcatPiece::Literal(text) => ConcatPart::Literal(text.into_owned()),
+                ConcatPiece::Expr(expr) => ConcatPart::Expr {
+                    text: self.source[expr.byte_range()].to_string(),
+                    kind: self.value_kind(expr),
+                    candidates: vec![],
+                    // A name, like `PREFIX`, or a field, like `Messages.PREFIX`, but not a call,
+                    // like `node.toString()`, that is named like a constant, so the locals and
+                    // parameters, which are most of the names, are left as they are.
+                    constant_at: (matches!(expr.kind(), "identifier" | "field_access")
+                        && is_constant_name(&self.source[expr.byte_range()]))
+                    .then(|| expr.start_byte()),
+                },
+            })
+            .collect()
+    }
+
+    /// The pieces of a Java concatenation that is a message, if any of them could be a constant,
+    /// see [`ConcatPart`], or else nothing.
+    fn constant_concat_parts(&self, node: Node<'a>) -> Vec<ConcatPart> {
+        if self.source_language != SourceLanguage::Java {
+            return vec![];
         }
-        Some((pattern, args))
+        let mut pieces = Vec::new();
+        if !self.flatten_concat(node, &mut pieces) {
+            return vec![];
+        }
+        let parts = self.concat_parts(pieces);
+        if parts.iter().any(|part| {
+            matches!(
+                part,
+                ConcatPart::Expr {
+                    constant_at: Some(_),
+                    ..
+                }
+            )
+        }) {
+            parts
+        } else {
+            vec![]
+        }
     }
 
     /// Split a tree of `+` expressions into its pieces.  Returns true if any piece is a
@@ -1747,6 +1843,24 @@ impl<'a> SourceQuery<'a> {
                 }
             }
             _ => {}
+        }
+        // A level macro in front of a C string, like `printk(KERN_INFO "...")` or
+        // `syslog_like(LOG_ERR "...")`, is a level argument too.
+        if node.kind() == "concatenated_string" {
+            if let Some(first) = node
+                .named_child(0)
+                .filter(|first| first.kind() == "identifier")
+            {
+                let name = &self.source[first.byte_range()];
+                let is_level_macro = ["KERN_", "LOG_"].iter().any(|prefix| {
+                    name.strip_prefix(prefix).is_some_and(|level| {
+                        !level.is_empty() && level.chars().all(|c| c.is_ascii_uppercase())
+                    })
+                });
+                if is_level_macro {
+                    args.push(name.to_string());
+                }
+            }
         }
         args
     }

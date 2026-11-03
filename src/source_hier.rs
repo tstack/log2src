@@ -82,7 +82,7 @@ enum ShallowCheckResult {
 }
 
 /// A unique identifier for a file that can be used instead of retaining the full path.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, Hash, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct SourceFileID(usize);
 
 /// A summary of a source code file

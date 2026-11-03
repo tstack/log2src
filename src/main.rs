@@ -105,6 +105,12 @@ struct MatchArgs {
     /// Do not extract the values of variables from the messages
     #[arg(long)]
     no_vars: bool,
+
+    /// When no logging call matches a message, look for other statements that could have
+    /// produced it, like a `println!()` or the message of an exception that was logged.  This is
+    /// slower, since there are a lot of those statements.
+    #[arg(long)]
+    fallback: bool,
 }
 
 #[derive(Args)]
@@ -200,7 +206,6 @@ impl MessageAccumulator {
                 src_ref: None,
                 prefix: None,
                 variables: vec![],
-                exception_trace: vec![],
             })
     }
 
@@ -543,6 +548,7 @@ fn run_match(cli: &Cli, args: &MatchArgs) -> miette::Result<()> {
     let count = args.count.unwrap_or(usize::MAX);
     let match_options = LogMatchOptions {
         extract_variables: !args.no_vars,
+        fallback: args.fallback,
     };
     let mut accumulator = MessageAccumulator::new(log_matcher, log_format, match_options, count);
 
@@ -573,7 +579,11 @@ fn run_match(cli: &Cli, args: &MatchArgs) -> miette::Result<()> {
         }
     }
 
-    accumulator.eof()
+    let retval = accumulator.eof();
+    if cli.verbose {
+        eprintln!("{}", log2src::take_match_stats());
+    }
+    retval
 }
 
 fn run_statements(cli: &Cli, args: &StatementsArgs) -> miette::Result<()> {

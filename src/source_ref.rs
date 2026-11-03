@@ -1,5 +1,6 @@
 use crate::java_symbols::MessageRef;
 use crate::value_kind::{self, SplitOrder, ValueKind, ANY_CAPTURE};
+use crate::source_query::{concat_parts_pattern, ConcatPart};
 use crate::{pointer_extension, CodeSource, QueryResult, SourceLanguage};
 use core::fmt;
 use regex::{Captures, Regex};
@@ -89,7 +90,13 @@ impl LogLevel {
     /// `spdlog::level::warn`, to a level.  Unlike [`LogLevel::from_name`], the argument has to
     /// be qualified by something logging related, so that a variable like `err` is ignored.
     pub fn from_level_arg(arg: &str) -> Option<LogLevel> {
-        Self::classify(arg, true)
+        Self::from_kernel_level(arg).or_else(|| Self::classify(arg, true))
+    }
+
+    /// Map a Linux kernel level, like `KERN_ERR` or `KERN_NOTICE`, to a level.  `KERN_CONT`
+    /// and `KERN_DEFAULT` are not levels.
+    fn from_kernel_level(arg: &str) -> Option<LogLevel> {
+        Self::from_word(&arg.strip_prefix("KERN_")?.to_ascii_lowercase())
     }
 
     /// Map the level text from a log message, like `WARN` or `error`, to a level.
@@ -251,16 +258,6 @@ fn split_words(ident: &str) -> Vec<String> {
         words.push(word);
     }
     words
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct CallSite {
-    pub name: String,
-    #[serde(rename(serialize = "sourcePath"))]
-    pub source_path: String,
-    pub language: SourceLanguage,
-    #[serde(rename(serialize = "lineNumber"))]
-    pub line_no: usize,
 }
 
 /// What a placeholder in a format string is replaced with at runtime.
@@ -686,6 +683,14 @@ pub struct Statement {
     /// None if `pattern` already matches the same text, see `relaxed_pattern()`.
     #[serde(skip)]
     relaxed_pattern: OnceLock<Option<Regex>>,
+    /// The literal text before the first placeholder, see `leading_literal()`.
+    #[serde(skip)]
+    leading_literal: OnceLock<Option<String>>,
+    /// For a Java message that is a concatenation with a piece that could be a constant, the
+    /// pieces, which `extract_logging_guarded()` moves out to resolve the constants later, see
+    /// [`ConcatPart`].
+    #[serde(skip)]
+    pub(crate) concat: Vec<ConcatPart>,
 }
 
 struct MessageMatcher {
@@ -770,12 +775,15 @@ impl Statement {
                 non_empty_matcher: OnceLock::new(),
                 choice_matchers: OnceLock::new(),
                 relaxed_pattern: OnceLock::new(),
+                leading_literal: OnceLock::new(),
+                concat: result.concat_parts,
             };
             if quality == 0 {
                 // A message without literal text matches anything, so it is only kept if it
                 // continues a line that an earlier statement started, like `pr_cont(" %s", x)`
-                // or `pr_cont("\n")`, see `is_bare_continuation()`.
-                if !src_ref.is_continuation() {
+                // or `pr_cont("\n")`, see `is_bare_continuation()`, or if it has a constant
+                // that could have the text, like `PREFIX + name`.
+                if !src_ref.is_continuation() && src_ref.concat.is_empty() {
                     return None;
                 }
                 if src_ref.ends_line() {
@@ -841,6 +849,8 @@ impl Statement {
             non_empty_matcher: OnceLock::new(),
             choice_matchers: OnceLock::new(),
             relaxed_pattern: OnceLock::new(),
+            leading_literal: OnceLock::new(),
+            concat: vec![],
         })
     }
 
@@ -924,6 +934,121 @@ impl Statement {
             non_empty_matcher: OnceLock::new(),
             choice_matchers: OnceLock::new(),
             relaxed_pattern: OnceLock::new(),
+            leading_literal: OnceLock::new(),
+            concat: vec![],
+        }
+    }
+
+    /// This statement, which is a Java concatenation, with the values of the constants among
+    /// `parts` that are in `constants`, by their fully-qualified names, in place of their
+    /// placeholders, see [`ConcatPart`].  The statement is returned as is if none of them are
+    /// known, or None if it then has no literal text.
+    pub(crate) fn with_constants(
+        &self,
+        parts: &[ConcatPart],
+        constants: &std::collections::HashMap<String, String>,
+        language: SourceLanguage,
+    ) -> Option<Statement> {
+        let mut resolved = false;
+        let parts: Vec<ConcatPart> = parts
+            .iter()
+            .map(|part| match part {
+                ConcatPart::Expr { candidates, .. } => {
+                    match candidates.iter().find_map(|fqn| constants.get(fqn)) {
+                        Some(value) => {
+                            resolved = true;
+                            ConcatPart::Literal(value.clone())
+                        }
+                        None => part.clone(),
+                    }
+                }
+                ConcatPart::Literal(_) => part.clone(),
+            })
+            .collect();
+        if !resolved {
+            return (self.quality > 0).then(|| Statement {
+                vars: self.vars.clone(),
+                var_kinds: self.var_kinds.clone(),
+                arg_position: self.arg_position,
+                ..self.derived()
+            });
+        }
+        let (message, args) = concat_parts_pattern(language, &parts);
+        let MessageMatcher {
+            matcher: _,
+            args: matcher_args,
+            quality,
+            kinds,
+            segments,
+            plain: _,
+        } = build_matcher(false, &message, language)?;
+        let (args, arg_kinds): (Vec<FormatArgument>, Vec<ValueKind>) = if args.is_empty() {
+            let count = matcher_args.len();
+            (matcher_args, vec![ValueKind::Any; count])
+        } else {
+            args.into_iter().unzip()
+        };
+        let mut stmt = Statement {
+            quality,
+            args,
+            arg_kinds,
+            kinds,
+            segments,
+            choices: vec![],
+            vars: self.vars.clone(),
+            var_kinds: self.var_kinds.clone(),
+            arg_position: self.arg_position,
+            ..self.derived()
+        };
+        stmt.carry_choices(self);
+        Some(stmt)
+    }
+
+    /// Give this statement, which was rebuilt from `prior` with different placeholders, the
+    /// choices that `prior` had for the arguments that are still printed.  The choices come
+    /// from the expressions in `vars`, which are the same, so a placeholder for the same
+    /// expression gets the same choices.
+    fn carry_choices(&mut self, prior: &Statement) {
+        if prior.choices.iter().all(Vec::is_empty) {
+            return;
+        }
+        let var_of = |args: &[FormatArgument]| -> Vec<Option<usize>> {
+            let mut placeholder_index = 0;
+            args.iter()
+                .map(|arg| match arg {
+                    FormatArgument::Named(_) => None,
+                    FormatArgument::Positional(pos) => Some(*pos),
+                    FormatArgument::Placeholder => {
+                        placeholder_index += 1;
+                        Some(placeholder_index - 1)
+                    }
+                })
+                .collect()
+        };
+        let mut by_var = std::collections::HashMap::new();
+        for (var, choices) in var_of(&prior.args).into_iter().zip(&prior.choices) {
+            if let Some(var) = var {
+                by_var.entry(var).or_insert(choices);
+            }
+        }
+        let choices: Vec<Vec<String>> = var_of(&self.args)
+            .into_iter()
+            .map(|var| {
+                var.and_then(|var| by_var.get(&var))
+                    .map(|choices| (*choices).clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        if choices.iter().all(Vec::is_empty) {
+            return;
+        }
+        self.quality += choices
+            .iter()
+            .filter_map(|choices| choices.iter().map(|c| literal_quality(c)).min())
+            .sum::<usize>();
+        self.choices = choices;
+        if !is_valid_pattern(&self.pattern_source()) {
+            self.choices.clear();
         }
     }
 
@@ -1217,6 +1342,33 @@ impl Statement {
             })
             .as_ref()
             .unwrap_or_else(|| self.pattern())
+    }
+
+    /// The literal text that the message starts with, before its first placeholder or anything
+    /// else that is not literal text, for finding where the statement's text could start in a
+    /// message that has a prefix that is not from any statement, like the device name that the
+    /// Linux kernel's `dev_info()` adds.  None if the message starts with a placeholder, since
+    /// that matches from the start of any text anyway.  It is found the first time it is needed.
+    pub(crate) fn leading_literal(&self) -> Option<&str> {
+        use regex_syntax::hir::HirKind;
+        self.leading_literal
+            .get_or_init(|| {
+                let segment = self
+                    .segments
+                    .first()
+                    .filter(|segment| !segment.is_empty())?;
+                let hir = regex_syntax::parse(segment).ok()?;
+                // The text can be followed by more, like the `\s*` for the newline at the end.
+                let first = match hir.kind() {
+                    HirKind::Concat(parts) => parts.first()?,
+                    _ => &hir,
+                };
+                match first.kind() {
+                    HirKind::Literal(literal) => String::from_utf8(literal.0.to_vec()).ok(),
+                    _ => None,
+                }
+            })
+            .as_deref()
     }
 
     /// The source of `pattern()`, which does not need to compile it.  It is borrowed from the
@@ -1973,6 +2125,14 @@ mod tests {
             ("LL_VERBOSE", Some(LogLevel::Debug)),
             ("SYSLOG_LEVEL_VERBOSE", Some(LogLevel::Debug)),
             ("NGX_LOG_ERR", Some(LogLevel::Error)),
+            ("KERN_ERR", Some(LogLevel::Error)),
+            ("KERN_NOTICE", Some(LogLevel::Info)),
+            ("KERN_WARNING", Some(LogLevel::Warn)),
+            ("KERN_EMERG", Some(LogLevel::Fatal)),
+            ("KERN_DEBUG", Some(LogLevel::Debug)),
+            ("KERN_CONT", None),
+            ("KERN_DEFAULT", None),
+            ("kern", None),
         ];
         for (name, expected) in cases {
             assert_eq!(LogLevel::from_level_arg(name), expected, "{name}");

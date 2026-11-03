@@ -1,5 +1,5 @@
 use crate::source_hier::SourceFileID;
-use crate::StatementsInFile;
+use crate::{Statement, StatementsInFile};
 use aho_corasick::{AhoCorasick, MatchKind};
 use rayon::prelude::*;
 use regex_syntax::hir::{Hir, HirKind};
@@ -27,10 +27,26 @@ pub(crate) struct Prefilter {
     by_byte: Vec<Vec<StatementID>>,
     /// Statements that did not have a usable literal and must always be checked.
     always: Vec<StatementID>,
+    /// The position of each file in the order of their paths, so candidates can be ordered by
+    /// their location without comparing the paths.
+    ranks: HashMap<SourceFileID, u32>,
 }
 
 impl Prefilter {
-    pub(crate) fn new<'a>(files: impl Iterator<Item = &'a StatementsInFile>) -> Self {
+    /// Index the statements in `files` that `keep` accepts.  A statement's index is still its
+    /// position in `matchable_statements()`, so a [`StatementID`] is the same in every
+    /// prefilter.
+    pub(crate) fn new<'a>(
+        files: impl Iterator<Item = &'a StatementsInFile>,
+        keep: impl Fn(&Statement) -> bool,
+    ) -> Self {
+        let mut files: Vec<&StatementsInFile> = files.collect();
+        files.sort_unstable_by(|lhs, rhs| lhs.path.cmp(&rhs.path));
+        let ranks = files
+            .iter()
+            .zip(0..)
+            .map(|(sif, rank)| (sif.id, rank))
+            .collect();
         let mut literal_ids: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut literals: Vec<Vec<u8>> = Vec::new();
         let mut by_literal: Vec<Vec<StatementID>> = Vec::new();
@@ -39,9 +55,11 @@ impl Prefilter {
 
         // Parsing the patterns is most of the work for a big tree, so it is done in parallel.
         let keyed: Vec<(StatementID, Option<Vec<u8>>)> = files
+            .iter()
             .flat_map(|sif| {
                 sif.matchable_statements()
                     .enumerate()
+                    .filter(|(_, stmt)| keep(stmt))
                     .map(move |(index, stmt)| ((sif.id, index), stmt))
             })
             .collect::<Vec<_>>()
@@ -72,7 +90,14 @@ impl Prefilter {
             by_literal,
             by_byte,
             always,
+            ranks,
         }
+    }
+
+    /// The position of a file in the order of the paths of the files, which is the same as
+    /// comparing the paths.
+    pub(crate) fn rank(&self, file_id: SourceFileID) -> u32 {
+        self.ranks.get(&file_id).copied().unwrap_or(u32::MAX)
     }
 
     /// Call `f` with each statement that might match the given text.
