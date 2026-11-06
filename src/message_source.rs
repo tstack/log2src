@@ -4,9 +4,10 @@
 //! Text that is built up in pieces, like SQL that is appended to a `StringBuilder`, is explained
 //! by the statements that added each piece.
 
-use crate::source_ref::regex_literal_pieces;
+use crate::source_ref::{regex_literal_pieces, Quality};
 use crate::{
-    compare_candidates, first_match, MessageCategory, Statement, StatementRef, MIN_FALLBACK_QUALITY,
+    compare_candidates, find_variables, first_match, has_fallback_quality, MessageCategory,
+    Statement, StatementRef, VariablePair,
 };
 use serde::Serialize;
 use std::cell::RefCell;
@@ -24,6 +25,11 @@ pub struct MessageSource<'s> {
     /// `"Unable to read file: {}"`.  Values that are too short to look up are left out.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub causes: Vec<MessageSource<'s>>,
+    /// The values of the best candidate's placeholders in the text, with the expressions that
+    /// produced them, like the `variables` of a log message that was matched.  Filled in by
+    /// [`find_message_sources`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub variables: Vec<VariablePair>,
     /// The candidates only share some literal text with the text, since none match all of it,
     /// like for a fragment of a message that was copied from a GUI.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -82,13 +88,88 @@ pub fn find_message_sources<'s>(
     statements: impl IntoIterator<Item = StatementRef<'s>>,
     message: &str,
 ) -> Vec<MessageSource<'s>> {
+    let (usable, rest): (Vec<_>, Vec<_>) = statements
+        .into_iter()
+        .partition(|stmt| has_fallback_quality(stmt));
+    let glyphs: Vec<StatementRef<'s>> = rest
+        .into_iter()
+        .filter(|stmt| glyph_text(stmt).is_some())
+        .collect();
+    let mut sources = resolve_message(usable, message);
+    explain_glyphs(&mut sources, &glyphs);
+    add_variables(&mut sources);
+    sources
+}
+
+/// Fill in the [`MessageSource::variables`] of the sources and their causes from the best
+/// candidate of each.  A fragment of a statement does not have all of its placeholders, so it
+/// has none.
+fn add_variables(sources: &mut [MessageSource]) {
+    for source in sources.iter_mut() {
+        add_variables(&mut source.causes);
+        if source.partial {
+            continue;
+        }
+        if let Some(best) = source.candidates.first() {
+            source.variables = find_variables(&source.text, best);
+        }
+    }
+}
+
+/// The most characters in a glyph, like an icon or an emoji, which can be several characters,
+/// like a flag or an emoji with a skin tone.
+const MAX_GLYPH_CHARS: usize = 8;
+
+/// Check if some text is a glyph, like the `✘` or `⚠` that a program shows in front of a
+/// message, which is not a letter, a digit, whitespace, or ASCII punctuation.
+fn is_glyph(text: &str) -> bool {
+    let count = text.chars().count();
+    (1..=MAX_GLYPH_CHARS).contains(&count)
+        && !text.is_ascii()
+        && text
+            .chars()
+            .all(|c| !c.is_alphanumeric() && !c.is_whitespace())
+}
+
+/// The glyph that is all of the text of a statement, like the `U'\u2718'` that a program
+/// returns as the icon for an error, or the `"\u2718"_error` that it appends to a line.
+fn glyph_text(stmt: &Statement) -> Option<String> {
+    let [segment] = stmt.segments.as_slice() else {
+        return None;
+    };
+    let text = regex_literal_pieces(segment).concat();
+    let text = text.trim();
+    is_glyph(text).then(|| text.to_string())
+}
+
+/// Find the statements for the glyphs that no statement explained, like the `✘` that is
+/// put in front of an error, since there is too little text in those for the statements to
+/// be used by the [`Finder`].  The glyph is often not part of the message, like an icon that
+/// a program draws in place of a space, so the statements that have it are the best that can
+/// be found.
+fn explain_glyphs<'s>(sources: &mut [MessageSource<'s>], glyphs: &[StatementRef<'s>]) {
+    for source in sources.iter_mut() {
+        explain_glyphs(&mut source.causes, glyphs);
+        if !source.candidates.is_empty() || !is_glyph(&source.text) {
+            continue;
+        }
+        let mut candidates: Vec<StatementRef<'s>> = glyphs
+            .iter()
+            .filter(|stmt| glyph_text(stmt).as_deref() == Some(source.text.as_str()))
+            .copied()
+            .collect();
+        candidates.sort_by(|lhs, rhs| compare_candidates(lhs, rhs, None, None));
+        source.candidates = candidates;
+    }
+}
+
+/// [`find_message_sources`] with the statements that have enough literal text to be used.
+fn resolve_message<'s>(statements: Vec<StatementRef<'s>>, message: &str) -> Vec<MessageSource<'s>> {
     let finder = Finder {
-        statements: statements
-            .into_iter()
-            .filter(|stmt| stmt.quality >= MIN_FALLBACK_QUALITY)
-            .collect(),
+        statements,
         relaxed: false,
         top_log_only: false,
+        fragment_values: true,
         memo: RefCell::default(),
     };
     let message = message.trim();
@@ -101,6 +182,7 @@ pub fn find_message_sources<'s>(
         statements: finder.statements.clone(),
         relaxed: true,
         top_log_only: false,
+        fragment_values: true,
         memo: RefCell::default(),
     };
     let loose = relaxed.prefixed_resolve(&collapsed);
@@ -110,7 +192,7 @@ pub fn find_message_sources<'s>(
     // A text that was built up in pieces, like SQL, can be explained by a generic statement,
     // like `"SELECT " + x`, but the pieces explain a lot more of it.
     let assembled = finder.assemble(&collapsed);
-    if best.0 > 0 {
+    if !best.0.is_zero() {
         return match assembled {
             Some((score, sources)) if score > best.0 => sources,
             _ => best.1,
@@ -152,10 +234,11 @@ pub(crate) fn best_log_source<'s>(
     let finder = Finder {
         statements: statements
             .into_iter()
-            .filter(|stmt| stmt.quality >= MIN_FALLBACK_QUALITY)
+            .filter(|stmt| has_fallback_quality(stmt))
             .collect(),
         relaxed: false,
         top_log_only: !fallback,
+        fragment_values: false,
         memo: RefCell::default(),
     };
     if finder.statements.is_empty() {
@@ -227,7 +310,7 @@ pub(crate) fn log_head(body: &str) -> &str {
 /// The statement that produced the most of a log message, from [`best_log_source`].
 pub(crate) struct LogSource<'s> {
     /// The amount of literal text explained by the reading of the message.
-    pub score: usize,
+    pub score: Quality,
     /// The statement.
     pub stmt: StatementRef<'s>,
     /// The part of the message that the statement produced.
@@ -295,7 +378,7 @@ impl<'s> Finder<'s> {
     /// compared by the amount of literal text they explain, so a generic statement that matches
     /// all of the message, like `"%s [%s]"`, does not hide a better one for the rest of it.  The
     /// whole message wins a tie, like a wrapper whose value is explained too.
-    fn prefixed_resolve(&self, message: &str) -> (usize, Vec<MessageSource<'s>>) {
+    fn prefixed_resolve(&self, message: &str) -> Resolution<'s> {
         self.memo.borrow_mut().reset(message);
         let mut best = self.resolve(message, 0, true);
         for (start, prefix_len) in self.prefix_splits(message) {
@@ -381,6 +464,12 @@ struct Finder<'s> {
     /// Only use logging calls for the whole text, not just for the parts of it, like when
     /// matching a log line without [`crate::LogMatchOptions::fallback`].
     top_log_only: bool,
+    /// Look for a statement that produced part of a value that no statement produced all of,
+    /// like the `" is already a named search"` that was appended to the quoted name in
+    /// `"error: “dup” is already a named search"`, see [`Finder::fragment`].  This looks at
+    /// every statement, so it is only done when finding the sources of one message, not for
+    /// every log message.
+    fragment_values: bool,
     /// The answers already worked out for this message.  The readings of a message overlap a
     /// lot: each `": "` is tried as the end of a prefix and as the end of the head of a chain,
     /// and the tails of those are tried again a level down, so the same text is looked up many
@@ -391,6 +480,10 @@ struct Finder<'s> {
 /// What [`Finder`] has already worked out for the message given to
 /// [`Finder::prefixed_resolve`].  The texts that are looked up are all slices of that message, so
 /// they are keyed by where they are in it ([`Memo::key`]), instead of copying and hashing them.
+/// The sources of some text and the amount of literal text they explain, from
+/// [`Finder::resolve`].
+type Resolution<'s> = (Quality, Vec<MessageSource<'s>>);
+
 /// Indexed by `top`, since that changes the statements that are used.
 #[derive(Default)]
 struct Memo<'s> {
@@ -400,7 +493,7 @@ struct Memo<'s> {
     candidates: [HashMap<(usize, usize), Vec<StatementRef<'s>>>; 2],
     /// [`Finder::resolve`], by depth too, since that limits how far down the values are looked
     /// up.
-    resolved: [HashMap<(usize, usize, usize), (usize, Vec<MessageSource<'s>>)>; 2],
+    resolved: [HashMap<(usize, usize, usize), Resolution<'s>>; 2],
 }
 
 impl Memo<'_> {
@@ -442,7 +535,9 @@ impl<'s> Finder<'s> {
 
     /// The regex for matching text to a statement.
     fn pattern<'a>(&self, stmt: &'a Statement) -> &'a regex::Regex {
-        if self.relaxed {
+        // The text is trimmed, so the relaxed pattern, whose leading whitespace is optional, is
+        // used for a statement that starts with some.
+        if self.relaxed || stmt.starts_with_whitespace() {
             stmt.relaxed_pattern()
         } else {
             stmt.pattern()
@@ -496,8 +591,13 @@ impl<'s> Finder<'s> {
             .collect();
         retval.sort_by(|lhs, rhs| compare_candidates(lhs, rhs, None, None));
         // `first_match()` uses the exact pattern, which a statement that only matches with the
-        // whitespace relaxed would fail, so the order is left as is.
-        if !self.relaxed {
+        // whitespace relaxed would fail, so the order is left as is.  That includes the best
+        // one when it starts with whitespace, which the trimmed text does not have.
+        if !self.relaxed
+            && !retval
+                .first()
+                .is_some_and(|stmt| stmt.starts_with_whitespace())
+        {
             let best = first_match(
                 retval.iter().copied().enumerate(),
                 text,
@@ -527,9 +627,9 @@ impl<'s> Finder<'s> {
     }
 
     /// Find the sources of `text` and the amount of literal text they explain.
-    fn resolve(&self, text: &str, depth: usize, top: bool) -> (usize, Vec<MessageSource<'s>>) {
+    fn resolve(&self, text: &str, depth: usize, top: bool) -> Resolution<'s> {
         if depth > MAX_DEPTH || text.len() < MIN_VALUE_LEN {
-            return (0, vec![]);
+            return (Quality::ZERO, vec![]);
         }
         let key = self
             .memo
@@ -549,15 +649,10 @@ impl<'s> Finder<'s> {
     }
 
     /// [`Self::resolve`], without the memo.
-    fn find_resolution(
-        &self,
-        text: &str,
-        depth: usize,
-        top: bool,
-    ) -> (usize, Vec<MessageSource<'s>>) {
+    fn find_resolution(&self, text: &str, depth: usize, top: bool) -> Resolution<'s> {
         let mut best = match self.source(text, depth, top) {
             Some((score, source)) => (score, vec![source]),
-            None => (0, vec![]),
+            None => (Quality::ZERO, vec![]),
         };
         // A chain of messages, like `"outer: inner: leaf"`, where each part was made separately.
         // A statement that matches all of the text wins a tie, like `"Unable to start: {:#}"`
@@ -582,7 +677,7 @@ impl<'s> Finder<'s> {
 
     /// The statements that match all of `text`, with the sources of the values of the best
     /// one's placeholders, and the amount of literal text they explain.
-    fn source(&self, text: &str, depth: usize, top: bool) -> Option<(usize, MessageSource<'s>)> {
+    fn source(&self, text: &str, depth: usize, top: bool) -> Option<(Quality, MessageSource<'s>)> {
         let candidates = self.candidates(text, top);
         let first = candidates.first()?;
         // A statement that only matched because a placeholder matches anything does not explain
@@ -590,7 +685,7 @@ impl<'s> Finder<'s> {
         let mut score = if self.fits(first, text) {
             first.quality
         } else {
-            0
+            Quality::ZERO
         };
         let mut causes = vec![];
         if let Some(captures) = self.pattern(first).captures(text) {
@@ -602,7 +697,17 @@ impl<'s> Finder<'s> {
                 let (value_score, value_sources) = self.resolve(value, depth + 1, false);
                 score += value_score;
                 if value_sources.is_empty() {
-                    causes.push(MessageSource::unknown(value));
+                    let fragment = self
+                        .fragment_values
+                        .then(|| self.fragment(&collapse_whitespace(value)))
+                        .flatten();
+                    // Only part of the value is explained, so the reading is not any better
+                    // for it, like one that assembles the same pieces.
+                    causes.push(match fragment {
+                        Some((_, fragment)) => fragment,
+                        None => MessageSource::unknown(value),
+                    });
+                    continue;
                 }
                 causes.extend(value_sources);
             }
@@ -611,6 +716,7 @@ impl<'s> Finder<'s> {
             text: text.to_string(),
             candidates,
             causes,
+            variables: vec![],
             partial: false,
         };
         Some((score, source))
@@ -626,15 +732,15 @@ impl<'s> Finder<'s> {
     /// else, like the values that were appended.  Returns the amount of literal text that is
     /// explained and the sources in the order of the text, or None if there are not at least
     /// two pieces.  The whitespace in `text` should already be collapsed.
-    fn assemble(&self, text: &str) -> Option<(usize, Vec<MessageSource<'s>>)> {
+    fn assemble(&self, text: &str) -> Option<Resolution<'s>> {
         let mut pieces = vec![];
         for stmt in &self.statements {
             let literals = literal_pieces(stmt);
-            let weight: usize = literals
+            let weight: Quality = literals
                 .iter()
-                .map(|(literal, _, _)| literal.chars().filter(|c| !c.is_whitespace()).count())
+                .map(|(literal, _, _)| Quality::of_text(literal))
                 .sum();
-            if weight < MIN_PIECE_LEN
+            if weight.total() < MIN_PIECE_LEN
                 || !literals
                     .iter()
                     .all(|(literal, _, _)| text.contains(literal.as_str()))
@@ -668,7 +774,9 @@ impl<'s> Finder<'s> {
             .1;
         let usable: Vec<&Piece> = pieces
             .iter()
-            .filter(|piece| function_of(&piece.stmt) == home || piece.weight >= MIN_FRAGMENT_LEN)
+            .filter(|piece| {
+                function_of(&piece.stmt) == home || piece.weight.total() >= MIN_FRAGMENT_LEN
+            })
             .collect();
         let (score, chosen) = best_cover(&usable, |piece| function_of(&piece.stmt) == home);
         if chosen.len() < 2 {
@@ -699,6 +807,7 @@ impl<'s> Finder<'s> {
                 text: text[piece.start..piece.end].to_string(),
                 candidates,
                 causes: vec![],
+                variables: vec![],
                 partial: false,
             });
             last_end = piece.end;
@@ -717,12 +826,12 @@ impl<'s> Finder<'s> {
     /// like `"a named search must have a name"` for the `" is already a named search"` at the
     /// end of a message, explains nothing more, so it is left out.  The ones that share the
     /// same amount are kept, since any of them could be the source.
-    fn fragment(&self, text: &str) -> Option<(usize, MessageSource<'s>)> {
+    fn fragment(&self, text: &str) -> Option<(Quality, MessageSource<'s>)> {
         let mut scored: Vec<(SharedLiteral, StatementRef<'s>)> = self
             .statements
             .iter()
             .map(|stmt| (shared_literal(stmt, text), *stmt))
-            .filter(|(shared, _)| shared.len >= MIN_FRAGMENT_LEN)
+            .filter(|(shared, _)| shared.len.total() >= MIN_FRAGMENT_LEN)
             .collect();
         scored.sort_by(|(lhs_shared, lhs), (rhs_shared, rhs)| {
             rhs_shared
@@ -764,6 +873,7 @@ impl<'s> Finder<'s> {
                 text: text.to_string(),
                 candidates,
                 causes: vec![],
+                variables: vec![],
                 partial: true,
             },
         ))
@@ -774,8 +884,8 @@ impl<'s> Finder<'s> {
 struct Piece<'s> {
     start: usize,
     end: usize,
-    /// The amount of literal text in the statement, not counting whitespace.
-    weight: usize,
+    /// The amount of literal text in the statement.
+    weight: Quality,
     stmt: StatementRef<'s>,
 }
 
@@ -846,16 +956,20 @@ fn piece_places(text: &str, literals: &[(String, bool, bool)]) -> Vec<(usize, us
 fn best_cover<'p, 's>(
     pieces: &[&'p Piece<'s>],
     preferred: impl Fn(&Piece<'s>) -> bool,
-) -> (usize, Vec<&'p Piece<'s>>) {
+) -> (Quality, Vec<&'p Piece<'s>>) {
     let mut sorted: Vec<&Piece> = pieces.to_vec();
     sorted.sort_by_key(|piece| (piece.end, piece.start));
     // best[i] is the best cover of the first `i` pieces, as (weight, preferred weight).
-    let mut best: Vec<(usize, usize)> = vec![(0, 0); sorted.len() + 1];
+    let mut best: Vec<(Quality, Quality)> = vec![(Quality::ZERO, Quality::ZERO); sorted.len() + 1];
     let mut taken = vec![false; sorted.len()];
     for (index, piece) in sorted.iter().enumerate() {
         // The pieces before this one that end before it starts.
         let before = sorted[..index].partition_point(|prev| prev.end <= piece.start);
-        let bonus = if preferred(piece) { piece.weight } else { 0 };
+        let bonus = if preferred(piece) {
+            piece.weight
+        } else {
+            Quality::ZERO
+        };
         let with = (best[before].0 + piece.weight, best[before].1 + bonus);
         if with > best[index] {
             best[index + 1] = with;
@@ -890,10 +1004,9 @@ pub(crate) fn collapse_whitespace(text: &str) -> String {
 /// in a literal part, or overlap the start or end of one, like `"read file: denied"` for
 /// `"Unable to read file: {}"`.
 fn shared_literal(stmt: &Statement, text: &str) -> SharedLiteral {
-    let non_ws = |s: &str| s.chars().filter(|c| !c.is_whitespace()).count();
-    let mut contained = 0;
+    let mut contained = Quality::ZERO;
     let mut contained_ranges = vec![];
-    let mut overlap = 0;
+    let mut overlap = Quality::ZERO;
     let mut overlap_range = 0..0;
     // The segments are regexes, so they are turned back into the literal text.
     for segment in stmt
@@ -906,7 +1019,7 @@ fn shared_literal(stmt: &Statement, text: &str) -> SharedLiteral {
             continue;
         }
         if let Some(pos) = text.find(&segment) {
-            contained += non_ws(&segment);
+            contained += Quality::of_text(&segment);
             contained_ranges.push(pos..pos + segment.len());
             continue;
         }
@@ -915,7 +1028,7 @@ fn shared_literal(stmt: &Statement, text: &str) -> SharedLiteral {
         } else {
             edge_overlap(&segment, text)
         };
-        let len = non_ws(&text[range.clone()]);
+        let len = Quality::of_text(&text[range.clone()]);
         if len > overlap {
             overlap = len;
             overlap_range = range;
@@ -936,8 +1049,8 @@ fn shared_literal(stmt: &Statement, text: &str) -> SharedLiteral {
 
 /// The literal text that a statement shares with some text, from [`shared_literal`].
 struct SharedLiteral {
-    /// The amount of shared text, not counting whitespace.
-    len: usize,
+    /// The amount of shared text.
+    len: Quality,
     /// Where the shared text is in the text.
     ranges: Vec<std::ops::Range<usize>>,
 }
@@ -965,6 +1078,7 @@ impl MessageSource<'_> {
             text: text.to_string(),
             candidates: vec![],
             causes: vec![],
+            variables: vec![],
             partial: false,
         }
     }

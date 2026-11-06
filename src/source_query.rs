@@ -109,6 +109,12 @@ pub(crate) struct QueryResult {
     /// For a Java message that is a concatenation with a piece that could be a constant, the
     /// pieces, see [`ConcatPart`].  Empty otherwise.
     pub concat_parts: Vec<ConcatPart>,
+    /// The statements after this one that add to the same text, with the name of the method
+    /// they call, see [`SourceQuery::append_chains`].
+    pub continuations: Vec<(TSRange, String)>,
+    /// The category of the statement, if it is known from where the message is used, instead
+    /// of from `call_name`, see `MessageCategory::classify()`.
+    pub category: Option<MessageCategory>,
 }
 
 impl QueryResult {
@@ -517,6 +523,20 @@ impl<'a> SourceQuery<'a> {
                     kind = "message_ref";
                 }
                 let mut raw = false;
+                // The string-literal in a C++ user-defined literal, like lnav's `"error"_error`,
+                // which is used for the range of the message, since the suffix is not part of
+                // the text.  The literal itself is the argument, so it is used for the rest.
+                let mut literal_node = None;
+                if kind == "user_defined_literal" {
+                    match Self::user_defined_string(child) {
+                        Some(inner) => {
+                            literal_node = Some(inner);
+                            kind = inner.kind();
+                        }
+                        // A number with a suffix, like `10_ms`.
+                        None => break,
+                    }
+                }
                 if self.source_language == SourceLanguage::Rust && kind == "token_tree" {
                     // The arguments of a `concat!` used as the format string.
                     match self.rust_concat_pattern(child) {
@@ -535,8 +555,9 @@ impl<'a> SourceQuery<'a> {
                         break;
                     }
                     // The contents of a raw string, like `R"(...)"`, are used as-is.
-                    let mut cursor = child.walk();
-                    let content = child
+                    let raw_node = literal_node.unwrap_or(child);
+                    let mut cursor = raw_node.walk();
+                    let content = raw_node
                         .named_children(&mut cursor)
                         .find(|piece| piece.kind() == "raw_string_content")
                         .map_or("", |piece| &self.source[piece.byte_range()]);
@@ -683,7 +704,7 @@ impl<'a> SourceQuery<'a> {
                     let (name, qualified_name) = self.names(anchor);
                     let block_id = self.block_id(anchor);
                     let qr_index = results.len();
-                    let mut range = child.range();
+                    let mut range = literal_node.unwrap_or(child).range();
                     if let Some(prefix) = Self::concat_error_prefix(child) {
                         range.start_byte = prefix.start_byte();
                         range.start_point = prefix.start_position();
@@ -713,6 +734,8 @@ impl<'a> SourceQuery<'a> {
                             .unwrap_or_else(|| self.leading_args(outer)),
                         arg_position: self.arg_position(outer),
                         concat_parts: std::mem::take(&mut concat_parts),
+                        continuations: vec![],
+                        category: None,
                     });
                     if let Some(anchor) = args_anchor {
                         child = anchor;
@@ -779,6 +802,8 @@ impl<'a> SourceQuery<'a> {
                                         leading_args: vec![],
                                         arg_position: None,
                                         concat_parts: vec![],
+                                        continuations: vec![],
+                                        category: None,
                                     });
                                 }
                             }
@@ -796,6 +821,403 @@ impl<'a> SourceQuery<'a> {
         });
 
         results
+    }
+
+    /// The text that C++ code builds with a chain of appends, like the
+    /// `"{} is already a named search"` from
+    /// `attr_line_t().append_quoted(name).append(" is already a named search")`.  The query
+    /// finds each string-literal in a chain on its own, which is all that is known for the
+    /// pieces that are only added sometimes, but a chain is always added all at once, so it is
+    /// a message of its own too.  An argument that is not a string-literal is a placeholder.
+    /// When the chain is called on a variable, the chains on the same variable that always run
+    /// after it add to the text too, like the `retval.append(msg)` after a `switch` that adds a
+    /// prefix in each `case`, see [`Self::following_appends`].  Only text that is made by more
+    /// than one append is returned, since the query already found the others.
+    pub(crate) fn append_chains(&self) -> Vec<QueryResult> {
+        if self.source_language != SourceLanguage::Cpp {
+            return vec![];
+        }
+        let mut chains = vec![];
+        Self::visit(self.tree.root_node(), &mut |node| {
+            if self.is_outermost_append(node) {
+                chains.push(node);
+            }
+        });
+        chains
+            .into_iter()
+            .filter_map(|chain| self.append_chain_result(chain))
+            .collect()
+    }
+
+    /// The character-literals that are glyphs, like the `U'\u2718'` that lnav returns as the
+    /// icon for an error, which is drawn in place of a space in front of the message.  Each is
+    /// a statement of its own, so that `find_message_sources()` can find where a glyph in a
+    /// message came from, even though it is not part of the text of any message.  A glyph is
+    /// not a letter, digit, whitespace, or ASCII, see `message_source::is_glyph()`.
+    pub(crate) fn glyph_literals(&self) -> Vec<QueryResult> {
+        let kind = match self.source_language {
+            SourceLanguage::C | SourceLanguage::Cpp | SourceLanguage::Rust => "char_literal",
+            SourceLanguage::Java | SourceLanguage::Kotlin => "character_literal",
+            SourceLanguage::Python => return vec![],
+        };
+        let mut retval = vec![];
+        Self::visit(self.tree.root_node(), &mut |node| {
+            if node.kind() != kind {
+                return;
+            }
+            let text = &self.source[node.byte_range()];
+            let (Some(open), Some(close)) = (text.find('\''), text.rfind('\'')) else {
+                return;
+            };
+            let Some(contents) = text.get(open + 1..close) else {
+                return;
+            };
+            let regex = crate::source_ref::literal_to_regex(false, self.source_language, contents);
+            let decoded = crate::source_ref::regex_literal_pieces(&regex).concat();
+            let mut chars = decoded.chars();
+            let is_glyph = match (chars.next(), chars.next()) {
+                (Some(c), None) => !c.is_ascii() && !c.is_alphanumeric() && !c.is_whitespace(),
+                _ => false,
+            };
+            if !is_glyph {
+                return;
+            }
+            let anchor = Self::statement_anchor(node);
+            let (name, qualified_name) = self.names(anchor);
+            retval.push(QueryResult {
+                kind: "string_literal".to_string(),
+                range: node.range(),
+                name,
+                qualified_name,
+                block_id: self.block_id(anchor),
+                // The decoded character, so the placeholders of the language are not a
+                // concern, since a glyph is not ASCII.
+                pattern: Some(decoded),
+                args: vec![],
+                raw: true,
+                value_kind: ValueKind::Any,
+                value_choices: vec![],
+                call_name: None,
+                leading_args: vec![],
+                arg_position: None,
+                concat_parts: vec![],
+                continuations: vec![],
+                category: Some(MessageCategory::Other),
+            });
+        });
+        retval
+    }
+
+    /// Call `f` for every node under `node`, and `node` itself, in order.
+    fn visit<'t>(node: Node<'t>, f: &mut impl FnMut(Node<'t>)) {
+        let mut cursor = node.walk();
+        loop {
+            f(cursor.node());
+            if cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                if cursor.node() == node {
+                    return;
+                }
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The receiver and the first argument of a C++ call to a method that appends text, like
+    /// `append()` or lnav's `append_quoted()`, or None if the node is not one.
+    fn append_link(&self, node: Node<'a>) -> Option<(Node<'a>, Option<Node<'a>>)> {
+        if node.kind() != "call_expression" {
+            return None;
+        }
+        let function = node
+            .child_by_field_name("function")
+            .filter(|function| function.kind() == "field_expression")?;
+        let field = function.child_by_field_name("field")?;
+        if !self.source[field.byte_range()].starts_with("append") {
+            return None;
+        }
+        let receiver = function.child_by_field_name("argument")?;
+        let mut cursor = node.walk();
+        let first_arg = node
+            .child_by_field_name("arguments")?
+            .named_children(&mut cursor)
+            .find(|arg| !arg.kind().contains("comment"));
+        Some((receiver, first_arg))
+    }
+
+    /// Check if a node is the last append of a chain, which is not the receiver of another one.
+    fn is_outermost_append(&self, node: Node<'a>) -> bool {
+        self.append_link(node).is_some()
+            && !node
+                .parent()
+                .filter(|parent| parent.kind() == "field_expression")
+                .and_then(|parent| parent.parent())
+                .and_then(|call| self.append_link(call))
+                .is_some_and(|(receiver, _)| receiver == node)
+    }
+
+    /// The first arguments of the appends in a chain, in the order they are called, and what
+    /// the first one is called on.
+    fn append_args(&self, chain: Node<'a>) -> (Vec<Option<Node<'a>>>, Node<'a>) {
+        let mut args = vec![];
+        let mut curr = chain;
+        while let Some((receiver, arg)) = self.append_link(curr) {
+            args.push(arg);
+            curr = receiver;
+        }
+        args.reverse();
+        (args, curr)
+    }
+
+    /// Add the text that the first argument of an append adds.  A string-literal, like `"text"`
+    /// or lnav's `"text"_error`, is literal text, and anything else is a placeholder.  The text
+    /// is not a format string, so anything that looks like a placeholder is escaped.
+    fn append_parts(&self, arg: Option<Node<'a>>, parts: &mut Vec<ConcatPart>) {
+        let Some(arg) = arg else {
+            return;
+        };
+        if arg.kind() != "raw_string_literal" {
+            if let Some(text) = self.string_contents(arg) {
+                let escaped = text
+                    .replace('%', "%%")
+                    .replace('{', "{{")
+                    .replace('}', "}}");
+                parts.push(ConcatPart::Literal(escaped));
+                return;
+            }
+        }
+        parts.push(ConcatPart::Expr {
+            text: self.source[arg.byte_range()].to_string(),
+            kind: self.value_kind(arg),
+            candidates: vec![],
+            constant_at: None,
+        });
+    }
+
+    /// The name of the last call of a chain of appends, like `retval.append().append`.
+    fn append_call_name(&self, chain: Node<'a>) -> String {
+        chain
+            .child_by_field_name("function")
+            .map(|function| {
+                self.special_call_name(function)
+                    .unwrap_or_else(|| self.source[function.byte_range()].to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    /// The message for a chain of appends found by [`Self::append_chains`], if it is made of
+    /// more than one append and has some literal text.
+    fn append_chain_result(&self, chain: Node<'a>) -> Option<QueryResult> {
+        if !Self::in_function_body(chain) {
+            return None;
+        }
+        let (args, root) = self.append_args(chain);
+        let mut appends = args.len();
+        let mut parts = vec![];
+        // The text of a builder that is made with some, like `attr_line_t("invalid ")`.
+        if root.kind() == "call_expression"
+            && root
+                .child_by_field_name("function")
+                .is_some_and(|function| function.kind() != "field_expression")
+        {
+            let mut cursor = root.walk();
+            let first = root
+                .child_by_field_name("arguments")
+                .and_then(|list| list.named_children(&mut cursor).next());
+            if first.is_some_and(|first| self.string_contents(first).is_some()) {
+                self.append_parts(first, &mut parts);
+                appends += 1;
+            }
+        }
+        for arg in args {
+            self.append_parts(arg, &mut parts);
+        }
+        let mut continuations = vec![];
+        let statement = chain
+            .parent()
+            .filter(|parent| parent.kind() == "expression_statement");
+        if let (Some(statement), "identifier") = (statement, root.kind()) {
+            let receiver = &self.source[root.byte_range()];
+            for next in self.following_appends(statement, receiver) {
+                let (next_args, _) = self.append_args(next);
+                appends += next_args.len();
+                for arg in next_args {
+                    self.append_parts(arg, &mut parts);
+                }
+                continuations.push((next.range(), self.append_call_name(next)));
+            }
+        }
+        if appends < 2
+            || !parts
+                .iter()
+                .any(|part| matches!(part, ConcatPart::Literal(_)))
+        {
+            return None;
+        }
+        let (pattern, args) = concat_parts_pattern(self.source_language, &parts);
+        let anchor = Self::statement_anchor(chain);
+        let (name, qualified_name) = self.names(anchor);
+        Some(QueryResult {
+            kind: "string_literal".to_string(),
+            range: chain.range(),
+            name,
+            qualified_name,
+            block_id: self.block_id(anchor),
+            pattern: Some(pattern),
+            args,
+            raw: false,
+            value_kind: ValueKind::Any,
+            value_choices: vec![],
+            call_name: Some(self.append_call_name(chain)),
+            leading_args: vec![],
+            arg_position: None,
+            concat_parts: vec![],
+            continuations,
+            category: self.message_call_category(chain),
+        })
+    }
+
+    /// The category of text that is passed to a call that makes an error or a message out of
+    /// it, like `user_message::error(...)` or `report_error(...)`, which is `Error`, since the
+    /// text is shown somewhere else, like the value of another message.
+    fn message_call_category(&self, node: Node<'a>) -> Option<MessageCategory> {
+        static MESSAGE_NAME: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(crate::C_MESSAGE_NAME).unwrap());
+        let mut curr = node;
+        let args = loop {
+            let parent = curr.parent()?;
+            match parent.kind() {
+                "argument_list" => break parent,
+                "parenthesized_expression" => curr = parent,
+                _ => return None,
+            }
+        };
+        let function = args.parent()?.child_by_field_name("function")?;
+        MESSAGE_NAME
+            .is_match(&self.source[function.byte_range()])
+            .then_some(MessageCategory::Error)
+    }
+
+    /// The chains of appends to `receiver` in the statements that always run after `stmt` and
+    /// before anything else could change it, in order.  The statements after the end of an `if`
+    /// or `switch` always run, whichever branch was taken, but the ones in a loop, a branch,
+    /// or after a `return` might not.  The walk ends at anything else that uses the receiver,
+    /// like a call of another of its methods or passing it to a function, but not at the use of
+    /// one of its fields, like lnav's `retval.al_attrs.emplace_back(...)`.
+    fn following_appends(&self, stmt: Node<'a>, receiver: &str) -> Vec<Node<'a>> {
+        let mut retval = vec![];
+        let mut curr = stmt;
+        while let Some(next) = Self::next_statement(curr) {
+            curr = next;
+            match next.kind() {
+                "break_statement" => {
+                    // The end of a `case`, so the statements after the `switch` are next.
+                    let mut up = next.parent();
+                    while let Some(node) = up {
+                        match node.kind() {
+                            "switch_statement" => break,
+                            "for_statement" | "for_range_loop" | "while_statement"
+                            | "do_statement" => return retval,
+                            _ => up = node.parent(),
+                        }
+                    }
+                    match up {
+                        Some(switch) => curr = switch,
+                        None => break,
+                    }
+                }
+                "return_statement" | "continue_statement" | "goto_statement"
+                | "throw_statement" => break,
+                _ => {
+                    let chain = next
+                        .named_child(0)
+                        .filter(|_| next.kind() == "expression_statement")
+                        .filter(|expr| self.is_outermost_append(*expr))
+                        .filter(|expr| {
+                            let (_, root) = self.append_args(*expr);
+                            root.kind() == "identifier"
+                                && &self.source[root.byte_range()] == receiver
+                        });
+                    match chain {
+                        Some(chain)
+                            if !self.uses_receiver(
+                                chain.child_by_field_name("arguments"),
+                                receiver,
+                            ) =>
+                        {
+                            retval.push(chain)
+                        }
+                        _ if self.uses_receiver(Some(next), receiver) => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        retval
+    }
+
+    /// The statement that runs after `node` when it does not jump, which is the next one in its
+    /// block, or the one after the `if`, `switch`, or block that the block ends, or None if
+    /// that is not known, like at the end of a loop, function, or a `case` that falls through.
+    fn next_statement(node: Node<'a>) -> Option<Node<'a>> {
+        let mut curr = node;
+        loop {
+            let parent = curr.parent()?;
+            match parent.kind() {
+                "compound_statement" | "case_statement" => {
+                    let mut next = curr.next_named_sibling();
+                    while let Some(sibling) = next.filter(|n| n.kind() == "comment") {
+                        next = sibling.next_named_sibling();
+                    }
+                    match next {
+                        // Falling into the next case.
+                        Some(next) if next.kind() == "case_statement" => return None,
+                        Some(next) => return Some(next),
+                        None if parent.kind() == "case_statement" => return None,
+                        None => curr = parent,
+                    }
+                }
+                // Leaving a branch, so the other branches are skipped.
+                "if_statement" | "else_clause" | "switch_statement" => curr = parent,
+                _ => return None,
+            }
+        }
+    }
+
+    /// Check if `node` uses the variable `receiver` in a way that could change its text, which
+    /// is anything but using one of its fields.
+    fn uses_receiver(&self, node: Option<Node<'a>>, receiver: &str) -> bool {
+        let Some(node) = node else {
+            return false;
+        };
+        let mut found = false;
+        Self::visit(node, &mut |ident| {
+            if found || ident.kind() != "identifier" || &self.source[ident.byte_range()] != receiver
+            {
+                return;
+            }
+            let field_access = ident
+                .parent()
+                .filter(|parent| parent.kind() == "field_expression")
+                .filter(|parent| parent.child_by_field_name("argument") == Some(ident))
+                .is_some_and(|parent| {
+                    !parent.parent().is_some_and(|call| {
+                        call.kind() == "call_expression"
+                            && call.child_by_field_name("function") == Some(parent)
+                    })
+                });
+            if !field_access {
+                found = true;
+            }
+        });
+        found
     }
 
     pub(crate) fn root_node(&self) -> Node<'_> {
@@ -1619,6 +2041,9 @@ impl<'a> SourceQuery<'a> {
     fn string_contents(&self, node: Node) -> Option<Cow<'a, str>> {
         let text = &self.source[node.start_byte()..node.end_byte()];
         match (self.source_language, node.kind()) {
+            (SourceLanguage::Cpp, "user_defined_literal") => {
+                self.string_contents(Self::user_defined_string(node)?)
+            }
             (SourceLanguage::C | SourceLanguage::Cpp, "string_literal") => {
                 let start = text.find('"')? + 1;
                 let end = text.rfind('"')?;
@@ -1639,13 +2064,22 @@ impl<'a> SourceQuery<'a> {
         }
     }
 
+    /// The string-literal of a C++ user-defined literal, like the `"error"` in lnav's
+    /// `"error"_error`, which makes styled text, or None if it is a number, like `10_ms`.
+    fn user_defined_string(node: Node) -> Option<Node> {
+        node.named_child(0)
+            .filter(|_| node.kind() == "user_defined_literal")
+            .filter(|inner| matches!(inner.kind(), "string_literal" | "raw_string_literal"))
+    }
+
     /// Check if an argument of a log call looks like a message, so that only the first one is
     /// used.
     fn is_message_like(&self, node: Node<'a>) -> bool {
         matches!(
             node.kind(),
             "string_literal" | "concatenated_string" | "raw_string_literal"
-        ) || (node.kind() == "binary_expression" && self.concat_pattern(node).is_some())
+        ) || Self::user_defined_string(node).is_some()
+            || (node.kind() == "binary_expression" && self.concat_pattern(node).is_some())
             || self.unwrap_message_call(node).is_some()
     }
 

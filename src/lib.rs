@@ -52,7 +52,7 @@ pub use progress::ProgressUpdate;
 pub use progress::WorkInfo;
 use source_query::QueryResult;
 pub use source_query::SourceQuery;
-pub use source_ref::{LogLevel, MessageCategory, Statement};
+pub use source_ref::{LogLevel, MessageCategory, Quality, Statement};
 
 #[derive(Error, Debug, Diagnostic, Clone, Default)]
 pub enum LogError {
@@ -160,7 +160,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "52")]
+    #[serde(rename = "55")]
     Current,
 }
 
@@ -506,6 +506,9 @@ fn prune_log_calls(
             .is_some_and(|family| pruned_families.contains(family));
     }
     for (stmt, language, from_arg) in stmts.iter_mut() {
+        if stmt.category_from_use {
+            continue;
+        }
         stmt.category = MessageCategory::Log;
         // A level from an argument, like `syslog(LOG_ERR, ...)`, is kept.
         if *from_arg {
@@ -680,7 +683,7 @@ impl SourceTree {
         &self,
         log_ref: &LogRef,
         fallback: bool,
-    ) -> Option<(StatementRef<'_>, usize, usize)> {
+    ) -> Option<(StatementRef<'_>, usize, Quality)> {
         let learned = self
             .learned_prefixes
             .read()
@@ -715,7 +718,7 @@ impl SourceTree {
                     let score = if src_ref.values_fit_kinds(src_ref.pattern(), rest) {
                         src_ref.quality
                     } else {
-                        0
+                        Quality::ZERO
                     };
                     Some((src_ref, start, score))
                 })
@@ -840,13 +843,13 @@ impl SourceTree {
         log_ref: &LogRef,
         fallback: bool,
     ) -> Option<(StatementRef<'_>, bool)> {
-        let ((stmt_id, src_ref), without_empty_values) =
-            self.first_match_in(self.log_prefilter(), log_ref)
-                .or_else(|| {
-                    fallback
-                        .then(|| self.first_match_in(self.fallback_prefilter(), log_ref))
-                        .flatten()
-                })?;
+        let ((stmt_id, src_ref), without_empty_values) = self
+            .first_match_in(self.log_prefilter(), log_ref)
+            .or_else(|| {
+                fallback
+                    .then(|| self.first_match_in(self.fallback_prefilter(), log_ref))
+                    .flatten()
+            })?;
         if let Some(key) = self.line_cache_key(log_ref) {
             let mut cache = self
                 .line_cache
@@ -897,7 +900,7 @@ impl SourceTree {
     fn fallback_prefilter(&self) -> &Prefilter {
         self.fallback_prefilter.get_or_init(|| {
             Prefilter::new(self.files_with_statements.values(), |stmt| {
-                stmt.category != MessageCategory::Log && stmt.quality >= MIN_FALLBACK_QUALITY
+                stmt.category != MessageCategory::Log && has_fallback_quality(stmt)
             })
         })
     }
@@ -906,7 +909,7 @@ impl SourceTree {
     fn find_prefilter(&self) -> &Prefilter {
         self.find_prefilter.get_or_init(|| {
             Prefilter::new(self.files_with_statements.values(), |stmt| {
-                stmt.quality >= MIN_FALLBACK_QUALITY
+                has_fallback_quality(stmt)
             })
         })
     }
@@ -1326,7 +1329,7 @@ fn explains_enough(best: Option<&StatementRef>, body: &str) -> bool {
         return false;
     };
     let total = body.chars().filter(|c| !c.is_whitespace()).count();
-    best.quality * 100 >= total * MIN_EXPLAINED_PERCENT
+    best.quality.total() * 100 >= total * MIN_EXPLAINED_PERCENT
 }
 
 /// Find the first of the ordered candidates whose statement matches `body`.  A statement that
@@ -1381,7 +1384,7 @@ fn choose_match<'a, T>(
         }) {
             break;
         }
-        if stmt.category != MessageCategory::Log && stmt.quality < MIN_FALLBACK_QUALITY {
+        if stmt.category != MessageCategory::Log && !has_fallback_quality(stmt) {
             continue;
         }
         let Some(without_empty_values) = matches(&candidate) else {
@@ -1405,6 +1408,17 @@ fn choose_match<'a, T>(
 /// The least amount of literal text, not counting whitespace, for a statement that is not `Log` to
 /// be matched to a log message.
 const MIN_FALLBACK_QUALITY: usize = 5;
+
+/// The least amount of alphanumeric literal text for a statement that is not `Log` to be matched
+/// to a log message, so one that only joins values with punctuation, like
+/// `format!("{}/{}.{}", dir, name, ext)`, is not used.
+const MIN_FALLBACK_ALNUM: usize = 3;
+
+/// Check if a statement has enough literal text to be used even when it is not `Log`, see
+/// [`MIN_FALLBACK_QUALITY`] and [`MIN_FALLBACK_ALNUM`].
+fn has_fallback_quality(stmt: &Statement) -> bool {
+    stmt.quality.total() >= MIN_FALLBACK_QUALITY && stmt.quality.alnum >= MIN_FALLBACK_ALNUM
+}
 
 /// How far a statement is from the line number in a log message, or zero if there is none.
 fn line_distance(src_ref: &Statement, lineno: Option<usize>) -> usize {
@@ -1458,7 +1472,7 @@ fn candidate_key(
     path_rank: u32,
     lineno: Option<usize>,
     level: Option<LogLevel>,
-) -> (u8, Reverse<usize>, bool, usize, usize, u32, usize, usize) {
+) -> (u8, Reverse<Quality>, bool, usize, usize, u32, usize, usize) {
     (
         src_ref.category.match_priority(),
         Reverse(src_ref.quality),
@@ -2186,9 +2200,10 @@ impl LogMatcher {
         // most of the time, the message does not have to be read.  A chain of `best` with
         // itself, like `"retry: retry"`, is missed, but that is not worth reading every
         // message for.
-        let others = candidates.iter().flat_map(|(_, found)| found).any(|(_, stmt)| {
-            best.is_none_or(|best| !std::ptr::eq(stmt.stmt, best.stmt))
-        });
+        let others = candidates
+            .iter()
+            .flat_map(|(_, found)| found)
+            .any(|(_, stmt)| best.is_none_or(|best| !std::ptr::eq(stmt.stmt, best.stmt)));
         if !others {
             match_stats::record_explain_skipped();
             return None;
@@ -2241,13 +2256,27 @@ impl LogMatcher {
     /// Find the statements that could have produced a message, like one copied from a log, a
     /// screenshot, or a GUI, and the sources of the values in it.  See
     /// [`find_message_sources`].
-    pub fn find_message_sources(&self, message: &str) -> Vec<MessageSource<'_>> {
+    pub fn find_message_sources(
+        &self,
+        message: &str,
+        extract_variables: bool,
+    ) -> Vec<MessageSource<'_>> {
         let statements = self
             .roots
             .values()
             .flat_map(|coll| coll.files_with_statements.values())
             .flat_map(|sif| sif.matchable_statements());
-        find_message_sources(statements, message)
+        let mut sources = find_message_sources(statements, message);
+        if !extract_variables {
+            fn clear(sources: &mut [MessageSource]) {
+                for source in sources {
+                    source.variables.clear();
+                    clear(&mut source.causes);
+                }
+            }
+            clear(&mut sources);
+        }
+        sources
     }
 
     /// Map the log message to the statement, whose values are extracted from `text`, which is
@@ -2261,7 +2290,9 @@ impl LogMatcher {
         options: &LogMatchOptions,
     ) -> LogMapping<'a, 's> {
         let variables = if options.extract_variables {
-            match_stats::timed(Step::Variables, || extract_variables_from(text, src_ref.stmt))
+            match_stats::timed(Step::Variables, || {
+                extract_variables_from(text, src_ref.stmt)
+            })
         } else {
             Vec::new()
         };
@@ -2607,7 +2638,8 @@ static C_QUERY: LazyLock<String> =
     LazyLock::new(|| c_family_query("(string_literal) (concatenated_string)", false));
 static CPP_QUERY: LazyLock<String> = LazyLock::new(|| {
     c_family_query(
-        "(string_literal) (raw_string_literal) (concatenated_string) (binary_expression)",
+        "(string_literal) (raw_string_literal) (concatenated_string) (binary_expression) \
+         (user_defined_literal)",
         true,
     )
 });
@@ -2942,9 +2974,7 @@ pub struct LogRef<'a> {
 
 fn is_only_body(details: &Option<LogDetails>) -> bool {
     if let Some(details) = details {
-        details.thread.is_none()
-            && details.file.is_none()
-            && details.lineno.is_none()
+        details.thread.is_none() && details.file.is_none() && details.lineno.is_none()
     } else {
         true
     }
@@ -3157,8 +3187,26 @@ pub fn extract_variables(log_ref: &LogRef, src_ref: &Statement) -> Vec<VariableP
 
 /// Extract the values of the statement's placeholders from the text it produced.
 fn extract_variables_from(line: &str, src_ref: &Statement) -> Vec<VariablePair> {
+    extract_variables_with(line, src_ref, src_ref.pattern())
+}
+
+/// The variables in the text that `find_message_sources()` found the statement for, which
+/// might only match the statement's relaxed pattern, like text whose whitespace was collapsed
+/// or that does not have the whitespace the statement starts with.
+pub(crate) fn find_variables(text: &str, src_ref: &Statement) -> Vec<VariablePair> {
+    let pattern = if src_ref.pattern().is_match(text) {
+        src_ref.pattern()
+    } else {
+        src_ref.relaxed_pattern()
+    };
+    extract_variables_with(text, src_ref, pattern)
+}
+
+/// [`extract_variables_from`] with the values found by `pattern`, which is the statement's
+/// pattern or its relaxed pattern.
+fn extract_variables_with(line: &str, src_ref: &Statement, pattern: &Regex) -> Vec<VariablePair> {
     let mut variables = Vec::new();
-    if let Some(captures) = src_ref.captures(line) {
+    if let Some(captures) = pattern.captures(line) {
         let exprs = src_ref.arg_exprs();
         let greedy = captures
             .iter()
@@ -3270,7 +3318,9 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
             } else {
                 Default::default()
             };
-            let results = src_query.query(code.info.language.compiled_query(), None);
+            let mut results = src_query.query(code.info.language.compiled_query(), None);
+            results.extend(src_query.append_chains());
+            results.extend(src_query.glyph_literals());
             for result in results {
                 // println!("node.kind()={:?} range={:?}", result.kind, result.range);
                 match result.kind.as_str() {
@@ -5449,7 +5499,10 @@ static void show_features(int n, const char **names, int extra)
             .pop()
             .unwrap();
         // The continuations that only end the line are not matched to messages.
-        assert!(sif.log_statements.iter().all(|stmt| stmt.quality > 0));
+        assert!(sif
+            .log_statements
+            .iter()
+            .all(|stmt| !stmt.quality.is_zero()));
         assert_eq!(
             sif.bare_continuations
                 .iter()
@@ -5560,7 +5613,7 @@ void show(int on)
         // A continuation without literal text is not matched on its own.
         assert!(matcher
             .statements()
-            .all(|stmt| !stmt.is_continuation() || stmt.quality > 0));
+            .all(|stmt| !stmt.is_continuation() || !stmt.quality.is_zero()));
     }
 
     #[test]
@@ -5707,7 +5760,7 @@ void con_init(struct vc_data *vc, const char *display_desc) {
         // The literal text of the shortest choice counts toward the quality.
         assert_eq!(
             src_refs[0].quality,
-            "Console:".len() + "mono".len() + "x".len()
+            Quality::of_text("Console:") + Quality::of_text("mono") + Quality::of_text("x")
         );
 
         let stmt = &src_refs[0];
@@ -5959,7 +6012,270 @@ static const handlers h = {
                     "\"A regular expression that matches a frame\"",
                     Some("yajlpp::property_handler().with_description")
                 ),
+                // The text of the chains of appends, see `SourceQuery::append_chains()`.
+                (
+                    4,
+                    "attr_line_t()\n            .append_quoted(value)\n            \
+                     .append(\" is not a valid value for option \")\n            \
+                     .append_quoted(ypc->get_full_path())",
+                    Some("attr_line_t().append_quoted().append().append_quoted")
+                ),
+                (
+                    10,
+                    "sql.append(\" OR ( \").append(clause).append(\" ) \")",
+                    Some("sql.append().append().append")
+                ),
             ]
+        );
+    }
+
+    #[test]
+    fn test_cpp_user_defined_literals() {
+        // The string of a user-defined literal, like lnav's `"error"_error`, is the text, but
+        // a number with a suffix is not a message.
+        let patterns = cpp_patterns(
+            r#"
+void f() {
+    al.append(" ").append("✘ Filter-out"_error).append("  ");
+    log_info("hello %d"_fmt, count);
+    auto delay = 10_ms;
+}
+"#,
+        );
+        assert_eq!(
+            patterns,
+            vec![
+                r"(?s)^✘ Filter-out$",
+                r"(?s)^hello (.*)$",
+                // The whole chain, whose whitespace at the end is optional.
+                r"(?s)^ ✘ Filter-out\s*$",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cpp_append_chains() {
+        let code = CodeSource::from_string(
+            &PathBuf::from("in-mem.cc"),
+            r#"
+attr_line_t to_attr_line(level lvl, bool x) {
+    switch (lvl) {
+        case level::error:
+            retval.append("  ").append("error"_error).append(": ");
+            retval.al_attrs.emplace_back(line_range{0, 1}, ICON);
+            break;
+        case level::ok:
+            retval.append("  ");
+            break;
+    }
+    retval.append(this->um_message).append("\n");
+    if (x) {
+        retval.append("maybe");
+    }
+    retval.append("50% {done}");
+    for (auto& i : items) {
+        retval.append(i).append(" item");
+    }
+    retval.append("never");
+    return retval;
+}
+void report() {
+    report_error(user_message::error(attr_line_t().append_quoted(n).append(" is bad")));
+    auto um = attr_line_t("unable to open: ").append(fn);
+}
+"#,
+        );
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        // Only the text of whole chains, not the string-literals in them.
+        let found: Vec<(usize, &str, Vec<usize>, MessageCategory)> = sif
+            .log_statements
+            .iter()
+            .filter(|stmt| !stmt.text.starts_with('"'))
+            .map(|stmt| {
+                (
+                    stmt.line_no,
+                    stmt.pattern().as_str(),
+                    stmt.continuations.iter().map(|c| c.line_number).collect(),
+                    stmt.category,
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                // The appends after the `switch` always run, whichever case was taken, and the
+                // field of the receiver that is changed does not change its text.  The other
+                // case only adds whitespace.
+                (
+                    5,
+                    r"(?s)^  error: (.*?)\s*$",
+                    vec![12],
+                    MessageCategory::Other
+                ),
+                // The appends after the `if` always run, until the loop, which might not.  The
+                // text is not a format string.
+                (
+                    14,
+                    r"(?s)^maybe50% \{done\}$",
+                    vec![16],
+                    MessageCategory::Other
+                ),
+                (18, r"(?s)^(.*) item$", vec![], MessageCategory::Other),
+                // The text is made into an error, which is shown somewhere else.
+                (24, r"(?s)^(.*) is bad$", vec![], MessageCategory::Error),
+                // The text the builder starts with.
+                (
+                    25,
+                    r"(?s)^unable to open: (.*)$",
+                    vec![],
+                    MessageCategory::Other
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_glyph() {
+        let source = r#"
+static block_elem_t wchar_for_icon(ui_icon_t ic) {
+    switch (ic) {
+        case ui_icon_t::ok:
+            return {U'✔', role_t::VCR_OK};
+        case ui_icon_t::error:
+            return {U'✘', role_t::VCR_ERROR};
+    }
+}
+attr_line_t user_message::to_attr_line() const {
+    attr_line_t retval;
+    retval.append("  ").append("error"_error).append(": ");
+    retval.al_attrs.emplace_back(line_range{0, 1}, VC_ICON.value(ui_icon_t::error));
+    retval.append(this->um_message).append("\n");
+    return retval;
+}
+void f() {
+    um_error(attr_line_t().append_quoted(name).append(" is already a named search"));
+    tl.append("✘"_error);
+    char letter = 'x';
+    char32_t accent = U'é';
+}
+"#;
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), source);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let found =
+            find_message_sources(sif.statements(), "✘ error: “dup” is already a named search");
+        let lines: Vec<(&str, Vec<usize>)> = found
+            .iter()
+            .map(|source| {
+                (
+                    source.text.as_str(),
+                    source.candidates.iter().map(|stmt| stmt.line_no).collect(),
+                )
+            })
+            .collect();
+        // The icon is drawn in place of the first space of the prefix, so it is not part of any
+        // text, but the places it could come from are found.  A letter, even one that is not
+        // ASCII, is not a glyph.
+        assert_eq!(
+            lines,
+            vec![
+                ("✘", vec![7, 19]),
+                // The chain matches all of it too, but the prefix is better, since the chain
+                // explains the rest.
+                ("error: “dup” is already a named search", vec![12, 18]),
+            ]
+        );
+        let causes: Vec<Vec<usize>> = found[1]
+            .causes
+            .iter()
+            .map(|cause| cause.candidates.iter().map(|stmt| stmt.line_no).collect())
+            .collect();
+        assert_eq!(causes, vec![vec![18]]);
+    }
+
+    #[test]
+    fn test_find_variables() {
+        let source = r#"
+attr_line_t user_message::to_attr_line() const {
+    attr_line_t retval;
+    retval.append("  ").append("error"_error).append(": ");
+    retval.append(this->um_message).append("\n");
+    return retval;
+}
+void f() {
+    um_error(attr_line_t().append_quoted(name).append(" is already a named search"));
+    status.set_value("%'d messages ", count);
+}
+"#;
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), source);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let variables = |sources: &[MessageSource]| -> Vec<Vec<(String, String)>> {
+            sources
+                .iter()
+                .map(|source| {
+                    source
+                        .variables
+                        .iter()
+                        .map(|pair| (pair.expr.clone(), pair.value.clone()))
+                        .collect()
+                })
+                .collect()
+        };
+        let pair = |expr: &str, value: &str| (expr.to_string(), value.to_string());
+        let found =
+            find_message_sources(sif.statements(), "error: “dup” is already a named search");
+        // The statement only matches without the whitespace it starts with, so the values are
+        // found with its relaxed pattern.
+        assert_eq!(
+            variables(&found),
+            vec![vec![pair(
+                "this->um_message",
+                "“dup” is already a named search"
+            )]]
+        );
+        // The causes have the values of their own statements.
+        assert_eq!(
+            variables(&found[0].causes),
+            vec![vec![pair("name", "“dup”")]]
+        );
+        // A value that is too short to look up the source of still has a variable.
+        let found = find_message_sources(sif.statements(), "42 messages");
+        assert_eq!(variables(&found), vec![vec![pair("count", "42")]]);
+        assert!(found[0].causes.is_empty());
+    }
+
+    #[test]
+    fn test_glyph_literals_in_other_languages() {
+        let glyphs = |path: &str, source: &str| -> Vec<String> {
+            let code = CodeSource::from_string(&PathBuf::from(path), source);
+            extract_logging(&[code], &ProgressTracker::new())
+                .pop()
+                .map(|sif| {
+                    sif.log_statements
+                        .iter()
+                        .map(|stmt| stmt.pattern().as_str().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            glyphs(
+                "in-mem.rs",
+                "fn icon(ok: bool) -> char { if ok { '✔' } else { '\\u{2718}' } }"
+            ),
+            vec![r"(?s)^✔$", r"(?s)^✘$"]
+        );
+        assert_eq!(
+            glyphs(
+                "in-mem.java",
+                "class A { char c = '\\u2718'; char d = 'x'; }"
+            ),
+            vec![r"(?s)^✘$"]
         );
     }
 
@@ -6443,8 +6759,8 @@ void f() {
     fn test_cpp_find_fragment_skips_weaker_overlaps() {
         let source = r#"
 void f() {
-    um_error(attr_line_t().append_quoted(name).append(" is already a named search"));
-    um_error(attr_line_t().append_quoted(name).append(" is already a named search"));
+    one.append(" is already a named search");
+    two.append(" is already a named search");
     um_error("a named search must have a name");
     log_info("%s: using %zu named search hits in [%d:%d)", a, b, c, d);
     um_error("Unable to open file");
@@ -6468,6 +6784,42 @@ void f() {
         // The statements that only share "a named search" or " named search", which the best
         // ones share too, are left out, but the ones that are as good are kept.
         assert_eq!(lines, vec![(true, vec![3, 4])]);
+    }
+
+    #[test]
+    fn test_cpp_find_fragment_of_value() {
+        let source = r#"
+void f(attr_line_t& al) {
+    al.append(" is already a named search");
+}
+
+void g() {
+    err.set_value("error: %s", msg);
+}
+"#;
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.cc"), source);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let found =
+            find_message_sources(sif.statements(), "✘ error: “dup” is already a named search");
+        // The generic statement matches after the prefix, but its value is only partly from
+        // another statement, which is found too.  The statements are in different functions,
+        // so the pieces are not put together, and `"error: "` is too short to be a piece from
+        // another function anyway.
+        let last = found.last().unwrap();
+        assert_eq!(last.candidates.first().map(|stmt| stmt.line_no), Some(7));
+        let lines: Vec<(bool, Vec<usize>)> = last
+            .causes
+            .iter()
+            .map(|cause| {
+                (
+                    cause.partial,
+                    cause.candidates.iter().map(|stmt| stmt.line_no).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(lines, vec![(true, vec![3])]);
     }
 
     // The tests below are known gaps, found by running `log2src find` on the expected error
@@ -6537,10 +6889,10 @@ void check() {
     }
 
     #[test]
-    #[should_panic(expected = "assertion `left == right` failed")]
-    fn test_find_prefers_longer_prefix_xfail() {
+    fn test_find_prefers_longer_prefix() {
         // The statement with the `: ` covers more of the message than the one without it, so
-        // it should win, rather than splitting the message at the end of the shorter one.
+        // it wins, rather than splitting the message at the end of the shorter one.  The text
+        // of the builder is from the whole chain of appends.
         let found = cpp_find(
             r#"
 Result<void, user_message> exec(exec_context& ec) {
@@ -6897,6 +7249,34 @@ void f(const char *path, int a, int b, long total) {
         assert_eq!(
             pairs(2, "total 1,024 bytes"),
             vec![("total".to_string(), "1,024".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_cpp_encoding_prefixes() {
+        // The prefix is not part of the text, and the escapes are decoded the same.
+        let patterns = cpp_patterns(
+            r#"
+void f() {
+    log_error(u8"✘ handler %s exited", name);
+    log_error(L"wide string %s", name);
+    log_error(u"utf-16 string %s", name);
+    log_error(U"utf-32 string %s", name);
+    log_error(u8"joined " "pieces %s", name);
+    log_error("\xe2\x9c\x98 byte escapes %s", name);
+}
+"#,
+        );
+        assert_eq!(
+            patterns,
+            vec![
+                r"(?s)^✘ handler (.*) exited$",
+                r"(?s)^wide string (.*)$",
+                r"(?s)^utf-16 string (.*)$",
+                r"(?s)^utf-32 string (.*)$",
+                r"(?s)^joined pieces (.*)$",
+                r"(?s)^✘ byte escapes (.*)$",
+            ]
         );
     }
 
@@ -9139,6 +9519,29 @@ fn check(p: &str) -> Result<()> {
     }
 
     #[test]
+    fn test_alnum_beats_punctuation() {
+        let code = CodeSource::from_string(
+            Path::new("in-mem.rs"),
+            r#"
+fn main() {
+    info!("{}: {} [{}] ({})", a, b, c, d);
+    info!("Done{}", rest);
+}
+"#,
+        );
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let line = "Done: x [y] (z)";
+        let log_ref = LogRefBuilder::new().with_body(Some(line)).build(line);
+        // Both match, but the one with text wins over the one with more punctuation.
+        assert_eq!(
+            link_to_source(&log_ref, &sif).map(|src_ref| src_ref.line_no),
+            Some(4)
+        );
+    }
+
+    #[test]
     fn test_fallback_quality() {
         let code = CodeSource::from_string(
             Path::new("in-mem.rs"),
@@ -9146,6 +9549,7 @@ fn check(p: &str) -> Result<()> {
 fn main() {
     let a = format!("{}/{}", dir, name);
     let b = format!("ready: {}", name);
+    let c = format!("[{}] <{}> ({})", x, y, z);
 }
 "#,
         );
@@ -9159,6 +9563,8 @@ fn main() {
         // Too little literal text to match a log message unless it is a log statement.
         assert_eq!(best("usr/bin"), None);
         assert_eq!(best("ready: now"), Some(4));
+        // Enough punctuation, but no text.
+        assert_eq!(best("[a] <b> (c)"), None);
     }
 
     #[test]
@@ -9658,7 +10064,10 @@ ZeroDivisionError: division by zero
         }
         assert_eq!(body(TRACE), Some("JvmPauseMonitor-n0: Started"));
         assert_eq!(
-            body(&format!("Failed to divide\n{}", PYTHON_TRACE.trim_start_matches("\\\n"))),
+            body(&format!(
+                "Failed to divide\n{}",
+                PYTHON_TRACE.trim_start_matches("\\\n")
+            )),
             Some("Failed to divide")
         );
         // The trace can be all of the message, like for `log.error("", e)`.
@@ -9669,7 +10078,10 @@ ZeroDivisionError: division by zero
             Some("Request failed")
         );
         // Without a frame after it, an exception's name is just part of the message.
-        assert_eq!(body("ConnectionError: timeout"), Some("ConnectionError: timeout"));
+        assert_eq!(
+            body("ConnectionError: timeout"),
+            Some("ConnectionError: timeout")
+        );
         assert_eq!(
             body("Retrying\nConnectionError: timeout"),
             Some("Retrying\nConnectionError: timeout")

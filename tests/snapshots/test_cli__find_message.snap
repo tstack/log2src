@@ -5,19 +5,19 @@ info:
   args:
     - find
     - "-d"
-    - /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpyJkEs4
+    - /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpsH7LFh
     - "Unable to start: failed to load the cache: cannot open store at /var/cache"
   env:
-    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpR3qYgx
+    APPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpC0ELVv
     COLS: "1000"
-    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpR3qYgx
-    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpR3qYgx
-    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpR3qYgx
-    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpR3qYgx
+    HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpC0ELVv
+    LOCALAPPDATA: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpC0ELVv
+    USERPROFILE: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpC0ELVv
+    XDG_CONFIG_HOME: /var/folders/j9/5x_yddgj607g1zf16sytlf5h0000gp/T/.tmpC0ELVv
 ---
 success: true
 exit_code: 0
 ----- stdout -----
-{"message":"Unable to start: failed to load the cache: cannot open store at /var/cache","sources":[{"candidates":[{"blockId":269,"callName":"warn","category":"Log","column":14,"endLineNumber":14,"language":"rust","level":"Warn","lineNumber":14,"name":"main","pattern":"(?s)^Unable to start: (.*)$","qualifiedName":"main","sourcePath":"{source_dir}/errors.rs","text":"\"Unable to start: {:#}\""}],"causes":[{"candidates":[{"blockId":153,"callName":"context","category":"Error","column":30,"endLineNumber":9,"language":"rust","level":"Unknown","lineNumber":9,"name":"load","pattern":"(?s)^failed to load the cache$","qualifiedName":"load","sourcePath":"{source_dir}/errors.rs","text":"\"failed to load the cache\""}],"text":"failed to load the cache"},{"candidates":[{"blockId":52,"callName":"#[error]","category":"Error","column":12,"endLineNumber":4,"language":"rust","level":"Unknown","lineNumber":4,"name":"errors","pattern":"(?s)^cannot open store at (.*)$","qualifiedName":"","sourcePath":"{source_dir}/errors.rs","text":"\"cannot open store at {0}\""}],"causes":[{"candidates":[],"text":"/var/cache"}],"text":"cannot open store at /var/cache"}],"text":"Unable to start: failed to load the cache: cannot open store at /var/cache"}]}
+{"message":"Unable to start: failed to load the cache: cannot open store at /var/cache","sources":[{"candidates":[{"blockId":269,"callName":"warn","category":"Log","column":14,"endLineNumber":14,"language":"rust","level":"Warn","lineNumber":14,"name":"main","pattern":"(?s)^Unable to start: (.*)$","qualifiedName":"main","sourcePath":"{source_dir}/errors.rs","text":"\"Unable to start: {:#}\""}],"causes":[{"candidates":[{"blockId":153,"callName":"context","category":"Error","column":30,"endLineNumber":9,"language":"rust","level":"Unknown","lineNumber":9,"name":"load","pattern":"(?s)^failed to load the cache$","qualifiedName":"load","sourcePath":"{source_dir}/errors.rs","text":"\"failed to load the cache\""}],"text":"failed to load the cache"},{"candidates":[{"blockId":52,"callName":"#[error]","category":"Error","column":12,"endLineNumber":4,"language":"rust","level":"Unknown","lineNumber":4,"name":"errors","pattern":"(?s)^cannot open store at (.*)$","qualifiedName":"","sourcePath":"{source_dir}/errors.rs","text":"\"cannot open store at {0}\""}],"causes":[{"candidates":[],"text":"/var/cache"}],"text":"cannot open store at /var/cache","variables":[{"expr":"<unknown>","value":"/var/cache"}]}],"text":"Unable to start: failed to load the cache: cannot open store at /var/cache","variables":[{"expr":"err","value":"failed to load the cache: cannot open store at /var/cache"}]}]}
 
 ----- stderr -----

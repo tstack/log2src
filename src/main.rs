@@ -137,6 +137,10 @@ struct FindArgs {
     /// The messages to find
     #[arg(required = true, value_name = "MESSAGE")]
     messages: Vec<String>,
+
+    /// Do not extract the values of variables from the messages
+    #[arg(long)]
+    no_vars: bool,
 }
 
 #[derive(Args)]
@@ -693,7 +697,7 @@ fn run_find(cli: &Cli, args: &FindArgs) -> miette::Result<()> {
     for message in &args.messages {
         let result = json!({
             "message": message,
-            "sources": log_matcher.find_message_sources(message),
+            "sources": log_matcher.find_message_sources(message, !args.no_vars),
         });
         if !print_json(&result) {
             break;

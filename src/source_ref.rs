@@ -1,6 +1,6 @@
 use crate::java_symbols::MessageRef;
-use crate::value_kind::{self, SplitOrder, ValueKind, ANY_CAPTURE};
 use crate::source_query::{concat_parts_pattern, ConcatPart};
+use crate::value_kind::{self, SplitOrder, ValueKind, ANY_CAPTURE};
 use crate::{pointer_extension, CodeSource, QueryResult, SourceLanguage};
 use core::fmt;
 use regex::{Captures, Regex};
@@ -620,10 +620,14 @@ pub struct Statement {
     pub text: String,
     pub level: LogLevel,
     pub category: MessageCategory,
+    /// The category is from where the message is used, like the text of a builder that is
+    /// passed to `user_message::error()`, not from `call_name`, so it is not classified again
+    /// by `prune_log_calls()`.
+    pub(crate) category_from_use: bool,
     /// The name of the logging function/macro/method that was called, as written in the source,
     /// like `ws_debug`, `logger.info`, or `syslog`.
     pub call_name: Option<String>,
-    pub quality: usize,
+    pub quality: Quality,
     pub(crate) args: Vec<FormatArgument>,
     /// The kind of value produced by the expression of each `FormatArgument::Named` in `args`.
     pub(crate) arg_kinds: Vec<ValueKind>,
@@ -699,7 +703,7 @@ struct MessageMatcher {
     /// is only compiled when it is needed, since most statements are never matched.
     #[cfg_attr(not(test), allow(dead_code))]
     matcher: String,
-    quality: usize,
+    quality: Quality,
     args: Vec<FormatArgument>,
     kinds: Vec<ValueKind>,
     segments: Vec<String>,
@@ -712,11 +716,37 @@ impl Statement {
         let level = result.level();
         let call_name = result.call_name.clone();
         let source = code.buffer.as_str();
-        let text = source[range.start_byte..range.end_byte].to_string();
+        let mut text = source[range.start_byte..range.end_byte].to_string();
         let line_no = range.start_point.row + 1;
-        let end_line_no = range.end_point.row + 1;
+        let mut end_line_no = range.end_point.row + 1;
         let col = range.start_point.column;
-        let start = range.start_byte + 1;
+        let result_category = result.category;
+        // The later statements that add to the text, like the appends to the same builder.
+        let continuations: Vec<Continuation> = result
+            .continuations
+            .iter()
+            .map(|(range, call_name)| Continuation {
+                line_number: range.start_point.row + 1,
+                end_line_number: range.end_point.row + 1,
+                column: range.start_point.column,
+                call_name: call_name.clone(),
+                text: source[range.start_byte..range.end_byte].to_string(),
+            })
+            .collect();
+        for cont in &continuations {
+            text.push(' ');
+            text.push_str(&cont.text);
+            end_line_no = end_line_no.max(cont.end_line_number);
+        }
+        // A C or C++ string-literal can have an encoding prefix, like `u8"..."` or `L"..."`.
+        let prefix_len = if code.info.language.is_c_family() {
+            text.find('"')
+                .filter(|&quote| text[..quote].chars().all(|c| c.is_ascii_alphanumeric()))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let start = range.start_byte + prefix_len + 1;
         let mut end = range.end_byte - 1;
         if start == range.end_byte {
             end = range.end_byte;
@@ -753,6 +783,7 @@ impl Statement {
                 text,
                 level,
                 category: MessageCategory::Log,
+                category_from_use: result_category.is_some(),
                 call_name,
                 quality,
                 pattern: OnceLock::new(),
@@ -767,7 +798,7 @@ impl Statement {
                 var_choices: vec![],
                 arg_position: result.arg_position.and_then(|pos| u32::try_from(pos).ok()),
                 call_chain: vec![],
-                continuations: vec![],
+                continuations,
                 value_kinds: OnceLock::new(),
                 segment_matchers: OnceLock::new(),
                 lazy_matcher: OnceLock::new(),
@@ -778,7 +809,7 @@ impl Statement {
                 leading_literal: OnceLock::new(),
                 concat: result.concat_parts,
             };
-            if quality == 0 {
+            if quality.is_zero() {
                 // A message without literal text matches anything, so it is only kept if it
                 // continues a line that an earlier statement started, like `pr_cont(" %s", x)`
                 // or `pr_cont("\n")`, see `is_bare_continuation()`, or if it has a constant
@@ -794,7 +825,8 @@ impl Statement {
                 }
             }
             // Redone by `prune_log_calls()`, which can change the level.
-            src_ref.category = MessageCategory::classify(&src_ref, code.info.language);
+            src_ref.category = result_category
+                .unwrap_or_else(|| MessageCategory::classify(&src_ref, code.info.language));
             if src_ref.category != MessageCategory::Log {
                 // Only log statements have a level, the name of an error call, like `Err`,
                 // does not mean anything.
@@ -827,6 +859,7 @@ impl Statement {
             text: message_ref.text.clone(),
             level: message_ref.level,
             category: MessageCategory::Log,
+            category_from_use: false,
             call_name: message_ref.call_name.clone(),
             quality,
             pattern: OnceLock::new(),
@@ -889,7 +922,7 @@ impl Statement {
         self.quality += choices
             .iter()
             .filter_map(|choices| choices.iter().map(|c| literal_quality(c)).min())
-            .sum::<usize>();
+            .sum::<Quality>();
         self.choices = choices;
         self.pattern = OnceLock::new();
         if !is_valid_pattern(&self.pattern_source()) {
@@ -912,6 +945,7 @@ impl Statement {
             text: self.text.clone(),
             level: self.level,
             category: self.category,
+            category_from_use: self.category_from_use,
             call_name: self.call_name.clone(),
             quality: self.quality,
             args: self.args.clone(),
@@ -966,7 +1000,7 @@ impl Statement {
             })
             .collect();
         if !resolved {
-            return (self.quality > 0).then(|| Statement {
+            return (!self.quality.is_zero()).then(|| Statement {
                 vars: self.vars.clone(),
                 var_kinds: self.var_kinds.clone(),
                 arg_position: self.arg_position,
@@ -1045,7 +1079,7 @@ impl Statement {
         self.quality += choices
             .iter()
             .filter_map(|choices| choices.iter().map(|c| literal_quality(c)).min())
-            .sum::<usize>();
+            .sum::<Quality>();
         self.choices = choices;
         if !is_valid_pattern(&self.pattern_source()) {
             self.choices.clear();
@@ -1264,7 +1298,7 @@ impl Statement {
     /// These would match any log message, so they are not matched on their own, they are only
     /// joined to the line they continue in `join_continued_lines()`.
     pub(crate) fn is_bare_continuation(&self) -> bool {
-        self.quality == 0 && self.is_continuation()
+        self.quality.is_zero() && self.is_continuation()
     }
 
     /// Check if this statement is a Linux kernel print that starts a line, like `pr_info(...)`
@@ -1327,11 +1361,19 @@ impl Statement {
     pub fn relaxed_pattern(&self) -> &Regex {
         self.relaxed_pattern
             .get_or_init(|| {
-                let segments: Vec<String> = self
+                let mut segments: Vec<String> = self
                     .segments
                     .iter()
                     .map(|segment| relax_whitespace(segment))
                     .collect();
+                // The text is trimmed, so the whitespace at the start, like the indent in
+                // `"  error: %s"`, is not there.
+                if let Some(rest) = segments
+                    .first()
+                    .and_then(|first| first.strip_prefix("\\s+"))
+                {
+                    segments[0] = format!("\\s*{rest}");
+                }
                 // A single space became a `\s+`, which matches the same collapsed text.
                 let same = std::iter::zip(&segments, &self.segments)
                     .all(|(relaxed, segment)| *relaxed == segment.replace(' ', "\\s+"));
@@ -1342,6 +1384,16 @@ impl Statement {
             })
             .as_ref()
             .unwrap_or_else(|| self.pattern())
+    }
+
+    /// Check if the message starts with whitespace, like the indent in `"  error: %s"`.
+    pub(crate) fn starts_with_whitespace(&self) -> bool {
+        self.segments.first().is_some_and(|first| {
+            first.starts_with(' ')
+                || ["\\n", "\\r", "\\t"]
+                    .iter()
+                    .any(|esc| first.starts_with(esc))
+        })
     }
 
     /// The literal text that the message starts with, before its first placeholder or anything
@@ -1531,7 +1583,7 @@ impl PartialEq for Statement {
 }
 
 fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<MessageMatcher> {
-    build_any_matcher(raw, text, language).filter(|matcher| matcher.quality > 0)
+    build_any_matcher(raw, text, language).filter(|matcher| !matcher.quality.is_zero())
 }
 
 /// Build the matcher for a message, even one without any literal text, like `"%s"` or `"\n"`.
@@ -1544,7 +1596,7 @@ fn build_any_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<
     let mut pattern = "(?s)^".to_string();
     // Where the capture group for the last placeholder ends in `pattern`.
     let mut last_group_end = pattern.len();
-    let mut quality = 0;
+    let mut quality = Quality::ZERO;
     // The regex for literal text that has not been added to `pattern` yet.
     let mut pending = String::new();
     let mut counter = ArgCounter::default();
@@ -1742,15 +1794,84 @@ pub(crate) fn regex_literal_pieces(regex: &str) -> Vec<String> {
     pieces
 }
 
-/// The amount of literal text matched by a regex built by `push_regex_literal()`, not counting
-/// whitespace.  The characters are counted, not their escapes in the
-/// regex, so `"a.b"` is 3 and the newline at the end of `"%s\n"` does not count.
-fn literal_quality(regex: &str) -> usize {
+/// The amount of literal text in a statement's message, which is how much a match to it says
+/// about where a log message came from.  Alphanumeric text, like `"Console: %s"`, says a lot
+/// more than punctuation that stitches values together, like `"%s [%s] <%s>"`, so the
+/// alphanumeric characters are compared first and the punctuation only breaks a tie.
+/// Whitespace does not count.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct Quality {
+    /// The number of alphanumeric characters.  This has to be the first field, since the
+    /// derived order is lexicographic.
+    pub alnum: usize,
+    /// The number of other characters that are not whitespace.
+    pub punct: usize,
+}
+
+impl Quality {
+    pub const ZERO: Quality = Quality { alnum: 0, punct: 0 };
+
+    /// The quality of some plain text, not a regex.
+    pub fn of_text(text: &str) -> Quality {
+        text.chars().fold(Quality::ZERO, |mut quality, c| {
+            if c.is_alphanumeric() {
+                quality.alnum += 1;
+            } else if !c.is_whitespace() {
+                quality.punct += 1;
+            }
+            quality
+        })
+    }
+
+    /// The number of characters that are not whitespace.
+    pub fn total(self) -> usize {
+        self.alnum + self.punct
+    }
+
+    pub fn is_zero(self) -> bool {
+        self == Quality::ZERO
+    }
+}
+
+impl std::ops::Add for Quality {
+    type Output = Quality;
+
+    fn add(self, rhs: Quality) -> Quality {
+        Quality {
+            alnum: self.alnum + rhs.alnum,
+            punct: self.punct + rhs.punct,
+        }
+    }
+}
+
+impl std::ops::AddAssign for Quality {
+    fn add_assign(&mut self, rhs: Quality) {
+        *self = *self + rhs;
+    }
+}
+
+impl std::iter::Sum for Quality {
+    fn sum<I: Iterator<Item = Quality>>(iter: I) -> Quality {
+        iter.fold(Quality::ZERO, |lhs, rhs| lhs + rhs)
+    }
+}
+
+impl fmt::Display for Quality {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}+{}", self.alnum, self.punct)
+    }
+}
+
+/// The amount of literal text matched by a regex built by `push_regex_literal()`.  The
+/// characters are counted, not their escapes in the regex, so `"a.b"` is 2 alphanumeric and
+/// 1 punctuation, and the newline at the end of `"%s\n"` does not count.
+pub(crate) fn literal_quality(regex: &str) -> Quality {
     regex_literal_pieces(regex)
         .iter()
-        .flat_map(|piece| piece.chars())
-        .filter(|c| !c.is_whitespace())
-        .count()
+        .map(|piece| Quality::of_text(piece))
+        .sum()
 }
 
 /// The names of the parameters in the signature of a C or C++ function, which is how the
@@ -1857,18 +1978,41 @@ fn take_utf16_escape(chars: &mut Chars) -> Option<char> {
     char::from_u32(high)
 }
 
+/// Add the regex for the text of the bytes from a run of C or C++ byte escapes, like the
+/// `"\xe2\x9c\x98"` or `"\342\234\230"` for `"✘"`, and clear them.  The bytes are UTF-8, and
+/// the ones that are not part of a valid character are printed as is.  A reader that decodes
+/// UTF-8 lossily, like `String::from_utf8_lossy()`, turns each run of those into one
+/// replacement character, so a run matches any one character.
+fn push_escaped_bytes(result: &mut String, bytes: &mut Vec<u8>) {
+    for chunk in bytes.utf8_chunks() {
+        chunk
+            .valid()
+            .chars()
+            .for_each(|c| push_regex_literal(result, c));
+        if !chunk.invalid().is_empty() {
+            result.push('.');
+        }
+    }
+    bytes.clear();
+}
+
 /// Convert a segment of a string-literal from the source code into a regex that matches the
 /// text the literal produces at runtime.  Escape sequences are decoded into the characters they
 /// represent and then any characters that are special to regexes are escaped.
 pub(crate) fn literal_to_regex(raw: bool, language: SourceLanguage, segment: &str) -> String {
     let mut result = String::with_capacity(segment.len() * 2);
     let mut chars = segment.chars();
+    // The bytes from the C or C++ escapes in a row that are not ASCII, which are the UTF-8 for
+    // the characters that are added once the run ends, see `push_escaped_bytes()`.
+    let mut bytes: Vec<u8> = vec![];
     while let Some(c) = chars.next() {
         if raw || c != '\\' {
+            push_escaped_bytes(&mut result, &mut bytes);
             push_regex_literal(&mut result, c);
             continue;
         }
         let Some(esc) = chars.next() else {
+            push_escaped_bytes(&mut result, &mut bytes);
             push_regex_literal(&mut result, '\\');
             break;
         };
@@ -1944,6 +2088,7 @@ pub(crate) fn literal_to_regex(raw: bool, language: SourceLanguage, segment: &st
             'N' if language == SourceLanguage::Python && chars.clone().next() == Some('{') => {
                 // The Python named-Unicode escape.  Ideally, we'd interpret the name, but that
                 // seems like a lot of work.  So, we'll just match any character.
+                push_escaped_bytes(&mut result, &mut bytes);
                 for c in chars.by_ref() {
                     if c == '}' {
                         break;
@@ -1954,11 +2099,22 @@ pub(crate) fn literal_to_regex(raw: bool, language: SourceLanguage, segment: &st
             }
             // Python keeps the backslash for unrecognized escapes.
             _ if language == SourceLanguage::Python && !matches!(esc, '\\' | '\'' | '"') => {
+                push_escaped_bytes(&mut result, &mut bytes);
                 push_regex_literal(&mut result, '\\');
                 Some(esc)
             }
             _ => Some(esc),
         };
+        // In C and C++, a hex or octal escape is a byte, not a character.
+        let byte = decoded
+            .filter(|_| language.is_c_family() && matches!(esc, 'x' | '0'..='7'))
+            .and_then(|c| u8::try_from(u32::from(c)).ok())
+            .filter(|byte| !byte.is_ascii());
+        if let Some(byte) = byte {
+            bytes.push(byte);
+            continue;
+        }
+        push_escaped_bytes(&mut result, &mut bytes);
         match decoded {
             Some(c) => push_regex_literal(&mut result, c),
             // The escape was well-formed, but its value is not a valid character, like a lone
@@ -1968,6 +2124,7 @@ pub(crate) fn literal_to_regex(raw: bool, language: SourceLanguage, segment: &st
             None => push_regex_literal(&mut result, esc),
         }
     }
+    push_escaped_bytes(&mut result, &mut bytes);
     result
 }
 
@@ -2241,11 +2398,25 @@ mod tests {
                 .unwrap()
                 .quality
         };
-        assert_eq!(quality("a.b"), 3);
-        assert_eq!(quality(r"%s %d.%d.%d\n"), 2);
-        assert_eq!(quality(r"%s [%s]\n"), 2);
-        assert_eq!(quality(r"x\ty\n"), 2);
-        assert_eq!(quality(r"\b%c"), 1);
+        let q = |alnum, punct| Quality { alnum, punct };
+        assert_eq!(quality("a.b"), q(2, 1));
+        assert_eq!(quality(r"%s %d.%d.%d\n"), q(0, 2));
+        assert_eq!(quality(r"%s [%s]\n"), q(0, 2));
+        assert_eq!(quality(r"x\ty\n"), q(2, 0));
+        assert_eq!(quality(r"\b%c"), q(0, 1));
+        assert_eq!(quality("Console: %s"), q(7, 1));
+    }
+
+    #[test]
+    fn test_quality_order() {
+        let q = |alnum, punct| Quality { alnum, punct };
+        // Any amount of alphanumeric text beats punctuation, which only breaks a tie.
+        assert!(q(1, 0) > q(0, 10));
+        assert!(q(3, 2) > q(3, 1));
+        assert!(q(4, 0) > q(3, 9));
+        assert_eq!(q(1, 2) + q(3, 4), q(4, 6));
+        assert_eq!(q(1, 2).total(), 3);
+        assert_eq!(Quality::of_text("ünïcode, 42!"), q(9, 2));
     }
 
     #[test]
@@ -2298,6 +2469,17 @@ mod tests {
             (Cpp, r"\b%c", r"\x08%c"),
             (Cpp, r"\a\f\v\e", r"\x07\x0C\x0B\x1B"),
             (Cpp, r"\x41\x4a", "AJ"),
+            // C and C++ hex and octal escapes are bytes, so a run of them is UTF-8.
+            (Cpp, r"\xe2\x9c\x98 x", "✘ x"),
+            (C, r"\342\234\230 x", "✘ x"),
+            (Cpp, r"\xe2\234\x98\x41", "✘A"),
+            (Cpp, r"caf\xc3\xa9.", r"café\."),
+            // A byte that is not part of a character matches any character.
+            (Cpp, r"\xff x", ". x"),
+            (Cpp, r"\xe2\x9c! \xe2\x9c\x98", r".! ✘"),
+            // The other languages' escapes are characters.
+            (Rust, r"\xe9", "é"),
+            (Python, r"\xe9", "é"),
             (Cpp, r"\101\0", r"A\x00"),
             (Cpp, r#"\"quoted\" \\path\?"#, r#""quoted" \\path\?"#),
             (Cpp, r"\u00e9\U0001F600", "é😀"),

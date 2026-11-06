@@ -4,7 +4,7 @@
 
 use log2src::{
     extract_variables, LogMatchOptions, LogMatcher, LogRef, LogRefBuilder, ProgressTracker,
-    StatementRef,
+    Quality, StatementRef,
 };
 use rayon::prelude::*;
 use regex::RegexSet;
@@ -249,7 +249,7 @@ struct Line {
 }
 
 /// The path, line number, and quality of the statement a line matched, if any.
-type MatchResult = Option<(String, usize, usize)>;
+type MatchResult = Option<(String, usize, Quality)>;
 
 fn time<F: FnMut(&Line) -> MatchResult>(
     lines: &[Line],
@@ -269,7 +269,7 @@ fn time<F: FnMut(&Line) -> MatchResult>(
     (start.elapsed() / rounds as u32, results)
 }
 
-fn stmt_key(src_ref: StatementRef) -> (String, usize, usize) {
+fn stmt_key(src_ref: StatementRef) -> (String, usize, Quality) {
     (
         src_ref.source_path().to_string(),
         src_ref.line_no,
