@@ -117,6 +117,18 @@ pub(crate) struct QueryResult {
     pub category: Option<MessageCategory>,
 }
 
+/// A field of a `tracing` event, see [`SourceQuery::tracing_field`].
+struct TracingField {
+    /// The name that is printed, like `path` for `?path`.
+    name: String,
+    /// The expression for the value, without the `?` or `%`.
+    value: TSRange,
+    /// The whole field, like `token = t`.
+    range: TSRange,
+    /// Whether the value is printed with `Debug` or `Display`, instead of as a value.
+    formatted: bool,
+}
+
 impl QueryResult {
     /// The level of the log call.  A level constant passed as an argument, like
     /// `syslog(LOG_ERR, ...)`, takes precedence over the name of the call.
@@ -847,6 +859,255 @@ impl<'a> SourceQuery<'a> {
             .into_iter()
             .filter_map(|chain| self.append_chain_result(chain))
             .collect()
+    }
+
+    /// The Rust logging calls whose message is not the first argument, which the query can not
+    /// read, since the arguments of a macro are a flat list of tokens: the ones that start with
+    /// a `target:`, `parent:`, or `name:`, like `trace!(target: "gc", "saving last-use data")`,
+    /// and `tracing` events with fields, like `debug!(?path, includes, "load config from
+    /// file")`.  `tracing-subscriber` prints the fields after the message, separated by spaces,
+    /// like `load config from file path="/x" includes=true`, so each one adds a ` name={N}` to
+    /// the pattern, whose argument is the value of the field.  An event can have fields without
+    /// a message, like `debug!(pending)`, which prints `pending=3`.  Each message is followed by
+    /// its arguments, the ones for the format string and then the values of the fields, like
+    /// the results of the query.
+    pub(crate) fn tracing_events(&self) -> Vec<QueryResult> {
+        if self.source_language != SourceLanguage::Rust {
+            return vec![];
+        }
+        let mut calls = vec![];
+        Self::visit(self.tree.root_node(), &mut |node| {
+            if node.kind() == "macro_invocation" {
+                calls.push(node);
+            }
+        });
+        calls
+            .into_iter()
+            .filter_map(|call| self.tracing_event(call))
+            .flatten()
+            .collect()
+    }
+
+    /// The results for one logging call, see [`Self::tracing_events`], or None if the query
+    /// already reads it or it is not a logging call that is understood.
+    fn tracing_event(&self, call: Node) -> Option<Vec<QueryResult>> {
+        let macro_name = call.child_by_field_name("macro")?;
+        let call_name = &self.source[macro_name.byte_range()];
+        let base = call_name.rsplit("::").next()?;
+        if !matches!(
+            base,
+            "trace" | "debug" | "info" | "warn" | "error" | "event" | "log"
+        ) {
+            return None;
+        }
+        let mut cursor = call.walk();
+        let tree = call
+            .children(&mut cursor)
+            .find(|child| child.kind() == "token_tree")?;
+        let mut cursor = tree.walk();
+        let tokens: Vec<Node> = tree.children(&mut cursor).collect();
+        // The arguments, without the delimiters around them, split on commas.
+        let mut groups: Vec<Vec<Node>> = vec![vec![]];
+        for token in tokens.get(1..tokens.len().saturating_sub(1))? {
+            match token.kind() {
+                "," => groups.push(vec![]),
+                kind if kind.contains("comment") => {}
+                _ => groups.last_mut()?.push(*token),
+            }
+        }
+        if groups.last().is_some_and(Vec::is_empty) {
+            // A trailing comma.
+            groups.pop();
+        }
+        let mut groups = groups.iter().peekable();
+        let mut has_keyword = false;
+        while let Some([keyword, colon, ..]) = groups.peek().map(|group| group.as_slice()) {
+            let is_keyword = keyword.kind() == "identifier"
+                && colon.kind() == ":"
+                && matches!(
+                    &self.source[keyword.byte_range()],
+                    "target" | "parent" | "name"
+                );
+            if !is_keyword {
+                break;
+            }
+            has_keyword = true;
+            groups.next();
+        }
+        let mut leading_args = vec![];
+        if matches!(base, "event" | "log") {
+            // The level, like `Level::INFO`.
+            leading_args.push(self.group_text(groups.next()?).to_string());
+        }
+        let mut fields = vec![];
+        // The format string, as the contents of a string-literal, and the nodes it spans.
+        let mut message = None;
+        for group in groups.by_ref() {
+            match group.as_slice() {
+                [literal] if literal.kind() == "string_literal" => {
+                    let text = &self.source[literal.byte_range()];
+                    // Not a byte string or a raw string.
+                    let contents = text.strip_prefix('"')?.strip_suffix('"')?;
+                    message = Some((*literal, *literal, contents.to_string()));
+                    break;
+                }
+                // A format string built with `concat!`, like `concat!("a ", "{}")`.
+                [concat, bang, args]
+                    if &self.source[concat.byte_range()] == "concat"
+                        && bang.kind() == "!"
+                        && args.kind() == "token_tree" =>
+                {
+                    message = Some((*concat, *args, self.rust_concat_pattern(*args)?));
+                    break;
+                }
+                _ => fields.push(self.tracing_field(group)?),
+            }
+        }
+        if !has_keyword && fields.is_empty() {
+            // The query reads the ones that start with the message or the level.
+            return None;
+        }
+        let format_args: Vec<&Vec<Node>> = groups.collect();
+        let fields: Vec<TracingField> = fields.into_iter().flatten().collect();
+        let mut pattern = match &message {
+            Some((_, _, contents)) => contents.clone(),
+            None if fields.is_empty() || !format_args.is_empty() => return None,
+            None => String::new(),
+        };
+        for (index, field) in fields.iter().enumerate() {
+            if !pattern.is_empty() {
+                pattern.push(' ');
+            }
+            let name = field
+                .name
+                .replace('\\', "\\\\")
+                .replace('{', "{{")
+                .replace('}', "}}");
+            // An explicit index, since the format string can use the arguments in any order.
+            pattern.push_str(&format!("{name}={{{}}}", format_args.len() + index));
+        }
+        let range = match message {
+            Some((first, last, _)) => Self::span(first, last),
+            None => {
+                let first = fields.first()?;
+                let last = fields.last()?;
+                TSRange {
+                    start_byte: first.range.start_byte,
+                    start_point: first.range.start_point,
+                    end_byte: last.range.end_byte,
+                    end_point: last.range.end_point,
+                }
+            }
+        };
+        let anchor = message.map_or(call, |(first, _, _)| first);
+        let (name, qualified_name) = self.names(anchor);
+        let block_id = self.block_id(anchor);
+        let result = |kind: &str, range: TSRange, value_kind: ValueKind| QueryResult {
+            kind: kind.to_string(),
+            range,
+            name: name.clone(),
+            qualified_name: qualified_name.clone(),
+            block_id,
+            pattern: None,
+            args: vec![],
+            raw: false,
+            value_kind,
+            value_choices: vec![],
+            call_name: None,
+            leading_args: vec![],
+            arg_position: None,
+            concat_parts: vec![],
+            continuations: vec![],
+            category: None,
+        };
+        let mut retval = vec![QueryResult {
+            pattern: Some(pattern),
+            call_name: Some(call_name.to_string()),
+            leading_args,
+            ..result("string_literal", range, ValueKind::Any)
+        }];
+        for group in format_args {
+            let (first, last) = (group.first()?, group.last()?);
+            let range = Self::span(*first, *last);
+            let text = &self.source[first.start_byte()..last.end_byte()];
+            retval.push(result("args", range, ValueKind::from_rust_tokens(text)));
+        }
+        for field in fields {
+            let value_kind = if field.formatted {
+                ValueKind::Any
+            } else {
+                ValueKind::from_rust_tokens(
+                    &self.source[field.value.start_byte..field.value.end_byte],
+                )
+            };
+            retval.push(result("args", field.value, value_kind));
+        }
+        Some(retval)
+    }
+
+    /// The text of the tokens in a macro argument.
+    fn group_text(&self, group: &[Node]) -> &str {
+        match (group.first(), group.last()) {
+            (Some(first), Some(last)) => &self.source[first.start_byte()..last.end_byte()],
+            _ => "",
+        }
+    }
+
+    /// The range from the start of `first` to the end of `last`.
+    fn span(first: Node, last: Node) -> TSRange {
+        TSRange {
+            start_byte: first.start_byte(),
+            start_point: first.start_position(),
+            end_byte: last.end_byte(),
+            end_point: last.end_position(),
+        }
+    }
+
+    /// The field of a `tracing` event for the tokens of a macro argument, like `?path`,
+    /// `%name`, `count`, `self.len`, or `token = t`.  Returns `Some(None)` for a field that is
+    /// not printed, like `x = field::Empty`, and None for anything else, like an expression.
+    fn tracing_field(&self, group: &[Node]) -> Option<Option<TracingField>> {
+        let is_path = |nodes: &[Node]| {
+            !nodes.is_empty()
+                && nodes
+                    .iter()
+                    .all(|node| matches!(node.kind(), "identifier" | "self" | "."))
+        };
+        let sigil = |nodes: &[Node]| {
+            nodes
+                .first()
+                .is_some_and(|node| matches!(node.kind(), "?" | "%"))
+        };
+        let (name_nodes, value_nodes) = match group.iter().position(|node| node.kind() == "=") {
+            Some(eq) => (&group[..eq], &group[eq + 1..]),
+            None if sigil(group) => (&group[1..], group),
+            None => (group, group),
+        };
+        let name = match name_nodes {
+            [literal] if literal.kind() == "string_literal" => {
+                let text = &self.source[literal.byte_range()];
+                text.strip_prefix('"')?.strip_suffix('"')?
+            }
+            _ if is_path(name_nodes) => self.group_text(name_nodes),
+            _ => return None,
+        };
+        let formatted = sigil(value_nodes);
+        let value_nodes = if formatted {
+            &value_nodes[1..]
+        } else {
+            value_nodes
+        };
+        let (first, last) = (value_nodes.first()?, value_nodes.last()?);
+        let value = &self.source[first.start_byte()..last.end_byte()];
+        if value.rsplit("::").next() == Some("Empty") {
+            return Some(None);
+        }
+        Some(Some(TracingField {
+            name: name.strip_prefix("r#").unwrap_or(name).to_string(),
+            value: Self::span(*first, *last),
+            range: Self::span(*group.first()?, *last),
+            formatted,
+        }))
     }
 
     /// The character-literals that are glyphs, like the `U'\u2718'` that lnav returns as the

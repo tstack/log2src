@@ -160,7 +160,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "55")]
+    #[serde(rename = "56")]
     Current,
 }
 
@@ -727,7 +727,9 @@ impl SourceTree {
     }
 
     /// The source files that the file name in a log message refers to: the ones with that name,
-    /// or else the ones whose path contains it.
+    /// or else the ones whose path contains it, or else, for a path from another machine, like
+    /// the build directory in a `file!()`, the ones that share the longest trailing run of
+    /// components with it.
     fn files_named(&self, name: &str) -> Arc<[SourceFileID]> {
         if let Some(ids) = self
             .files_by_name
@@ -746,6 +748,9 @@ impl SourceTree {
                 .map(|sif| sif.id)
                 .collect(),
         };
+        if ids.is_empty() && Path::new(name).has_root() {
+            ids = self.files_with_path_suffix(name);
+        }
         ids.sort_unstable();
         let ids: Arc<[SourceFileID]> = ids.into();
         let mut cache = self
@@ -758,6 +763,37 @@ impl SourceTree {
             cache.clear();
         }
         cache.insert(name.to_string(), ids.clone());
+        ids
+    }
+
+    /// The source files that share the most trailing components with `path`, if they share at
+    /// least the file name, like the ones for an absolute path from the machine a log came from.
+    fn files_with_path_suffix(&self, path: &str) -> Vec<SourceFileID> {
+        let names: Vec<_> = Path::new(path)
+            .components()
+            .filter_map(|comp| match comp {
+                Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        let mut best = 0;
+        let mut ids = Vec::new();
+        for sif in self.files_with_statements.values() {
+            let matched = Path::new(&sif.path)
+                .components()
+                .rev()
+                .zip(names.iter().rev())
+                .take_while(|(comp, name)| comp.as_os_str() == **name)
+                .count();
+            if matched == 0 || matched < best {
+                continue;
+            }
+            if matched > best {
+                best = matched;
+                ids.clear();
+            }
+            ids.push(sif.id);
+        }
         ids
     }
 
@@ -3319,9 +3355,26 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                 Default::default()
             };
             let mut results = src_query.query(code.info.language.compiled_query(), None);
+            let queried = results.len();
+            // The query can read some of these too, like the start of
+            // `event!(Level::INFO, count, "...")`, so its reading of them is dropped.
+            let tracing_events = src_query.tracing_events();
+            let tracing_messages: HashSet<usize> = tracing_events
+                .iter()
+                .filter(|result| result.kind == "string_literal")
+                .map(|result| result.range.start_byte)
+                .collect();
             results.extend(src_query.append_chains());
             results.extend(src_query.glyph_literals());
-            for result in results {
+            results.extend(tracing_events);
+            for (index, result) in results.into_iter().enumerate() {
+                if index < queried
+                    && result.kind == "string_literal"
+                    && tracing_messages.contains(&result.range.start_byte)
+                {
+                    args_target = ArgsTarget::None;
+                    continue;
+                }
                 // println!("node.kind()={:?} range={:?}", result.kind, result.range);
                 match result.kind.as_str() {
                     "string_literal" | "string" | "concatenated_string" | "binary_expression" => {
@@ -4157,10 +4210,19 @@ class Dup {
         assert!(match_path("a/Dup.java", "count xyz")
             .unwrap()
             .ends_with("com/a/Dup.java"));
+        // An absolute path from another machine, like a build directory in a `file!()`, is
+        // the file that shares the most of its trailing components.
+        assert!(match_path("/build/tmp/src/com/b/Dup.java", "count is 3")
+            .unwrap()
+            .ends_with("com/b/Dup.java"));
+        assert!(match_path("/build/tmp/src/com/a/Dup.java", "count is 3")
+            .unwrap()
+            .ends_with("com/a/Dup.java"));
         // No statement is in a file that is not in the tree, like one in a library.
         assert_eq!(match_path("Other.java", "count is 3"), None);
+        assert_eq!(match_path("/build/tmp/src/Other.java", "count is 3"), None);
         let coll = matcher.roots.values().next().unwrap();
-        assert_eq!(coll.files_by_name.read().unwrap().len(), 3);
+        assert_eq!(coll.files_by_name.read().unwrap().len(), 6);
     }
 
     const SAME_TEXT_SRC: &str = r#"package com.example;
@@ -7581,6 +7643,107 @@ fn main() {
         assert_eq!(patterns, vec![r"(?s)^request (.*) done$"]);
         assert_eq!(src_refs[0].level, LogLevel::Info);
         assert_eq!(src_refs[0].vars, vec!["id"]);
+    }
+
+    #[test]
+    fn test_rust_tracing_events() {
+        let source = r#"
+fn main() {
+    trace!(target: "gc", "saving last-use data");
+    debug!(target: "net", "fetching {} from {url}", name);
+    tracing::debug!(?path, %why, includes, "load config from file");
+    trace!(token = t, count = ?self.items.len(), "finish");
+    debug!(target: "x", pending);
+    tracing::trace!(start = now().to_string());
+    info!(r#type = kind, "typed");
+    debug!(span = field::Empty, done, "with empty");
+    tracing::event!(Level::WARN, retries, "giving up");
+    tracing::event!(target: "y", tracing::Level::ERROR, "failed {}", code);
+    warn!(target: "z", concat!("joined ", "{}"), v);
+    info!("plain {}", x);
+    debug!(1 + 2, "not a field");
+}
+"#;
+        let code = CodeSource::from_string(&PathBuf::from("in-mem.rs"), source);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let mut stmts: Vec<_> = sif.log_statements.iter().collect();
+        stmts.sort_by_key(|stmt| stmt.line_no);
+        let actual: Vec<(&str, LogLevel, Vec<&str>)> = stmts
+            .iter()
+            .map(|stmt| (stmt.pattern().as_str(), stmt.level, stmt.arg_exprs()))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (r"(?s)^saving last-use data$", LogLevel::Trace, vec![]),
+                (
+                    r"(?s)^fetching (.*) from (.*)$",
+                    LogLevel::Debug,
+                    vec!["name", "url"]
+                ),
+                (
+                    r"(?s)^load config from file path=(.*) why=(.*) includes=(.*)$",
+                    LogLevel::Debug,
+                    vec!["path", "why", "includes"]
+                ),
+                (
+                    r"(?s)^finish token=(.*) count=(.*)$",
+                    LogLevel::Trace,
+                    vec!["t", "self.items.len()"]
+                ),
+                (r"(?s)^pending=(.*)$", LogLevel::Debug, vec!["pending"]),
+                (
+                    r"(?s)^start=(.*)$",
+                    LogLevel::Trace,
+                    vec!["now().to_string()"]
+                ),
+                (r"(?s)^typed type=(.*)$", LogLevel::Info, vec!["kind"]),
+                (r"(?s)^with empty done=(.*)$", LogLevel::Debug, vec!["done"]),
+                (
+                    r"(?s)^giving up retries=(.*)$",
+                    LogLevel::Warn,
+                    vec!["retries"]
+                ),
+                (r"(?s)^failed (.*)$", LogLevel::Error, vec!["code"]),
+                (r"(?s)^joined (.*)$", LogLevel::Warn, vec!["v"]),
+                (r"(?s)^plain (.*)$", LogLevel::Info, vec!["x"]),
+            ]
+        );
+
+        // The values of the fields are the variables, as `tracing-subscriber` prints them.
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("main.rs"), source).unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let match_message = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            let mapping = matcher.match_log_statement(&log_ref, &LogMatchOptions::default())?;
+            Some((
+                mapping.src_ref?.line_no,
+                mapping
+                    .variables
+                    .into_iter()
+                    .map(|var| (var.expr, var.value))
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        let pairs = |vars: &[(&str, &str)]| -> Vec<(String, String)> {
+            vars.iter()
+                .map(|(expr, value)| (expr.to_string(), value.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            match_message(r#"load config from file path="/a/b" why=Cli includes=true"#),
+            Some((
+                5,
+                pairs(&[("path", r#""/a/b""#), ("why", "Cli"), ("includes", "true")])
+            ))
+        );
+        assert_eq!(
+            match_message("pending=3"),
+            Some((7, pairs(&[("pending", "3")])))
+        );
     }
 
     #[test]
