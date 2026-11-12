@@ -223,7 +223,12 @@ fn is_logging_word(word: &str) -> bool {
         "logout",
         "prolog",
     ];
-    (word.contains("log") && !word.contains("ology") && !NOT_LOGGING.contains(&word))
+    // A plural, like `dialogs`, is not logging either.
+    let singular = word.strip_suffix('s').unwrap_or(word);
+    (word.contains("log")
+        && !word.contains("ology")
+        && !NOT_LOGGING.contains(&word)
+        && !NOT_LOGGING.contains(&singular))
         // `ll` is short for "log level", like Redis's `LL_WARNING`.
         || matches!(word, "level" | "lvl" | "ll" | "tracing")
 }
@@ -385,14 +390,9 @@ impl MessageCategory {
                 _ => MessageCategory::Other,
             },
             SourceLanguage::C | SourceLanguage::Cpp => MessageCategory::Other,
-            SourceLanguage::Python => match Self::short_call_name(src_ref) {
-                // a level that is not known until runtime, like `logger.log(lvl, "...")`
-                "log" => MessageCategory::Log,
-                _ => MessageCategory::Other,
-            },
             // The other Java calls with a message are methods of a builder, like the `append`
             // in `new StringBuilder().append("...")`.
-            SourceLanguage::Java => match Self::short_call_name(src_ref) {
+            SourceLanguage::Python | SourceLanguage::Java => match Self::short_call_name(src_ref) {
                 // a level that is not known until runtime, like `logger.log(lvl, "...")`
                 "log" => MessageCategory::Log,
                 _ => MessageCategory::Other,
@@ -665,36 +665,51 @@ pub struct Statement {
     /// continuations.  See `Statement::join()`.
     #[serde(skip)]
     pub continuations: Vec<Continuation>,
-    /// The regex used to match log messages, built from `segments`.  This, and the rest of the
-    /// fields below, are only computed when needed since most statements are never matched.
+    /// The matchers built from `segments`, `choices`, and the arguments.
     #[serde(skip)]
-    pattern: OnceLock<Regex>,
-    /// `kinds` refined by the argument expressions.
-    #[serde(skip)]
-    value_kinds: OnceLock<Vec<ValueKind>>,
-    #[serde(skip)]
-    segment_matchers: OnceLock<Option<Vec<Regex>>>,
-    #[serde(skip)]
-    lazy_matcher: OnceLock<Option<Regex>>,
-    #[serde(skip)]
-    separators: OnceLock<Option<Vec<Regex>>>,
-    #[serde(skip)]
-    non_empty_matcher: OnceLock<Option<Regex>>,
-    #[serde(skip)]
-    choice_matchers: OnceLock<Option<Vec<Option<Regex>>>>,
-    /// `pattern` with each run of whitespace in the literal text matching any whitespace, for
-    /// text whose whitespace was changed, like a message copied from a GUI that wrapped it.
-    /// None if `pattern` already matches the same text, see `relaxed_pattern()`.
-    #[serde(skip)]
-    relaxed_pattern: OnceLock<Option<Regex>>,
-    /// The literal text before the first placeholder, see `leading_literal()`.
-    #[serde(skip)]
-    leading_literal: OnceLock<Option<String>>,
+    lazy: LazyMatchers,
     /// For a Java message that is a concatenation with a piece that could be a constant, the
     /// pieces, which `extract_logging_guarded()` moves out to resolve the constants later, see
     /// [`ConcatPart`].
     #[serde(skip)]
     pub(crate) concat: Vec<ConcatPart>,
+}
+
+/// The matchers of a `Statement` that are built from its message the first time they are
+/// needed, since most statements are never matched.  They depend on the segments, choices, and
+/// arguments, so they have to be reset when any of those change.
+#[derive(Debug, Default)]
+struct LazyMatchers {
+    /// The regex used to match log messages, built from `segments`.
+    pattern: OnceLock<Regex>,
+    /// `kinds` refined by the argument expressions.
+    value_kinds: OnceLock<Vec<ValueKind>>,
+    segment_matchers: OnceLock<Option<Vec<Regex>>>,
+    lazy_matcher: OnceLock<Option<Regex>>,
+    separators: OnceLock<Option<Vec<Regex>>>,
+    non_empty_matcher: OnceLock<Option<Regex>>,
+    choice_matchers: OnceLock<Option<Vec<Option<Regex>>>>,
+    /// `pattern` with each run of whitespace in the literal text matching any whitespace, for
+    /// text whose whitespace was changed, like a message copied from a GUI that wrapped it.
+    /// None if `pattern` already matches the same text, see `relaxed_pattern()`.
+    relaxed_pattern: OnceLock<Option<Regex>>,
+    /// The literal text before the first placeholder, see `leading_literal()`.
+    leading_literal: OnceLock<Option<String>>,
+}
+
+/// The index in `vars` of the expression for each argument, in the order the placeholders
+/// appear in the message, or None for a `FormatArgument::Named` argument, which has its own
+/// expression.
+fn var_indices(args: &[FormatArgument]) -> impl Iterator<Item = Option<usize>> + '_ {
+    let mut placeholder_index = 0;
+    args.iter().map(move |arg| match arg {
+        FormatArgument::Named(_) => None,
+        FormatArgument::Positional(pos) => Some(*pos),
+        FormatArgument::Placeholder => {
+            placeholder_index += 1;
+            Some(placeholder_index - 1)
+        }
+    })
 }
 
 struct MessageMatcher {
@@ -746,14 +761,12 @@ impl Statement {
         } else {
             0
         };
-        let start = range.start_byte + prefix_len + 1;
-        let mut end = range.end_byte - 1;
-        if start == range.end_byte {
-            end = range.end_byte;
-        }
         let unquoted = if let Some(pat) = result.pattern {
             pat
         } else {
+            // Leave out the quotes, if the node is long enough to have both.
+            let start = (range.start_byte + prefix_len + 1).min(range.end_byte);
+            let end = range.end_byte.saturating_sub(1).max(start);
             source[start..end].to_string()
         };
         if let Some(MessageMatcher {
@@ -786,7 +799,6 @@ impl Statement {
                 category_from_use: result_category.is_some(),
                 call_name,
                 quality,
-                pattern: OnceLock::new(),
                 args,
                 arg_kinds,
                 vars: vec![],
@@ -799,14 +811,7 @@ impl Statement {
                 arg_position: result.arg_position.and_then(|pos| u32::try_from(pos).ok()),
                 call_chain: vec![],
                 continuations,
-                value_kinds: OnceLock::new(),
-                segment_matchers: OnceLock::new(),
-                lazy_matcher: OnceLock::new(),
-                separators: OnceLock::new(),
-                non_empty_matcher: OnceLock::new(),
-                choice_matchers: OnceLock::new(),
-                relaxed_pattern: OnceLock::new(),
-                leading_literal: OnceLock::new(),
+                lazy: LazyMatchers::default(),
                 concat: result.concat_parts,
             };
             if quality.is_zero() {
@@ -862,7 +867,6 @@ impl Statement {
             category_from_use: false,
             call_name: message_ref.call_name.clone(),
             quality,
-            pattern: OnceLock::new(),
             arg_kinds: vec![ValueKind::Any; args.len()],
             args,
             vars: message_ref.vars.clone(),
@@ -875,14 +879,7 @@ impl Statement {
             arg_position: None,
             call_chain: vec![],
             continuations: vec![],
-            value_kinds: OnceLock::new(),
-            segment_matchers: OnceLock::new(),
-            lazy_matcher: OnceLock::new(),
-            separators: OnceLock::new(),
-            non_empty_matcher: OnceLock::new(),
-            choice_matchers: OnceLock::new(),
-            relaxed_pattern: OnceLock::new(),
-            leading_literal: OnceLock::new(),
+            lazy: LazyMatchers::default(),
             concat: vec![],
         })
     }
@@ -896,37 +893,36 @@ impl Statement {
         if var_choices.iter().all(Vec::is_empty) {
             return;
         }
-        let mut placeholder_index = 0;
-        let choices: Vec<Vec<String>> = self
-            .args
-            .iter()
+        let choices: Vec<Vec<String>> = var_indices(&self.args)
             .enumerate()
-            .map(|(index, arg)| {
-                let var = match arg {
-                    FormatArgument::Named(_) => None,
-                    FormatArgument::Positional(pos) => Some(*pos),
-                    FormatArgument::Placeholder => {
-                        placeholder_index += 1;
-                        Some(placeholder_index - 1)
-                    }
-                };
-                match var.and_then(|var| var_choices.get(var)) {
+            .map(
+                |(index, var)| match var.and_then(|var| var_choices.get(var)) {
                     Some(choices) if plain.get(index).copied().unwrap_or(false) => choices.clone(),
                     _ => vec![],
-                }
-            })
+                },
+            )
             .collect();
+        self.apply_choices(choices);
+    }
+
+    /// Use `choices` for the placeholders, if any of them has some, and add the literal text of
+    /// the shortest choice of each to the quality, since every match has it.  The choices are
+    /// left out if the pattern with them does not parse.  The lazily built matchers are reset
+    /// since they depend on the choices.
+    fn apply_choices(&mut self, choices: Vec<Vec<String>>) {
         if choices.iter().all(Vec::is_empty) {
             return;
         }
-        self.quality += choices
+        let extra: Quality = choices
             .iter()
             .filter_map(|choices| choices.iter().map(|c| literal_quality(c)).min())
-            .sum::<Quality>();
+            .sum();
         self.choices = choices;
-        self.pattern = OnceLock::new();
-        if !is_valid_pattern(&self.pattern_source()) {
-            // Too big, maybe, so fall back to the pattern without the choices.
+        self.lazy = LazyMatchers::default();
+        if is_valid_pattern(&self.pattern_source()) {
+            self.quality += extra;
+        } else {
+            // The pattern without the choices was valid, so fall back to it.
             self.choices.clear();
         }
     }
@@ -960,15 +956,7 @@ impl Statement {
             arg_position: None,
             call_chain: self.call_chain.clone(),
             continuations: self.continuations.clone(),
-            pattern: OnceLock::new(),
-            value_kinds: OnceLock::new(),
-            segment_matchers: OnceLock::new(),
-            lazy_matcher: OnceLock::new(),
-            separators: OnceLock::new(),
-            non_empty_matcher: OnceLock::new(),
-            choice_matchers: OnceLock::new(),
-            relaxed_pattern: OnceLock::new(),
-            leading_literal: OnceLock::new(),
+            lazy: LazyMatchers::default(),
             concat: vec![],
         }
     }
@@ -1046,44 +1034,20 @@ impl Statement {
         if prior.choices.iter().all(Vec::is_empty) {
             return;
         }
-        let var_of = |args: &[FormatArgument]| -> Vec<Option<usize>> {
-            let mut placeholder_index = 0;
-            args.iter()
-                .map(|arg| match arg {
-                    FormatArgument::Named(_) => None,
-                    FormatArgument::Positional(pos) => Some(*pos),
-                    FormatArgument::Placeholder => {
-                        placeholder_index += 1;
-                        Some(placeholder_index - 1)
-                    }
-                })
-                .collect()
-        };
         let mut by_var = std::collections::HashMap::new();
-        for (var, choices) in var_of(&prior.args).into_iter().zip(&prior.choices) {
+        for (var, choices) in var_indices(&prior.args).zip(&prior.choices) {
             if let Some(var) = var {
                 by_var.entry(var).or_insert(choices);
             }
         }
-        let choices: Vec<Vec<String>> = var_of(&self.args)
-            .into_iter()
+        let choices: Vec<Vec<String>> = var_indices(&self.args)
             .map(|var| {
                 var.and_then(|var| by_var.get(&var))
                     .map(|choices| (*choices).clone())
                     .unwrap_or_default()
             })
             .collect();
-        if choices.iter().all(Vec::is_empty) {
-            return;
-        }
-        self.quality += choices
-            .iter()
-            .filter_map(|choices| choices.iter().map(|c| literal_quality(c)).min())
-            .sum::<Quality>();
-        self.choices = choices;
-        if !is_valid_pattern(&self.pattern_source()) {
-            self.choices.clear();
-        }
+        self.apply_choices(choices);
     }
 
     /// Derive a statement for this call from the statement that prints its message in the
@@ -1098,8 +1062,8 @@ impl Statement {
     pub(crate) fn splice(&self, splice: &Splice) -> Option<Statement> {
         let inner = splice.inner;
         if splice.placeholder >= inner.kinds.len()
-            || inner.segments.len() != inner.kinds.len() + 1
-            || self.segments.len() != self.kinds.len() + 1
+            || !inner.is_well_formed()
+            || !self.is_well_formed()
         {
             return None;
         }
@@ -1207,8 +1171,7 @@ impl Statement {
     /// `pr_cont("to %s %s %dx%d\n", ...)` after `pr_info("Console: switching ")`.  The
     /// location is this statement's, and the continuations are listed in `continuations`.
     pub(crate) fn join(&self, conts: &[&Statement]) -> Option<Statement> {
-        let well_formed = |stmt: &Statement| stmt.segments.len() == stmt.kinds.len() + 1;
-        if !well_formed(self) || !conts.iter().all(|cont| well_formed(cont)) {
+        if !self.is_well_formed() || !conts.iter().all(|cont| cont.is_well_formed()) {
             return None;
         }
         let mut segments = self.segments.clone();
@@ -1345,7 +1308,7 @@ impl Statement {
     /// The regex used to match log messages to this statement.  It is compiled the first time
     /// it is needed, like after the statement is loaded from the cache.
     pub fn pattern(&self) -> &Regex {
-        self.pattern.get_or_init(|| {
+        self.lazy.pattern.get_or_init(|| {
             // The pattern was checked when the statement was extracted, but it could still be
             // too big to compile, and then the statement cannot match anything.
             Regex::new(&self.pattern_source())
@@ -1359,7 +1322,8 @@ impl Statement {
     /// only have single spaces, which already match collapsed text, so `pattern()` is used for
     /// those rather than compiling another regex for every statement.
     pub fn relaxed_pattern(&self) -> &Regex {
-        self.relaxed_pattern
+        self.lazy
+            .relaxed_pattern
             .get_or_init(|| {
                 let mut segments: Vec<String> = self
                     .segments
@@ -1403,7 +1367,8 @@ impl Statement {
     /// that matches from the start of any text anyway.  It is found the first time it is needed.
     pub(crate) fn leading_literal(&self) -> Option<&str> {
         use regex_syntax::hir::HirKind;
-        self.leading_literal
+        self.lazy
+            .leading_literal
             .get_or_init(|| {
                 let segment = self
                     .segments
@@ -1426,7 +1391,7 @@ impl Statement {
     /// The source of `pattern()`, which does not need to compile it.  It is borrowed from the
     /// regex if that was already compiled.
     pub fn pattern_source(&self) -> Cow<'_, str> {
-        match self.pattern.get() {
+        match self.lazy.pattern.get() {
             Some(pattern) => Cow::Borrowed(pattern.as_str()),
             None => Cow::Owned(value_kind::pattern_source(&self.segments, &self.choices)),
         }
@@ -1441,21 +1406,21 @@ impl Statement {
                 self.var_kinds.get(index).copied().unwrap_or(ValueKind::Any),
             )
         };
-        let mut placeholder_index = 0;
-        self.args
-            .iter()
+        std::iter::zip(&self.args, var_indices(&self.args))
             .enumerate()
-            .map(move |(index, arg)| match arg {
-                FormatArgument::Named(name) => (
+            .map(move |(index, (arg, var_index))| match (arg, var_index) {
+                (FormatArgument::Named(name), _) => (
                     name.as_str(),
                     self.arg_kinds.get(index).copied().unwrap_or(ValueKind::Any),
                 ),
-                FormatArgument::Positional(pos) => var(*pos),
-                FormatArgument::Placeholder => {
-                    placeholder_index += 1;
-                    var(placeholder_index - 1)
-                }
+                (_, var_index) => var_index.map_or(("<unknown>", ValueKind::Any), var),
             })
+    }
+
+    /// Check if there is a placeholder between each pair of segments and an argument for each
+    /// placeholder, which `splice()` and `join()` need to line them up.
+    fn is_well_formed(&self) -> bool {
+        self.segments.len() == self.kinds.len() + 1 && self.args.len() == self.kinds.len()
     }
 
     /// The argument expressions for each placeholder, in the order the placeholders appear in
@@ -1468,7 +1433,7 @@ impl Statement {
     /// the spec does not have a kind, the argument expression.  These are computed the first
     /// time they are needed and then cached.
     pub(crate) fn value_kinds(&self) -> &[ValueKind] {
-        self.value_kinds.get_or_init(|| {
+        self.lazy.value_kinds.get_or_init(|| {
             std::iter::zip(&self.kinds, self.resolved_args())
                 .map(|(kind, (_, expr_kind))| match kind {
                     ValueKind::Any => expr_kind,
@@ -1480,28 +1445,32 @@ impl Statement {
 
     /// Anchored regexes for the literal text before, between, and after the placeholders.
     pub(crate) fn segment_matchers(&self) -> Option<&[Regex]> {
-        self.segment_matchers
+        self.lazy
+            .segment_matchers
             .get_or_init(|| value_kind::compile_segments(&self.segments))
             .as_deref()
     }
 
     /// Anchored regexes for the choices of each placeholder, see `choices`.
     pub(crate) fn choice_matchers(&self) -> Option<&[Option<Regex>]> {
-        self.choice_matchers
+        self.lazy
+            .choice_matchers
             .get_or_init(|| value_kind::compile_choices(&self.choices))
             .as_deref()
     }
 
     /// A matcher like `pattern`, but with lazy captures.
     pub(crate) fn lazy_matcher(&self) -> Option<&Regex> {
-        self.lazy_matcher
+        self.lazy
+            .lazy_matcher
             .get_or_init(|| value_kind::compile_matcher(&self.segments, &self.choices, "(.*?)"))
             .as_ref()
     }
 
     /// Unanchored regexes for the literal text after each placeholder.
     pub(crate) fn separators(&self) -> Option<&[Regex]> {
-        self.separators
+        self.lazy
+            .separators
             .get_or_init(|| value_kind::compile_separators(&self.segments))
             .as_deref()
     }
@@ -1555,7 +1524,8 @@ impl Statement {
         if self.kinds.is_empty() {
             return self.pattern().is_match(body);
         }
-        self.non_empty_matcher
+        self.lazy
+            .non_empty_matcher
             .get_or_init(|| value_kind::compile_matcher(&self.segments, &self.choices, "(.+)"))
             .as_ref()
             .is_some_and(|matcher| matcher.is_match(body))
@@ -2242,6 +2212,18 @@ mod tests {
         for (name, expected) in cases {
             assert_eq!(LogLevel::from_name(name), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn test_is_logging_word() {
+        assert!(is_logging_word("log"));
+        assert!(is_logging_word("logs"));
+        assert!(is_logging_word("logger"));
+        assert!(!is_logging_word("dialog"));
+        assert!(!is_logging_word("dialogs"));
+        assert!(!is_logging_word("catalogs"));
+        assert!(!is_logging_word("logins"));
+        assert_eq!(LogLevel::from_name("dialogs.error"), None);
     }
 
     #[test]
