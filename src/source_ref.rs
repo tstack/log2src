@@ -235,7 +235,7 @@ fn is_logging_word(word: &str) -> bool {
 
 /// Split an identifier into lowercase words on underscores and case changes, so `log_debug`,
 /// `logDebug`, `LogDebug`, and `LOG_DEBUG` all become `["log", "debug"]`.
-fn split_words(ident: &str) -> Vec<String> {
+pub(crate) fn split_words(ident: &str) -> Vec<String> {
     let chars: Vec<char> = ident.chars().collect();
     let mut words = Vec::new();
     let mut word = String::new();

@@ -6,7 +6,9 @@ use tree_sitter::{
     InputEdit, Node, Parser, Point, Query, QueryCursor, Range as TSRange, StreamingIterator, Tree,
 };
 
-use crate::source_ref::{ArgCounter, FormatArgument, LogLevel, MessageCategory, Substitution};
+use crate::source_ref::{
+    split_words, ArgCounter, FormatArgument, LogLevel, MessageCategory, Substitution,
+};
 use crate::value_kind::{self, ValueKind};
 use crate::wrappers::MacroWrapper;
 use crate::{CodeSource, SourceLanguage};
@@ -115,6 +117,19 @@ pub(crate) struct QueryResult {
     /// The category of the statement, if it is known from where the message is used, instead
     /// of from `call_name`, see `MessageCategory::classify()`.
     pub category: Option<MessageCategory>,
+}
+
+/// How a Python message variable is used, see [`SourceQuery::python_message_var_use`].
+struct VarUse<'a> {
+    /// The argument of the call that the variable is passed to, if it is.
+    arg: Option<Node<'a>>,
+    /// The name of the call, or `return` for a returned message.
+    call_name: Option<String>,
+    /// The category, if it comes from the use instead of the call.
+    category: Option<MessageCategory>,
+    /// The expression that formats the message, if it is a template, like `msg % (a, b)` or
+    /// `msg.format(a)`.
+    formatter: Option<Node<'a>>,
 }
 
 /// A field of a `tracing` event, see [`SourceQuery::tracing_field`].
@@ -755,8 +770,14 @@ impl<'a> SourceQuery<'a> {
                     if self.source_language == SourceLanguage::Python
                         && matches!(child.kind(), "string" | "concatenated_string")
                     {
-                        let (pattern, args) =
-                            self.python_pattern(child, Self::has_python_format_args(child));
+                        let format_args = Self::has_python_format_args(child);
+                        let (pattern, args) = self.python_pattern(child, format_args);
+                        // Mapping keys formatted by `logging`, like
+                        // `logger.info("%(user)s left", {"user": name})`.
+                        let (pattern, args) = format_args
+                            .then(|| self.python_logging_mapping(child, &pattern))
+                            .flatten()
+                            .unwrap_or((pattern, args));
                         results[qr_index].pattern = Some(pattern);
                         results[qr_index].args = args;
                     }
@@ -859,6 +880,364 @@ impl<'a> SourceQuery<'a> {
             .into_iter()
             .filter_map(|chain| self.append_chain_result(chain))
             .collect()
+    }
+
+    /// The Python messages that are put in a variable before they are used, like
+    /// `msg = "port %s is in use" % port` followed by `log.error(msg)` or `alert(code, msg)`.
+    /// The query only reads a message that is written in the call.  Strings are put in
+    /// variables for all sorts of reasons, like paths and SQL, so only the ones whose variable
+    /// is later passed to a logging call or an exception are kept, or to any call when the
+    /// name of the variable or keyword looks like a message, like `msg` or `msg=`.  A variable
+    /// whose name looks like a message is also kept when it is used in some other way, like
+    /// `return msg` or `{"msg": msg}`, since it is probably shown to someone, and so is an
+    /// attribute like `self.message`, which an exception or a result could show later.  Each
+    /// message is followed by the arguments of the call that formats it, if it has any.
+    pub(crate) fn python_message_vars(&self) -> Vec<QueryResult> {
+        if self.source_language != SourceLanguage::Python {
+            return vec![];
+        }
+        let mut assignments = vec![];
+        Self::visit(self.tree.root_node(), &mut |node| {
+            if node.kind() == "assignment"
+                && node.parent().map(|p| p.kind()) == Some("expression_statement")
+                && node.child_by_field_name("type").is_none()
+                && node
+                    .child_by_field_name("left")
+                    .is_some_and(|left| Self::is_python_var(left))
+            {
+                assignments.push(node);
+            }
+        });
+        assignments
+            .into_iter()
+            .filter_map(|assignment| self.python_message_var(assignment))
+            .flatten()
+            .collect()
+    }
+
+    /// Check if a Python assignment target is a variable that can be followed, like `msg` or
+    /// `self.msg`.
+    fn is_python_var(node: Node) -> bool {
+        match node.kind() {
+            "identifier" => true,
+            "attribute" => node
+                .child_by_field_name("object")
+                .is_some_and(|object| object.kind() == "identifier"),
+            _ => false,
+        }
+    }
+
+    /// Check if the name of a Python variable or keyword argument looks like it holds a
+    /// message, like `msg`, `err_msg`, or `errorMessage`.  The last word has to be about a
+    /// message, since a name like `error_file` or `REASON_CC_DELETED` is something else.
+    fn is_python_message_name(name: &str) -> bool {
+        split_words(name).last().is_some_and(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "msg" | "message" | "errmsg" | "err" | "error" | "reason" | "warning"
+            )
+        })
+    }
+
+    /// The pattern for a Python message with mapping keys that the `logging` module formats
+    /// with the only argument, like `logger.info("%(user)s left", {"user": name})`.  The
+    /// `template` is the message with its placeholders as written.
+    fn python_logging_mapping(&self, message: Node, template: &str) -> Option<(String, Vec<Arg>)> {
+        if !template.contains("%(") {
+            return None;
+        }
+        let mut values = vec![];
+        let mut next = message.next_named_sibling();
+        while let Some(arg) = next {
+            match arg.kind() {
+                "keyword_argument" | "comment" => {}
+                "dictionary_splat" | "list_splat" => return None,
+                _ => values.push(arg),
+            }
+            next = arg.next_named_sibling();
+        }
+        match values[..] {
+            [mapping] => {
+                self.python_mapping_pattern(template, Self::python_unparenthesize(mapping))
+            }
+            _ => None,
+        }
+    }
+
+    /// The results for one assignment, see [`Self::python_message_vars`].
+    fn python_message_var(&self, assignment: Node<'a>) -> Option<Vec<QueryResult>> {
+        let left = assignment.child_by_field_name("left")?;
+        let value = Self::python_unparenthesize(assignment.child_by_field_name("right")?);
+        if !(Self::is_python_string(value) || matches!(value.kind(), "binary_operator" | "call")) {
+            return None;
+        }
+        let var_use = self.python_message_var_use(assignment, left)?;
+        // Only a message passed as a positional argument is formatted again by the call.
+        let format_args = var_use.arg.is_some_and(|arg| {
+            arg.kind() != "keyword_argument" && Self::has_python_format_args(arg)
+        });
+        let (pattern, args) = if let Some(formatter) = var_use.formatter {
+            // A template that is formatted where it is used.
+            if !Self::is_python_string(value) {
+                return None;
+            }
+            if formatter.kind() == "binary_operator" {
+                self.python_percent_parts(
+                    value,
+                    formatter.child_by_field_name("right")?,
+                    format_args,
+                )?
+            } else {
+                self.python_format_parts(
+                    value,
+                    formatter.child_by_field_name("arguments")?,
+                    format_args,
+                )?
+            }
+        } else if Self::is_python_string(value) {
+            let (pattern, args, interpolated) = self.python_template(value, format_args);
+            // A string without any formatting of its own is only a message if it has some
+            // literal text, so not an empty string or a separator.
+            if !interpolated && !pattern.chars().any(char::is_alphabetic) {
+                return None;
+            }
+            match var_use.arg.filter(|_| format_args && !interpolated) {
+                Some(arg) => self
+                    .python_logging_mapping(arg, &pattern)
+                    .unwrap_or((pattern, vec![])),
+                None if interpolated => (pattern, args),
+                None => (pattern, vec![]),
+            }
+        } else {
+            self.python_expr_pattern(value, format_args)?
+        };
+        let anchor = Self::statement_anchor(assignment);
+        let (name, qualified_name) = self.names(anchor);
+        let block_id = self.block_id(anchor);
+        let mut retval = vec![QueryResult {
+            kind: "string".to_string(),
+            range: value.range(),
+            name: name.clone(),
+            qualified_name: qualified_name.clone(),
+            block_id,
+            pattern: Some(pattern),
+            args,
+            raw: false,
+            value_kind: ValueKind::Any,
+            value_choices: vec![],
+            call_name: var_use.call_name,
+            leading_args: var_use
+                .arg
+                .map_or_else(Vec::new, |arg| self.leading_args(arg)),
+            arg_position: None,
+            concat_parts: vec![],
+            continuations: vec![],
+            category: var_use.category,
+        }];
+        if let Some(use_arg) = var_use
+            .arg
+            .filter(|_| format_args && var_use.formatter.is_none() && Self::is_python_string(value))
+        {
+            // The arguments that the logging call formats the message with, like the `port` in
+            // `log.error(msg, port)`.
+            let mut next = use_arg.next_named_sibling();
+            while let Some(arg) = next {
+                if !matches!(
+                    arg.kind(),
+                    "keyword_argument" | "dictionary_splat" | "comment"
+                ) {
+                    retval.push(QueryResult {
+                        kind: "args".to_string(),
+                        range: arg.range(),
+                        name: name.clone(),
+                        qualified_name: qualified_name.clone(),
+                        block_id,
+                        pattern: None,
+                        args: vec![],
+                        raw: false,
+                        value_kind: self.value_kind(arg),
+                        value_choices: value_kind::value_choices(
+                            self.source_language,
+                            arg,
+                            self.source,
+                        ),
+                        call_name: None,
+                        leading_args: vec![],
+                        arg_position: None,
+                        concat_parts: vec![],
+                        continuations: vec![],
+                        category: None,
+                    });
+                }
+                next = arg.next_named_sibling();
+            }
+        }
+        Some(retval)
+    }
+
+    /// Find how a Python message variable is used, see [`Self::python_message_vars`].  A
+    /// logging call is preferred over an exception, which is preferred over another call,
+    /// which is preferred over any other use of a variable whose name looks like a message.
+    fn python_message_var_use(&self, assignment: Node<'a>, left: Node<'a>) -> Option<VarUse<'a>> {
+        let var_name = &self.source[left.byte_range()];
+        let is_attribute = left.kind() == "attribute";
+        let last_name = var_name.rsplit('.').next().unwrap_or(var_name);
+        let message_name = Self::is_python_message_name(last_name);
+        // The function that a variable is local to, or the module.  An attribute of `self` can
+        // be used by any method of the class.
+        let object = left
+            .child_by_field_name("object")
+            .map(|object| &self.source[object.byte_range()]);
+        let scope_kinds: &[&str] = if matches!(object, Some("self" | "cls")) {
+            &["class_definition"]
+        } else {
+            &["function_definition", "lambda"]
+        };
+        let mut scope = assignment;
+        while let Some(parent) = scope.parent() {
+            scope = parent;
+            if scope_kinds.contains(&scope.kind()) {
+                break;
+            }
+        }
+        let mut best: Option<(u8, VarUse<'a>)> = None;
+        Self::visit(scope, &mut |node| {
+            if node.kind() != left.kind()
+                || node == left
+                || (!is_attribute && node.start_byte() < assignment.end_byte())
+                || &self.source[node.byte_range()] != var_name
+                || best.as_ref().is_some_and(|(rank, _)| *rank == 0)
+                || !self.is_python_read(node)
+            {
+                return;
+            }
+            let Some((rank, var_use)) = self.python_var_use_rank(node, message_name) else {
+                return;
+            };
+            if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+                best = Some((rank, var_use));
+            }
+        });
+        match best {
+            Some((_, var_use)) => Some(var_use),
+            // An attribute that is not used here, like the message of an exception that is
+            // shown by whatever catches it.
+            None if is_attribute && message_name => Some(VarUse {
+                arg: None,
+                call_name: None,
+                category: Some(MessageCategory::Format),
+                formatter: None,
+            }),
+            None => None,
+        }
+    }
+
+    /// Check if a Python name or attribute is read, instead of being assigned to, or being the
+    /// name of a keyword or of an attribute of something else, like the `msg` in `msg=x` or
+    /// `alert.msg`.
+    fn is_python_read(&self, node: Node) -> bool {
+        let Some(parent) = node.parent() else {
+            return true;
+        };
+        let field_is = |field: &str| parent.child_by_field_name(field) == Some(node);
+        match parent.kind() {
+            "assignment" | "augmented_assignment" => !field_is("left"),
+            "keyword_argument" | "default_parameter" | "typed_default_parameter" => {
+                !field_is("name")
+            }
+            "attribute" => !field_is("attribute"),
+            "parameters" | "lambda_parameters" => false,
+            _ => true,
+        }
+    }
+
+    /// How a read of a Python message variable uses it, with a rank for how likely it is to
+    /// be shown, lowest first, see [`Self::python_message_var_use`].
+    fn python_var_use_rank(&self, node: Node<'a>, message_name: bool) -> Option<(u8, VarUse<'a>)> {
+        // A template that is formatted here, like `msg % (a, b)` or `msg.format(a)`, in which
+        // case the formatted message is what is used.
+        let formatter = node.parent().and_then(|parent| match parent.kind() {
+            "binary_operator"
+                if parent.child_by_field_name("left") == Some(node)
+                    && parent
+                        .child_by_field_name("operator")
+                        .is_some_and(|op| op.kind() == "%") =>
+            {
+                Some(parent)
+            }
+            "attribute"
+                if parent.child_by_field_name("object") == Some(node)
+                    && parent
+                        .child_by_field_name("attribute")
+                        .is_some_and(|name| &self.source[name.byte_range()] == "format") =>
+            {
+                parent.parent().filter(|call| {
+                    call.kind() == "call" && call.child_by_field_name("function") == Some(parent)
+                })
+            }
+            _ => None,
+        });
+        let node = formatter.unwrap_or(node);
+        // The argument is the variable itself, or the value of a keyword, like `msg=msg`.
+        let (arg, keyword) = match node.parent() {
+            Some(parent) if parent.kind() == "argument_list" => (Some(node), None),
+            Some(parent)
+                if parent.kind() == "keyword_argument"
+                    && parent.child_by_field_name("value") == Some(node) =>
+            {
+                let keyword = parent
+                    .child_by_field_name("name")
+                    .map(|name| &self.source[name.byte_range()]);
+                (Some(parent), keyword)
+            }
+            _ => (None, None),
+        };
+        let call = arg
+            .and_then(|arg| arg.parent())
+            .and_then(|list| list.parent())
+            .filter(|call| call.kind() == "call");
+        if let (Some(arg), Some(function)) = (
+            arg,
+            call.and_then(|call| call.child_by_field_name("function")),
+        ) {
+            let call_name = self
+                .special_call_name(function)
+                .unwrap_or_else(|| self.source[function.byte_range()].to_string());
+            let rank = if Self::has_level(Some(&call_name), &self.leading_args(arg)) {
+                0
+            } else if MessageCategory::is_exception_call(&call_name) {
+                1
+            } else if message_name || keyword.is_some_and(Self::is_python_message_name) {
+                2
+            } else {
+                return None;
+            };
+            return Some((
+                rank,
+                VarUse {
+                    arg: Some(arg),
+                    call_name: Some(call_name),
+                    category: None,
+                    formatter,
+                },
+            ));
+        }
+        if !message_name {
+            return None;
+        }
+        // Some other use, like `return msg` or `{"msg": msg}`.
+        let returned = node
+            .parent()
+            .is_some_and(|p| p.kind() == "return_statement");
+        Some((
+            3,
+            VarUse {
+                arg: None,
+                call_name: returned.then(|| "return".to_string()),
+                category: Some(MessageCategory::Format),
+                formatter,
+            },
+        ))
     }
 
     /// The Rust logging calls whose message is not the first argument, which the query can not
@@ -1810,18 +2189,34 @@ impl<'a> SourceQuery<'a> {
     /// placeholder.  That is not supported.
     fn python_percent_pattern(&self, node: Node, format_args: bool) -> Option<(String, Vec<Arg>)> {
         let left = node.child_by_field_name("left")?;
-        let right = Self::python_unparenthesize(node.child_by_field_name("right")?);
+        let right = node.child_by_field_name("right")?;
+        self.python_percent_parts(left, right, format_args)
+    }
+
+    /// [`Self::python_percent_pattern`] for the string on the `left` of the `%` and the
+    /// values on the `right`.  The string can be from somewhere else, like the assignment to
+    /// the variable in `msg % (name, count)`.
+    fn python_percent_parts(
+        &self,
+        left: Node,
+        right: Node,
+        format_args: bool,
+    ) -> Option<(String, Vec<Arg>)> {
+        let right = Self::python_unparenthesize(right);
         let left_text = &self.source[left.byte_range()];
-        // Mapping keys, like `%(name)s`, are not supported.
-        if !Self::is_python_string(left)
-            || left_text.contains("%(")
-            || (format_args && left_text.contains("%%"))
-        {
+        if !Self::is_python_string(left) || (format_args && left_text.contains("%%")) {
             return None;
         }
         let (pattern, placeholders, interpolated) = self.python_template(left, true);
         if interpolated {
             return None;
+        }
+        if pattern.contains("%(") {
+            // Python does not allow mixing mapping keys with other placeholders.
+            if !placeholders.is_empty() {
+                return None;
+            }
+            return self.python_mapping_pattern(&pattern, right);
         }
         let values: Vec<Node> = if right.kind() == "tuple" {
             let mut cursor = right.walk();
@@ -1862,6 +2257,92 @@ impl<'a> SourceQuery<'a> {
             let value = values.get(index)?;
             args.push((self.python_arg(*value), self.value_kind(*value)));
         }
+        Some((pattern, args))
+    }
+
+    /// Convert the mapping keys of a `%` format, like `"%(user)s has %(count)d items" % info`,
+    /// into placeholders.  The argument for a key is the value in a dictionary literal, the
+    /// variable itself for `locals()` or `vars()`, and otherwise the subscript of the mapping,
+    /// like `info['user']`.
+    fn python_mapping_pattern(&self, template: &str, mapping: Node) -> Option<(String, Vec<Arg>)> {
+        static KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"%%|%\(([^)]*)\)([-+ #0]*(?:\d+)?(?:\.\d+)?[hlL]?[diouxXeEfFgGcrsa])|%")
+                .unwrap()
+        });
+        let mapping_text = self.source[mapping.byte_range()].trim();
+        let mut entries: Vec<(String, Node)> = vec![];
+        if mapping.kind() == "dictionary" {
+            let mut cursor = mapping.walk();
+            for entry in mapping.named_children(&mut cursor) {
+                match entry.kind() {
+                    "comment" => {}
+                    "pair" => {
+                        let key = entry.child_by_field_name("key")?;
+                        if key.kind() != "string" {
+                            return None;
+                        }
+                        let (key, _, interpolated) = self.python_template(key, false);
+                        if interpolated {
+                            return None;
+                        }
+                        entries.push((key.replace("%%", "%"), entry.child_by_field_name("value")?));
+                    }
+                    // A splat, like `{**base, 'x': 1}`, could hold any key.
+                    _ => return None,
+                }
+            }
+        } else if !matches!(
+            mapping.kind(),
+            "identifier" | "attribute" | "subscript" | "call"
+        ) {
+            // Something that is not a mapping, like a tuple.
+            return None;
+        }
+        let is_scope = matches!(mapping_text, "locals()" | "vars()" | "globals()");
+        let mut pattern = String::new();
+        let mut args = Vec::new();
+        let mut last_end = 0;
+        for cap in KEY_REGEX.captures_iter(template) {
+            let whole = cap.get(0).unwrap();
+            pattern.push_str(&template[last_end..whole.start()]);
+            last_end = whole.end();
+            let (Some(key), Some(spec)) = (cap.get(1), cap.get(2)) else {
+                if whole.as_str() == "%%" {
+                    pattern.push_str("%%");
+                    continue;
+                }
+                // A `%` that is not a valid mapping placeholder is an error at runtime.
+                return None;
+            };
+            let key = key.as_str();
+            let spec = spec.as_str();
+            pattern.push('%');
+            pattern.push_str(spec);
+            let conversion = spec.chars().last().unwrap_or('s');
+            let arg = if mapping.kind() == "dictionary" {
+                let value = entries.iter().find(|(name, _)| name == key)?.1;
+                let kind = if matches!(conversion, 's' | 'r' | 'a') {
+                    self.value_kind(value)
+                } else {
+                    ValueKind::Any
+                };
+                (self.python_arg(value), kind)
+            } else if is_scope {
+                (FormatArgument::Named(key.to_string()), ValueKind::Any)
+            } else {
+                let quoted = if key.contains('\'') {
+                    format!("\"{key}\"")
+                } else {
+                    format!("'{key}'")
+                };
+                (
+                    FormatArgument::Named(format!("{mapping_text}[{quoted}]")),
+                    ValueKind::Any,
+                )
+            };
+            args.push(arg);
+        }
+        pattern.push_str(&template[last_end..]);
         Some((pattern, args))
     }
 
@@ -1914,13 +2395,28 @@ impl<'a> SourceQuery<'a> {
 
     /// Convert `"user {} has {count} items".format(name, count=n)` into a pattern.
     fn python_format_pattern(&self, node: Node, format_args: bool) -> Option<(String, Vec<Arg>)> {
-        // Backslash escapes are skipped so the braces in a `\N{NAME}` are not a field.
-        static FIELD_REGEX: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"\\N\{[^{}]*\}|\\.|\{\{|\}\}|\{([^{}]*)\}|[{}]").unwrap());
         let function = node.child_by_field_name("function")?;
         let string = function.child_by_field_name("object")?;
         let method = function.child_by_field_name("attribute")?;
-        if !Self::is_python_string(string) || &self.source[method.byte_range()] != "format" {
+        if &self.source[method.byte_range()] != "format" {
+            return None;
+        }
+        self.python_format_parts(string, node.child_by_field_name("arguments")?, format_args)
+    }
+
+    /// [`Self::python_format_pattern`] for the `string` that `format()` is called on and the
+    /// `arguments` of the call.  The string can be from somewhere else, like the assignment to
+    /// the variable in `msg.format(name)`.
+    fn python_format_parts(
+        &self,
+        string: Node,
+        arguments: Node,
+        format_args: bool,
+    ) -> Option<(String, Vec<Arg>)> {
+        // Backslash escapes are skipped so the braces in a `\N{NAME}` are not a field.
+        static FIELD_REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\\N\{[^{}]*\}|\\.|\{\{|\}\}|\{([^{}]*)\}|[{}]").unwrap());
+        if !Self::is_python_string(string) {
             return None;
         }
         let (text, placeholders, interpolated) = self.python_template(string, format_args);
@@ -1929,7 +2425,6 @@ impl<'a> SourceQuery<'a> {
         }
         let mut positional = vec![];
         let mut keywords = vec![];
-        let arguments = node.child_by_field_name("arguments")?;
         let mut cursor = arguments.walk();
         for arg in arguments.named_children(&mut cursor) {
             match arg.kind() {

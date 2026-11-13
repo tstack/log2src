@@ -160,7 +160,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "56")]
+    #[serde(rename = "60")]
     Current,
 }
 
@@ -2701,16 +2701,32 @@ impl SourceLanguage {
         }
     }
 
-    fn from_extension(extension: &OsStr) -> Option<Self> {
-        match extension.to_str() {
-            Some("rs") => Some(Self::Rust),
-            Some("java") => Some(Self::Java),
-            Some("c") => Some(Self::C),
-            Some("h" | "hh" | "hpp" | "hxx" | "tpp" | "cc" | "cpp" | "cxx") => Some(Self::Cpp),
-            Some("py") => Some(Self::Python),
-            Some("kt" | "kts") => Some(Self::Kotlin),
-            None | Some(_) => None,
+    /// Every language that can be parsed.
+    pub fn all() -> &'static [SourceLanguage] {
+        <Self as clap::ValueEnum>::value_variants()
+    }
+
+    /// The extensions, without the dot, of this language's source files.  They are matched
+    /// case-sensitively.  A `.h` header is listed under C++, though its contents may make it C
+    /// (see [SourceLanguage::from_contents]).  Tools that watch source files, like editor
+    /// plugins, can use these to tell which changes matter.
+    pub fn extensions(&self) -> &'static [&'static str] {
+        match self {
+            SourceLanguage::Rust => &["rs"],
+            SourceLanguage::Java => &["java"],
+            SourceLanguage::C => &["c"],
+            SourceLanguage::Cpp => &["h", "hh", "hpp", "hxx", "tpp", "cc", "cpp", "cxx"],
+            SourceLanguage::Python => &["py"],
+            SourceLanguage::Kotlin => &["kt", "kts"],
         }
+    }
+
+    fn from_extension(extension: &OsStr) -> Option<Self> {
+        let extension = extension.to_str()?;
+        Self::all()
+            .iter()
+            .copied()
+            .find(|lang| lang.extensions().contains(&extension))
     }
 
     /// The language of a source file, using its contents for a `.h` header, which could be C
@@ -3365,6 +3381,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                 .map(|result| result.range.start_byte)
                 .collect();
             results.extend(src_query.append_chains());
+            results.extend(src_query.python_message_vars());
             results.extend(src_query.glyph_literals());
             results.extend(tracing_events);
             for (index, result) in results.into_iter().enumerate() {
@@ -3526,6 +3543,26 @@ mod tests {
     fn from_log_format_and_line<'a>(buffer: &'a str, log_format: LogFormat) -> LogRef<'a> {
         let captures = log_format.captures(buffer).unwrap();
         LogRefBuilder::new().build_from_captures(captures, buffer)
+    }
+
+    #[test]
+    fn test_source_language_extensions() {
+        let ext = |e: &str| SourceLanguage::from_extension(OsStr::new(e));
+        assert_eq!(ext("rs"), Some(SourceLanguage::Rust));
+        assert_eq!(ext("kts"), Some(SourceLanguage::Kotlin));
+        assert_eq!(ext("h"), Some(SourceLanguage::Cpp));
+        assert_eq!(ext("c"), Some(SourceLanguage::C));
+        assert_eq!(ext("RS"), None);
+        assert_eq!(ext("txt"), None);
+        // Every language has extensions, and no extension is two languages'.
+        let mut seen = std::collections::HashSet::new();
+        for lang in SourceLanguage::all() {
+            assert!(!lang.extensions().is_empty(), "{:?}", lang);
+            for e in lang.extensions() {
+                assert!(seen.insert(*e), "{} is listed twice", e);
+                assert_eq!(ext(e), Some(*lang));
+            }
+        }
     }
 
     #[test]
@@ -6348,7 +6385,6 @@ def main(name, count, err, user, d, a, b, off, old_id):
     logger.debug("{}: {} missing (byte {offset})".format(name, user.path, offset=off))
     logger.info("{0.name} is {{literal}} 100%".format(user))
     logger.error("100%% of %s" % name)
-    logger.info("x %(a)s" % d)
     logger.info(a + b)
     logger.info("%s took " + "%s", name, count)
     logger.debug("process (%s, %s) is dying" % old_id)
@@ -6429,6 +6465,316 @@ def main(name, count, err, user, d, a, b, off, old_id):
         assert_eq!(
             extract_pairs("in-mem.py", PYTHON_FORMATTED_SOURCE, 5, "job took 5s"),
             pairs(&[("name", "job"), ("count", "5s")])
+        );
+    }
+
+    const PYTHON_MAPPING_SOURCE: &str = r#"
+def main(d, port, user, n):
+    logger.info("x %(a)s" % d)
+    logger.error('bind "%(name)s" port %(port)d: %(error)s' % port)
+    logger.info("%(who)s has %(count)d items, 100%%" % {"who": user.name, "count": n})
+    logger.info("%(user)s again" % locals())
+    logger.info("%(a)s and %s" % d)
+    logger.info("%(missing)s" % {"who": user})
+    logger.info("%(a)s" % (d,))
+    logger.info("%(user)s left %(where)s", {"user": user.name, "where": d})
+    logger.info("%(user)s stays", d, n)
+"#;
+
+    #[test]
+    fn test_python_mapping() {
+        let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_MAPPING_SOURCE);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let patterns: Vec<&str> = sif
+            .log_statements
+            .iter()
+            .map(|s| s.pattern().as_str())
+            .collect();
+        // A mix of keys and other placeholders, a missing key, and a tuple are not mappings.
+        assert_eq!(
+            patterns,
+            vec![
+                r"(?s)^x (.*)$",
+                r#"(?s)^bind "(.*)" port (.*): (.*)$"#,
+                r"(?s)^(.*) has (.*) items, 100%$",
+                r"(?s)^(.*) again$",
+                r"(?s)^(.*) left (.*)$",
+                r"(?s)^%\(user\)s stays$",
+            ]
+        );
+        // `logging` formats with the mapping when it is the only argument.
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_MAPPING_SOURCE, 4, "bob left home"),
+            pairs(&[("user.name", "bob"), ("d", "home")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_MAPPING_SOURCE, 0, "x 1"),
+            pairs(&[("d['a']", "1")])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.py",
+                PYTHON_MAPPING_SOURCE,
+                1,
+                r#"bind "cc_port" port 8090: in use"#
+            ),
+            pairs(&[
+                ("port['name']", "cc_port"),
+                ("port['port']", "8090"),
+                ("port['error']", "in use")
+            ])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.py",
+                PYTHON_MAPPING_SOURCE,
+                2,
+                "bob has 3 items, 100%"
+            ),
+            pairs(&[("user.name", "bob"), ("n", "3")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_MAPPING_SOURCE, 3, "bob again"),
+            pairs(&[("user", "bob")])
+        );
+    }
+
+    const PYTHON_MESSAGE_VAR_SOURCE: &str = r#"
+def main(port, path, name, n, x):
+    msg = 'Could not bind to "%(name)s" port %(port)s' % port
+    alerts.append(self._generate_cc_alert('PORT_BIND_ERROR', msg, port))
+    text = "user %s left" % name
+    logger.warning(text)
+    reason = "no such file: " + path
+    raise ValueError(reason)
+    err_msg = "Bad count {}".format(n)
+    report(code=1, msg=err_msg)
+    query = "SELECT %s FROM t" % x
+    db.execute(query)
+    label = "total %s" % n
+    widget.set(label)
+    fmt = "user %s has %d items"
+    logger.info(fmt, name, n)
+    sep = ", "
+    logger.info(sep)
+    unused_msg = "never used %s" % x
+"#;
+
+    #[test]
+    fn test_python_message_vars() {
+        let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_MESSAGE_VAR_SOURCE);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let summary: Vec<(&str, usize, Option<&str>, LogLevel, MessageCategory)> = sif
+            .log_statements
+            .iter()
+            .map(|s| {
+                (
+                    s.pattern().as_str(),
+                    s.line_no,
+                    s.call_name.as_deref(),
+                    s.level,
+                    s.category,
+                )
+            })
+            .collect();
+        // The SQL and the label are passed to calls that are not about messages, the separator
+        // has no text, and the last message is never used.
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    r#"(?s)^Could not bind to "(.*)" port (.*)$"#,
+                    3,
+                    Some("self._generate_cc_alert"),
+                    LogLevel::Unknown,
+                    MessageCategory::Other
+                ),
+                (
+                    r"(?s)^user (.*) left$",
+                    5,
+                    Some("logger.warning"),
+                    LogLevel::Warn,
+                    MessageCategory::Log
+                ),
+                (
+                    r"(?s)^no such file: (.*)$",
+                    7,
+                    Some("raise ValueError"),
+                    LogLevel::Unknown,
+                    MessageCategory::Error
+                ),
+                (
+                    r"(?s)^Bad count (.*)$",
+                    9,
+                    Some("report"),
+                    LogLevel::Unknown,
+                    MessageCategory::Other
+                ),
+                (
+                    r"(?s)^user (.*) has (.*) items$",
+                    15,
+                    Some("logger.info"),
+                    LogLevel::Info,
+                    MessageCategory::Log
+                ),
+            ]
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.py",
+                PYTHON_MESSAGE_VAR_SOURCE,
+                0,
+                r#"Could not bind to "cc_port" port 8090"#
+            ),
+            pairs(&[("port['name']", "cc_port"), ("port['port']", "8090")])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.py",
+                PYTHON_MESSAGE_VAR_SOURCE,
+                2,
+                "no such file: /x"
+            ),
+            pairs(&[("path", "/x")])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.py",
+                PYTHON_MESSAGE_VAR_SOURCE,
+                4,
+                "user bob has 3 items"
+            ),
+            pairs(&[("name", "bob"), ("n", "3")])
+        );
+    }
+
+    const PYTHON_MESSAGE_USE_SOURCE: &str = r#"
+def describe(path, n):
+    msg = "Could not open %s" % path
+    return msg
+
+def results(n, name, x):
+    err = "Found %d problems" % n
+    warnings.append({"code": "PROBLEMS", "msg": err})
+    path = "/tmp/%s" % name
+    return path
+    fmt = "%(user)s logged in"
+    logger.info(fmt, {"user": name})
+    msg = "shadowed %s" % x
+    report(msg=x)
+
+class BadThing(Exception):
+    def __init__(self, thing):
+        self.message = "Bad thing: %s" % thing
+        self.code = "BAD_%s" % thing
+        self.label = "label %s" % thing
+
+    def show(self):
+        log.error(self.label)
+
+def mismatch(a, b):
+    err = ("Mismatch %s != %s; "
+           "check config")
+    msg = ""
+    msg += err % (a, b)
+    tmpl = "user {} has {n} items"
+    log.info(tmpl.format(a, n=b))
+    return msg
+"#;
+
+    #[test]
+    fn test_python_message_uses() {
+        let code = CodeSource::from_string(Path::new("in-mem.py"), PYTHON_MESSAGE_USE_SOURCE);
+        let sif = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let summary: Vec<(&str, usize, Option<&str>, MessageCategory)> = sif
+            .log_statements
+            .iter()
+            .map(|s| {
+                (
+                    s.pattern().as_str(),
+                    s.line_no,
+                    s.call_name.as_deref(),
+                    s.category,
+                )
+            })
+            .collect();
+        // A path that is returned is not a message, a variable that is only the name of a
+        // keyword is not used, and an attribute that is not a message is only kept when it is
+        // logged.
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    r"(?s)^Could not open (.*)$",
+                    3,
+                    Some("return"),
+                    MessageCategory::Format
+                ),
+                (
+                    r"(?s)^Found (.*) problems$",
+                    7,
+                    None,
+                    MessageCategory::Format
+                ),
+                (
+                    r"(?s)^(.*) logged in$",
+                    11,
+                    Some("logger.info"),
+                    MessageCategory::Log
+                ),
+                (r"(?s)^Bad thing: (.*)$", 18, None, MessageCategory::Format),
+                (
+                    r"(?s)^label (.*)$",
+                    20,
+                    Some("log.error"),
+                    MessageCategory::Log
+                ),
+                (
+                    r"(?s)^Mismatch (.*) != (.*); check config$",
+                    26,
+                    None,
+                    MessageCategory::Format
+                ),
+                (
+                    r"(?s)^user (.*) has (.*) items$",
+                    30,
+                    Some("log.info"),
+                    MessageCategory::Log
+                ),
+            ]
+        );
+        // A template is formatted where it is used.
+        assert_eq!(
+            extract_pairs(
+                "in-mem.py",
+                PYTHON_MESSAGE_USE_SOURCE,
+                5,
+                "Mismatch 1 != 2; check config"
+            ),
+            pairs(&[("a", "1"), ("b", "2")])
+        );
+        assert_eq!(
+            extract_pairs(
+                "in-mem.py",
+                PYTHON_MESSAGE_USE_SOURCE,
+                6,
+                "user bob has 3 items"
+            ),
+            pairs(&[("a", "bob"), ("b", "3")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_MESSAGE_USE_SOURCE, 2, "bob logged in"),
+            pairs(&[("name", "bob")])
+        );
+        assert_eq!(
+            extract_pairs("in-mem.py", PYTHON_MESSAGE_USE_SOURCE, 3, "Bad thing: x"),
+            pairs(&[("thing", "x")])
         );
     }
 
