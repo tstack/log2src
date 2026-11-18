@@ -7,7 +7,8 @@ use tree_sitter::{
 };
 
 use crate::source_ref::{
-    normalize_expr, split_words, ArgCounter, FormatArgument, LogLevel, MessageCategory, Substitution,
+    normalize_expr, split_words, ArgCounter, FormatArgument, LogLevel, MessageCategory,
+    Substitution,
 };
 use crate::value_kind::{self, ValueKind};
 use crate::wrappers::MacroWrapper;
