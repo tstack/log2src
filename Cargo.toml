@@ -31,9 +31,6 @@ ignore = "0.4"
 rayon = "1.11.0"
 miette = { version = "7.6.0", features = ["fancy", "serde"] }
 
-[build-dependencies]
-cc="*"
-
 [dev-dependencies]
 assert_cmd = "2.0.16"
 env_logger = "0.11.8"

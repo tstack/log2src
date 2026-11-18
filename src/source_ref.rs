@@ -205,6 +205,47 @@ impl LogLevel {
     }
 }
 
+/// The text of an argument expression as it is shown to the user: trimmed, and with each line
+/// break and the indentation around it, which come from an expression that is split across
+/// lines, collapsed into a single space, or into nothing next to a bracket, dot, or separator,
+/// like `foo\n    .bar(\n        x)` becoming `foo.bar(x)`.
+pub(crate) fn normalize_expr(text: &str) -> String {
+    let text = text.trim();
+    if !text.contains('\n') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(|c: char| c.is_whitespace()) {
+        let (before, after) = rest.split_at(pos);
+        out.push_str(before);
+        let ws_len = after
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(after.len());
+        let (ws, after) = after.split_at(ws_len);
+        if !ws.contains('\n') {
+            out.push_str(ws);
+        } else {
+            // A line continuation, like in Python or a C macro.
+            if out.ends_with('\\') {
+                out.pop();
+                out.truncate(out.trim_end().len());
+            }
+            let prev = out.chars().last();
+            let next = after.chars().next();
+            let joins = matches!(prev, Some('(' | '[' | '{' | '.'))
+                || matches!(next, Some(')' | ']' | '}' | '.' | ',' | ';'))
+                || ["?.", "->", "::"].iter().any(|op| after.starts_with(op));
+            if !joins {
+                out.push(' ');
+            }
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn is_logging_word(word: &str) -> bool {
     // Words that contain "log" but have nothing to do with logging.
     const NOT_LOGGING: &[&str] = &[
@@ -2100,7 +2141,25 @@ pub(crate) fn literal_to_regex(raw: bool, language: SourceLanguage, segment: &st
 
 #[cfg(test)]
 mod tests {
-    use super::{c_parameter_names, push_regex_literal, regex_literal_pieces, relax_whitespace};
+    use super::{
+        c_parameter_names, normalize_expr, push_regex_literal, regex_literal_pieces,
+        relax_whitespace,
+    };
+
+    #[test]
+    fn test_normalize_expr() {
+        assert_eq!(normalize_expr("  name "), "name");
+        assert_eq!(normalize_expr("a  +  b"), "a  +  b");
+        assert_eq!(normalize_expr("a +\n        b"), "a + b");
+        assert_eq!(
+            normalize_expr("foo\n        .bar(\n            x,\n            y\n        )"),
+            "foo.bar(x, y)"
+        );
+        assert_eq!(normalize_expr("ptr\n    ->field"), "ptr->field");
+        assert_eq!(normalize_expr("a\n  ?.b"), "a?.b");
+        assert_eq!(normalize_expr("a + \\\n    b"), "a + b");
+        assert_eq!(normalize_expr("x \\\r\n    or y"), "x or y");
+    }
 
     #[test]
     fn test_relax_whitespace() {

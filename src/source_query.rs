@@ -7,7 +7,7 @@ use tree_sitter::{
 };
 
 use crate::source_ref::{
-    split_words, ArgCounter, FormatArgument, LogLevel, MessageCategory, Substitution,
+    normalize_expr, split_words, ArgCounter, FormatArgument, LogLevel, MessageCategory, Substitution,
 };
 use crate::value_kind::{self, ValueKind};
 use crate::wrappers::MacroWrapper;
@@ -1634,7 +1634,7 @@ impl<'a> SourceQuery<'a> {
             }
         }
         parts.push(ConcatPart::Expr {
-            text: self.source[arg.byte_range()].to_string(),
+            text: normalize_expr(&self.source[arg.byte_range()]),
             kind: self.value_kind(arg),
             candidates: vec![],
             constant_at: None,
@@ -2151,9 +2151,9 @@ impl<'a> SourceQuery<'a> {
                                 _ => spec_kind,
                             };
                             args.push((
-                                FormatArgument::Named(
-                                    self.source[expr.start_byte()..expr.end_byte()].to_string(),
-                                ),
+                                FormatArgument::Named(normalize_expr(
+                                    &self.source[expr.start_byte()..expr.end_byte()],
+                                )),
                                 kind,
                             ));
                         }
@@ -2498,7 +2498,7 @@ impl<'a> SourceQuery<'a> {
 
     fn python_arg(&self, node: Node) -> FormatArgument {
         let node = Self::python_unparenthesize(node);
-        FormatArgument::Named(self.source[node.byte_range()].trim().to_string())
+        FormatArgument::Named(normalize_expr(&self.source[node.byte_range()]))
     }
 
     /// Strip the parentheses around an expression, like `(x)`.
@@ -2707,7 +2707,7 @@ impl<'a> SourceQuery<'a> {
             .map(|piece| match piece {
                 ConcatPiece::Literal(text) => ConcatPart::Literal(text.into_owned()),
                 ConcatPiece::Expr(expr) => ConcatPart::Expr {
-                    text: self.source[expr.byte_range()].to_string(),
+                    text: normalize_expr(&self.source[expr.byte_range()]),
                     kind: self.value_kind(expr),
                     candidates: vec![],
                     // A name, like `PREFIX`, or a field, like `Messages.PREFIX`, but not a call,

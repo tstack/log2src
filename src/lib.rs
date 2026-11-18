@@ -160,7 +160,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "60")]
+    #[serde(rename = "61")]
     Current,
 }
 
@@ -3460,7 +3460,7 @@ pub fn extract_logging_guarded(sources: &[CodeSource], guard: &WorkGuard) -> Vec
                             .all(|&s| s != text.to_lowercase())
                         {
                             let end_line_no = result.range.end_point.row + 1;
-                            let var = text.trim().to_string();
+                            let var = source_ref::normalize_expr(&text);
                             if let ArgsTarget::MessageRef = args_target {
                                 let prior = message_refs.last_mut().unwrap();
                                 prior.end_line_no = end_line_no;
@@ -6880,6 +6880,32 @@ void connect() {
         assert_eq!(src_refs[1].level, LogLevel::Error);
         assert_eq!(src_refs[2].level, LogLevel::Warn);
         assert_eq!(src_refs[2].vars, vec!["count"]);
+    }
+
+    #[test]
+    fn test_extract_multiline_arg_exprs() {
+        let code = CodeSource::from_string(
+            &PathBuf::from("in-mem.java"),
+            r#"
+class Main {
+  void run(Request request) {
+    LOG.info("handling {} from {}",
+        request
+            .getPath(),
+        request.getRemote(
+            true));
+  }
+}
+"#,
+        );
+        let stmts = extract_logging(&[code], &ProgressTracker::new())
+            .pop()
+            .unwrap();
+        let src_refs = stmts.log_statements;
+        assert_eq!(
+            src_refs[0].arg_exprs(),
+            vec!["request.getPath()", "request.getRemote(true)"]
+        );
     }
 
     #[test]

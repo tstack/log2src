@@ -773,7 +773,6 @@ dependencies = [
  "aho-corasick",
  "assert_cmd",
  "bincode",
- "cc",
  "clap",
  "colored_json",
  "directories",
