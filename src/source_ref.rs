@@ -1231,23 +1231,10 @@ impl Statement {
         let mut continuations = vec![];
         for cont in conts {
             let resolved: Vec<(&str, ValueKind)> = cont.resolved_args().collect();
-            // The `KERN_CONT` in `printk(KERN_CONT "...")` is a placeholder that prints
-            // nothing, since printk() takes the level out.
-            let skip = usize::from(
-                cont.segments[0].is_empty()
-                    && resolved
-                        .first()
-                        .is_some_and(|(expr, _)| *expr == "KERN_CONT"),
-            );
             let last = segments.pop().unwrap_or_default();
-            let first = if skip == 1 {
-                &cont.segments[1]
-            } else {
-                &cont.segments[0]
-            };
-            segments.push(format!("{last}{first}"));
-            segments.extend(cont.segments[skip + 1..].iter().cloned());
-            for index in skip..cont.kinds.len() {
+            segments.push(format!("{last}{}", cont.segments[0]));
+            segments.extend(cont.segments[1..].iter().cloned());
+            for index in 0..cont.kinds.len() {
                 let (expr, kind) = resolved
                     .get(index)
                     .copied()

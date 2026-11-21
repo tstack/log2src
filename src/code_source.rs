@@ -2,7 +2,19 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::source_hier::SourceFileInfo;
+use crate::source_query::SourceQuery;
 use crate::{LogError, SourceLanguage};
+
+/// The text of a source file as it is parsed.  C and C++ macro calls with a parenthesized list
+/// of arguments are rewritten as plain calls, see [`SourceQuery::rewrite_double_paren_calls`].
+/// The rewrite keeps the byte offsets and lines the same, and it is done here so that the
+/// tree and the text of the arguments come from the same buffer.
+fn parsable_buffer(language: SourceLanguage, buffer: String) -> String {
+    if !language.is_c_family() {
+        return buffer;
+    }
+    SourceQuery::rewrite_double_paren_calls(&buffer).unwrap_or(buffer)
+}
 
 pub struct CodeSource {
     pub(crate) filename: String,
@@ -29,8 +41,8 @@ impl CodeSource {
                 info.language = SourceLanguage::from_contents(path, info.language, &buffer);
                 Ok(CodeSource {
                     filename: path.to_string_lossy().to_string(),
+                    buffer: parsable_buffer(info.language, buffer),
                     info,
-                    buffer,
                 })
             }
             Err(err) => Err(LogError::CannotReadSourceFile {
@@ -41,14 +53,12 @@ impl CodeSource {
     }
 
     pub fn from_string(path: &Path, input: &str) -> CodeSource {
+        let language =
+            SourceLanguage::from_contents(path, SourceLanguage::from_path(path).unwrap(), input);
         CodeSource {
             filename: path.to_string_lossy().to_string(),
-            info: SourceFileInfo::new(SourceLanguage::from_contents(
-                path,
-                SourceLanguage::from_path(path).unwrap(),
-                input,
-            )),
-            buffer: input.to_string(),
+            info: SourceFileInfo::new(language),
+            buffer: parsable_buffer(language, input.to_string()),
         }
     }
 }

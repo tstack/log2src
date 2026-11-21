@@ -11,7 +11,7 @@ use crate::source_ref::{
     Substitution,
 };
 use crate::value_kind::{self, ValueKind};
-use crate::wrappers::MacroWrapper;
+use crate::wrappers::{self, MacroWrapper};
 use crate::{CodeSource, SourceLanguage};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -289,6 +289,92 @@ impl<'a> SourceQuery<'a> {
                 .collect::<String>()
         });
         (!masked.is_empty()).then(|| (retval.into_owned(), masked))
+    }
+
+    /// Replace the inner parentheses of a macro call whose only argument is a parenthesized
+    /// list with a string-literal in it, like ACPICA's `ACPI_WARNING((AE_INFO, "...", x))`,
+    /// with spaces.  The macro passes the list to a function, like
+    /// `#define ACPI_WARNING(plist) acpi_warning plist`, so the list is the function's
+    /// arguments.  The grammar parses the list as a comma expression, whose parts are not the
+    /// arguments of the call, but it parses `ACPI_WARNING( AE_INFO, "...", x )` like any other
+    /// call, and the byte offsets stay the same.  The `((` of a condition, like
+    /// `if ((x = f()))`, or of an attribute, like `__attribute__((format(printf, 1, 2)))`, is
+    /// left alone, since it is not a call or has no string-literal in the list.  Returns None if
+    /// there was nothing to rewrite.
+    pub(crate) fn rewrite_double_paren_calls(source: &str) -> Option<String> {
+        static CALL_REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*(\()").unwrap());
+        const NOT_CALLS: &[&str] = &[
+            "if",
+            "while",
+            "for",
+            "switch",
+            "return",
+            "sizeof",
+            "typeof",
+            "__typeof__",
+            "_Alignof",
+            "alignof",
+            "decltype",
+            "defined",
+            "__attribute__",
+            "__declspec",
+            "asm",
+            "__asm__",
+        ];
+        let bytes = source.as_bytes();
+        let mut code: Option<Vec<bool>> = None;
+        let mut retval: Option<Vec<u8>> = None;
+        for call in CALL_REGEX.captures_iter(source) {
+            let name = call.get(1).unwrap();
+            let open = call.get(2).unwrap().start();
+            if NOT_CALLS.contains(&name.as_str()) {
+                continue;
+            }
+            let code = code.get_or_insert_with(|| Self::code_bytes(source));
+            if !code[name.start()] || !code[open] {
+                continue;
+            }
+            // Find the `)` that closes the list, and check that the list has a comma and a
+            // string-literal that are not nested in it.
+            let mut depth = 0;
+            let mut close = None;
+            let mut has_comma = false;
+            let mut has_literal = false;
+            for (index, &byte) in bytes.iter().enumerate().skip(open) {
+                if !code[index] {
+                    // The start of a string-literal, not a `"` in a comment or a character.
+                    has_literal |= depth == 1 && byte == b'"' && code[index - 1];
+                    continue;
+                }
+                match byte {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(index);
+                            break;
+                        }
+                    }
+                    b',' if depth == 1 => has_comma = true,
+                    // The end of a statement, so the parentheses are not balanced.
+                    b';' => break,
+                    _ => {}
+                }
+            }
+            let Some(close) = close.filter(|_| has_comma && has_literal) else {
+                continue;
+            };
+            // The list has to be the only argument of the call.
+            if !source[close + 1..].trim_start().starts_with(')') {
+                continue;
+            }
+            let retval = retval.get_or_insert_with(|| bytes.to_vec());
+            retval[open] = b' ';
+            retval[close] = b' ';
+        }
+        // Only ASCII parentheses were replaced, so the result is still UTF-8.
+        retval.map(|retval| String::from_utf8(retval).unwrap())
     }
 
     /// Replace the parentheses of macro calls that wrap a string-literal and are concatenated
@@ -1951,6 +2037,13 @@ impl<'a> SourceQuery<'a> {
                 "identifier" if call_name.is_none() && ends_in_open_conversion(&pattern) => {
                     pattern.push('s');
                 }
+                // A Linux kernel level in front of the message, like `printk(KERN_INFO "...")`,
+                // is taken out by printk(), so it prints nothing.  As a placeholder, it would
+                // match any text in front of the message, like the timestamp from dmesg.
+                "identifier"
+                    if call_name.is_none()
+                        && pattern.is_empty()
+                        && wrappers::is_kernel_log_level(text) => {}
                 "identifier" if call_name.is_none() => {
                     if self.source[piece.end_byte()..]
                         .trim_start()
@@ -3644,6 +3737,34 @@ mod test {
             Some("int f() {\n        \n  return 1;\n      \n}\n")
         );
         assert_eq!(mask("int f() { return 1; }\n"), None);
+    }
+
+    #[test]
+    fn test_rewrite_double_paren_calls() {
+        let rewrite = |source: &str| SourceQuery::rewrite_double_paren_calls(source);
+        // An ACPICA message, whose list of arguments is passed to a function by the macro.
+        assert_eq!(
+            rewrite("ACPI_WARNING((AE_INFO, \"bad %u\", x));").as_deref(),
+            Some("ACPI_WARNING( AE_INFO, \"bad %u\", x );")
+        );
+        assert_eq!(
+            rewrite("ACPI_DEBUG_PRINT ((ACPI_DB_INFO,\n    \"f(%s)\", g(a, b)) );").as_deref(),
+            Some("ACPI_DEBUG_PRINT ( ACPI_DB_INFO,\n    \"f(%s)\", g(a, b)  );")
+        );
+        // Not calls, or not a list with a string-literal in it.
+        assert_eq!(rewrite("if ((x = f(\"a\", 1))) {}"), None);
+        assert_eq!(rewrite("while ((n = read(fd, \"x\", 1)) > 0) {}"), None);
+        assert_eq!(
+            rewrite("void f(void) __attribute__((format(printf, 1, 2)));"),
+            None
+        );
+        assert_eq!(rewrite("y = f((a, b));"), None);
+        assert_eq!(rewrite("y = f((int)x, \"s\");"), None);
+        assert_eq!(rewrite("y = f((a, \"s\"), c);"), None);
+        // A `((` in a comment or a string-literal.
+        assert_eq!(rewrite("/* f((a, \"s\")) */ g(\"f((a, b))\");"), None);
+        // The `"` of a character is not a string-literal.
+        assert_eq!(rewrite("y = f((a, '\"'));"), None);
     }
 
     #[test]

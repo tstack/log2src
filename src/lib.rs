@@ -160,7 +160,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "61")]
+    #[serde(rename = "63")]
     Current,
 }
 
@@ -1398,8 +1398,10 @@ fn first_match_full<'a, T>(
     choose_match(candidates, lineno, &src_ref, |candidate| {
         let stmt = src_ref(candidate);
         match_stats::record_pattern_check();
-        stmt.pattern()
-            .is_match(body)
+        // A statement whose values do not look like the kinds in its format string, like a
+        // word for a `%d`, did not produce the message, even though its pattern matches, which
+        // happens a lot for one with little literal text, like `"%dx%d"`.
+        (stmt.pattern().is_match(body) && stmt.values_fit_kinds(stmt.pattern(), body))
             .then(|| stmt.matches_without_empty_values(body))
     })
 }
@@ -4630,6 +4632,85 @@ class Balancer {
         assert_eq!(count(&matcher), once);
     }
 
+    /// The line number, variables, and prefix of the statement matched to a C message.
+    type CMatch = (usize, Vec<(String, String)>, Option<String>);
+
+    /// Match a message and return the line number, variables, and prefix of the statement.
+    fn match_c_message(matcher: &LogMatcher, msg: &str) -> Option<CMatch> {
+        let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+        let mapping = matcher.match_log_statement(&log_ref, &LogMatchOptions::default())?;
+        let vars = mapping
+            .variables
+            .into_iter()
+            .map(|var| (var.expr, var.value))
+            .collect();
+        Some((
+            mapping.src_ref?.line_no,
+            vars,
+            mapping.prefix.map(str::to_string),
+        ))
+    }
+
+    #[test]
+    fn test_match_kernel_level_prints_nothing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("dquot.c"),
+            r#"static int __init dquot_init(void)
+{
+    printk(KERN_NOTICE "VFS: Disk quotas %s\n", __DQUOT_VERSION__);
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let patterns: Vec<String> = matcher
+            .statements()
+            .map(|stmt| stmt.pattern().as_str().to_string())
+            .collect();
+        assert_eq!(patterns, vec![r"(?s)^VFS: Disk quotas (.*?)\s*$"]);
+        let version = vec![("__DQUOT_VERSION__".to_string(), "dquot_6.6.0".to_string())];
+        assert_eq!(
+            match_c_message(&matcher, "VFS: Disk quotas dquot_6.6.0"),
+            Some((3, version.clone(), None))
+        );
+        // The level is not a placeholder, so it does not take the text in front of the message,
+        // like the timestamp from dmesg, which is found as a prefix instead.
+        assert_eq!(
+            match_c_message(&matcher, "[    0.160216] VFS: Disk quotas dquot_6.6.0"),
+            Some((3, version, Some("[    0.160216]".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_match_values_fit_kinds() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("fb.c"),
+            r#"void show(int w, int h)
+{
+    printk(KERN_INFO "%d by %d\n", w, h);
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        assert_eq!(
+            match_c_message(&matcher, "1024 by 768"),
+            Some((
+                3,
+                vec![
+                    ("w".to_string(), "1024".to_string()),
+                    ("h".to_string(), "768".to_string())
+                ],
+                None
+            ))
+        );
+        // The pattern matches any text with ` by ` in it, but the values are not numbers.
+        assert_eq!(match_c_message(&matcher, "Written by Linus Torvalds"), None);
+    }
+
     #[test]
     fn test_match_explains_rest_of_message() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -5627,7 +5708,7 @@ static void show_features(int n, const char **names, int extra)
             vec![
                 (6, vec![8, 9], r"(?s)^features: name=(.*?)\s*$"),
                 (6, vec![9], r"(?s)^features:\s*$"),
-                (12, vec![13], r"(?s)^(.*)regs:\s*$"),
+                (12, vec![13], r"(?s)^regs:\s*$"),
             ]
         );
     }
@@ -5791,7 +5872,7 @@ void other(void)
                 (4, vec![10], r"(?s)^Console: switching\s*to (.*?)\s*$"),
                 (4, vec![12], r"(?s)^Console: switching\s*ends the line\s*$"),
                 // `KERN_CONT` prints nothing, so it is left out.
-                (17, vec![18, 19], r"(?s)^(.*)regs: a=(.*) b=(.*?)\s*$"),
+                (17, vec![18, 19], r"(?s)^regs: a=(.*) b=(.*?)\s*$"),
             ]
         );
         let line = "Console: switching consoles 1-63 to colour 128x48";
