@@ -3692,13 +3692,13 @@ enum ConcatPiece<'a> {
 }
 
 /// Check for a format macro from <cinttypes>, like PRIu64 or SCNd32.
-fn is_inttypes_macro(text: &str) -> bool {
+pub(crate) fn is_inttypes_macro(text: &str) -> bool {
     (text.starts_with("PRI") || text.starts_with("SCN")) && is_identifier(text)
 }
 
 /// Check if a printf-style format ends in a conversion specification that is not finished,
 /// like the `%-10` in `"%-10" G_GINT64_FORMAT`.
-fn ends_in_open_conversion(format: &str) -> bool {
+pub(crate) fn ends_in_open_conversion(format: &str) -> bool {
     let mut open = false;
     for c in format.chars() {
         if open {

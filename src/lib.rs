@@ -160,7 +160,7 @@ pub enum CacheEntrySchema {
 /// The revision value is a simple way to invalidate the cache entries by changing the number.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Revision {
-    #[serde(rename = "63")]
+    #[serde(rename = "64")]
     Current,
 }
 
@@ -440,8 +440,134 @@ pub struct LogCall {
 /// done again, like after a file changes, since a statement whose call name has a level is
 /// only `Unknown` if it was pruned before, so its level is restored first.  The calls that are
 /// known not to be logging, see [`MessageCategory::from_call`], are skipped.
+#[cfg(test)]
 fn prune_log_calls(
+    stmts: Vec<(&mut Statement, SourceLanguage, bool)>,
+) -> BTreeMap<String, LogCall> {
+    prune_log_calls_with(stmts, &HashMap::new())
+}
+
+/// The level that a C macro gives the messages passed to it, when its name does not have one,
+/// see [`macro_levels`].
+#[derive(Clone, Debug, PartialEq)]
+struct MacroLevel {
+    level: LogLevel,
+    /// The family that the macro's level is counted in, see [`LogLevel::call_family`]: the
+    /// macro's own, like `v4l2` for `v4l2_err`, if its name has one, or else the one of the
+    /// call that the level comes from, like `drm` for the `__drm_dbg` that `DRM_DEBUG_KMS`
+    /// calls.
+    family: Option<String>,
+    /// True if a definition of the macro reaches a call that is known to be logging, or passes
+    /// a level to its call, like the `KERN_ERR` in `printk(KERN_ERR fmt, ...)`, so the macro is
+    /// logging even if the rest of its family is not.
+    logging: bool,
+}
+
+/// The levels of the C macros whose names do not say what level they log at, but that call
+/// something that does, like `#define DRM_DEBUG_KMS(fmt, ...) __drm_dbg(DRM_UT_KMS, fmt, ...)`
+/// in the Linux kernel, or pass a level to the call, like `printk(KERN_ERR fmt, ...)`.  The
+/// macros are followed through the ones they call.  A macro with definitions that do not agree
+/// on a level has none, since it is not known which one a call uses.
+fn macro_levels<'a>(
+    files: impl Iterator<Item = &'a StatementsInFile>,
+) -> HashMap<String, MacroLevel> {
+    let mut defs: HashMap<&str, Vec<&wrappers::MacroWrapper>> = HashMap::new();
+    for sif in files.filter(|sif| sif.language.is_c_family()) {
+        for wrapper in &sif.macros {
+            defs.entry(wrapper.name.as_str()).or_default().push(wrapper);
+        }
+    }
+    // A name with a level from a prefix that might not be a logger, like `my_alert`, is better
+    // evidence of logging when the macro calls a logger.
+    defs.keys()
+        .filter(|name| !is_known_logging_name(name))
+        .filter_map(|name| {
+            resolve_macro_level(name, &defs, 0).map(|level| (name.to_string(), level))
+        })
+        .collect()
+}
+
+/// Check if the name of a call says that it is logging, and at what level, without a prefix
+/// that might not be a logger, see [`LogLevel::call_family`].
+fn is_known_logging_name(name: &str) -> bool {
+    LogLevel::from_name(name).is_some() && LogLevel::call_family(name).is_none()
+}
+
+/// The level that the macro with the name gives its messages, see [`macro_levels`].  A
+/// definition that reaches a known logger, or passes a level, like the
+/// `netdev_printk(KERN_DEBUG, ...)` of one of the `netdev_dbg` definitions, shows that the
+/// macro is logging, see [`MacroLevel::logging`].
+fn resolve_macro_level(
+    name: &str,
+    defs: &HashMap<&str, Vec<&wrappers::MacroWrapper>>,
+    depth: usize,
+) -> Option<MacroLevel> {
+    if depth >= MAX_WRAPPER_DEPTH {
+        return None;
+    }
+    let callee_level = |callee: &str| {
+        if is_known_logging_name(callee) {
+            return LogLevel::from_name(callee).map(|level| MacroLevel {
+                level,
+                family: None,
+                logging: true,
+            });
+        }
+        // A macro says more than a name with a prefix that might not be a logger.
+        resolve_macro_level(callee, defs, depth + 1).or_else(|| {
+            LogLevel::from_name(callee).map(|level| MacroLevel {
+                level,
+                family: LogLevel::call_family(callee),
+                logging: false,
+            })
+        })
+    };
+    let mut level = None;
+    let mut logging = false;
+    let mut callee_family = None;
+    for def in defs.get(name)? {
+        let def_level = match &def.body {
+            wrappers::MacroBody::Call { callee, args } => args
+                .iter()
+                .find_map(|arg| {
+                    let first = arg
+                        .trim()
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()?;
+                    LogLevel::from_level_arg(first)
+                })
+                .map(|level| MacroLevel {
+                    level,
+                    family: None,
+                    logging: true,
+                })
+                .or_else(|| callee_level(callee))?,
+            wrappers::MacroBody::Alias(target) => callee_level(target)?,
+            // Text, like a `pr_fmt`, is not a call.
+            _ => return None,
+        };
+        match level {
+            None => level = Some(def_level.level),
+            Some(prev) if prev == def_level.level => {}
+            Some(_) => return None,
+        }
+        logging |= def_level.logging;
+        if let Some(family) = def_level.family {
+            callee_family.get_or_insert(family);
+        }
+    }
+    Some(MacroLevel {
+        level: level?,
+        family: LogLevel::call_family(name).or(callee_family),
+        logging,
+    })
+}
+
+/// [`prune_log_calls`], with the levels of the C macros under the root whose names do not
+/// have one, see [`macro_levels`].
+fn prune_log_calls_with(
     mut stmts: Vec<(&mut Statement, SourceLanguage, bool)>,
+    macro_levels: &HashMap<String, MacroLevel>,
 ) -> BTreeMap<String, LogCall> {
     // The level from the name of each call, which only needs to be computed once per name.
     let mut name_levels: HashMap<String, Option<LogLevel>> = HashMap::new();
@@ -458,7 +584,10 @@ fn prune_log_calls(
             let name_level = match name_levels.get(call_name) {
                 Some(level) => *level,
                 None => {
-                    let level = LogLevel::from_name(call_name);
+                    let level = match macro_levels.get(call_name) {
+                        Some(ml) => Some(ml.level),
+                        None => LogLevel::from_name(call_name),
+                    };
                     name_levels.insert(call_name.to_string(), level);
                     level
                 }
@@ -474,7 +603,11 @@ fn prune_log_calls(
             log_calls.insert(
                 call_name.to_string(),
                 LogCall {
-                    family: LogLevel::call_family(call_name),
+                    family: match macro_levels.get(call_name) {
+                        // The macro's level comes from the call it makes.
+                        Some(ml) => ml.family.clone(),
+                        None => LogLevel::call_family(call_name),
+                    },
                     ..LogCall::default()
                 },
             );
@@ -499,11 +632,15 @@ fn prune_log_calls(
         .filter(|(_, levels)| levels.len() < 2)
         .map(|(family, _)| family.to_string())
         .collect();
-    for log_call in log_calls.values_mut() {
-        log_call.pruned = log_call
-            .family
-            .as_ref()
-            .is_some_and(|family| pruned_families.contains(family));
+    for (call_name, log_call) in log_calls.iter_mut() {
+        // A macro that is shown to be logging still counts in its family, but is not pruned
+        // with it.
+        let logging = macro_levels.get(call_name).is_some_and(|ml| ml.logging);
+        log_call.pruned = !logging
+            && log_call
+                .family
+                .as_ref()
+                .is_some_and(|family| pruned_families.contains(family));
     }
     for (stmt, language, from_arg) in stmts.iter_mut() {
         if stmt.category_from_use {
@@ -606,12 +743,13 @@ impl SourceTree {
     /// look like logging, see `prune_log_calls()`.  This needs to be redone whenever any file
     /// changes, since the decision depends on the calls in all of the files.
     fn prune_log_calls(&mut self) {
+        let macro_levels = macro_levels(self.files_with_statements.values());
         let stmts = self
             .files_with_statements
             .values_mut()
             .flat_map(|sif| sif.statements_for_pruning())
             .collect();
-        self.log_calls = prune_log_calls(stmts);
+        self.log_calls = prune_log_calls_with(stmts, &macro_levels);
         self.languages = self
             .files_with_statements
             .values()
@@ -1168,6 +1306,25 @@ impl<'s> Wrappers<'s> {
         call_site: &StatementsInFile,
     ) -> Vec<(&'s StatementsInFile, &'s wrappers::MacroWrapper)> {
         Self::pick(self.macros.get(name), call_site, true)
+    }
+
+    /// The C code of the string macro with the name that a call in the file uses, like the
+    /// `"\"%s\": %d %d"` of `DRM_MODE_FMT`, see [`wrappers::MacroBody::Literal`].  None if
+    /// the definitions that it could use are not all the same string.
+    fn string_macro(&self, name: &str, call_site: &StatementsInFile) -> Option<&'s str> {
+        let defs = self.pick_macros(name, call_site);
+        let (first, rest) = defs.split_first()?;
+        let value = first.1.literal()?;
+        rest.iter()
+            .all(|(_, wrapper)| wrapper.literal() == Some(value))
+            .then_some(value)
+    }
+
+    /// The statement for a call whose message is built with string macros, with their text in
+    /// place of their placeholders, see [`Statement::with_string_macros`].  The statement as it
+    /// is matches messages from other versions of the macros too, so it is kept.
+    fn expand(&self, call: &Statement, sif: &'s StatementsInFile) -> Option<Statement> {
+        call.with_string_macros(&|name| self.string_macro(name, sif), sif.language)
     }
 
     fn frame(path: &str, wrapper: &wrappers::MacroWrapper, parameter: &str) -> ChainFrame {
@@ -2036,8 +2193,12 @@ impl LogMatcher {
             .flat_map(|(root, sif)| {
                 let wrappers = &wrappers;
                 sif.log_statements.iter().flat_map(move |call| {
-                    wrappers
-                        .link(call, sif)
+                    let mut stmts = wrappers.link(call, sif);
+                    if let Some(expanded) = wrappers.expand(call, sif) {
+                        stmts.extend(wrappers.link(&expanded, sif));
+                        stmts.push(expanded);
+                    }
+                    stmts
                         .into_iter()
                         .map(move |stmt| (root.clone(), sif.id, stmt))
                 })
@@ -3016,6 +3177,22 @@ pub struct LogMapping<'a, 's> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix: Option<&'a str>,
     pub variables: Vec<VariablePair>,
+}
+
+impl LogMapping<'_, '_> {
+    /// Check if the literal text of the statement covers enough of the text that it produced,
+    /// which is the message without the `prefix`, that the statement most likely produced it.
+    /// A statement that is almost all placeholders, like `"%s: %s"`, matches a lot of
+    /// messages, so the things that are known about it, like its level, are not good evidence
+    /// for this message.  See [`MIN_EXPLAINED_PERCENT`].
+    pub fn explains_message(&self) -> bool {
+        let body = self.log_ref.body();
+        let text = self
+            .prefix
+            .and_then(|prefix| body.trim_start().strip_prefix(prefix))
+            .unwrap_or(body);
+        explains_enough(self.src_ref.as_ref(), text)
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize)]
@@ -4680,6 +4857,184 @@ class Balancer {
         assert_eq!(
             match_c_message(&matcher, "[    0.160216] VFS: Disk quotas dquot_6.6.0"),
             Some((3, version, Some("[    0.160216]".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_macro_levels() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("print.h"),
+            r#"#define DRM_DEBUG_KMS(fmt, ...) __drm_dbg(DRM_UT_KMS, fmt, ##__VA_ARGS__)
+#define MY_ALERT(fmt, ...) printk(KERN_ALERT fmt, ##__VA_ARGS__)
+#define LUA_FAIL(fmt, ...) luaL_error(L, fmt, ##__VA_ARGS__)
+#ifdef DYNAMIC
+#define net_dbg(dev, fmt, ...) dynamic_net_dbg(dev, fmt, ##__VA_ARGS__)
+#else
+#define net_dbg(dev, fmt, ...) net_printk(KERN_DEBUG, dev, fmt, ##__VA_ARGS__)
+#endif
+#define vv_err(dev, fmt, ...) vv_printk(KERN_ERR, dev, fmt, ##__VA_ARGS__)
+#define vv_dbg(level, dev, fmt, ...) do { if (level) vv_printk(KERN_DEBUG, dev, fmt); } while (0)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("drv.c"),
+            r#"void f(struct drm_device *dev, int x)
+{
+    DRM_DEBUG_KMS("mode %d\n", x);
+    MY_ALERT("on fire %d\n", x);
+    drm_err(dev, "bad mode %d\n", x);
+    LUA_FAIL("lua %d", x);
+    net_dbg(dev, "net %d\n", x);
+    vv_err(dev, "vv failed %d\n", x);
+    vv_dbg(1, dev, "vv state %d\n", x);
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let found: BTreeMap<String, (LogLevel, MessageCategory)> = matcher
+            .statements()
+            .map(|stmt| (stmt.text.clone(), (stmt.level, stmt.category)))
+            .collect();
+        let level_of = |text: &str| found.get(text).copied();
+        // The level comes from the call that the macro makes, which is in a family of
+        // logging calls, since `drm_err` has another level.
+        assert_eq!(
+            level_of(r#""mode %d\n""#),
+            Some((LogLevel::Debug, MessageCategory::Log))
+        );
+        // The level comes from an argument of the call that the macro makes.
+        assert_eq!(
+            level_of(r#""on fire %d\n""#),
+            Some((LogLevel::Fatal, MessageCategory::Log))
+        );
+        // The family of the call that the macro makes has only one level, so it is not
+        // logging, like it would not be if `luaL_error` were called directly.
+        assert_eq!(
+            level_of(r#""lua %d""#),
+            Some((LogLevel::Unknown, MessageCategory::Other))
+        );
+        // One of the definitions passes a level, so the macro is logging, even though the
+        // other one calls something that is not known to be.
+        assert_eq!(
+            level_of(r#""net %d\n""#),
+            Some((LogLevel::Debug, MessageCategory::Log))
+        );
+        // `vv_err` is logging since it passes a level, and still counts in the `vv` family,
+        // so `vv_dbg`, which is not a wrapper, keeps the level from its name.
+        assert_eq!(
+            level_of(r#""vv failed %d\n""#),
+            Some((LogLevel::Error, MessageCategory::Log))
+        );
+        assert_eq!(
+            level_of(r#""vv state %d\n""#),
+            Some((LogLevel::Debug, MessageCategory::Log))
+        );
+    }
+
+    #[test]
+    fn test_string_macros() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("modes.h"),
+            r#"#define DRM_MODE_FMT    "\"%s\": %d %d 0x%x"
+#define WRAPPED_FMT "<" DRM_MODE_FMT ">"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("modes.c"),
+            r#"void show(struct drm_display_mode *mode, int a)
+{
+    printk(KERN_INFO "Modeline " DRM_MODE_FMT "\n", DRM_MODE_ARG(mode));
+    printk(KERN_INFO "nested " WRAPPED_FMT " done\n", DRM_MODE_ARG(mode));
+    printk(KERN_INFO "unknown " UNKNOWN_FMT " %d\n", a);
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let matched = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .and_then(|mapping| {
+                    let values: Vec<String> =
+                        mapping.variables.into_iter().map(|var| var.value).collect();
+                    let src_ref = mapping.src_ref?;
+                    Some((
+                        src_ref.line_no,
+                        src_ref.pattern().as_str().to_string(),
+                        values,
+                    ))
+                })
+        };
+        // The macro's conversions take the call's arguments, so the values are found.
+        assert_eq!(
+            matched(r#"Modeline "1360x768": 60 85500 0x48"#),
+            Some((
+                3,
+                r#"(?s)^Modeline "(.*)": (.*) (.*) 0x(.*?)\s*$"#.to_string(),
+                vec!["1360x768", "60", "85500", "48"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            ))
+        );
+        // A string macro can be built from another one.
+        assert_eq!(
+            matched(r#"nested <"640x480": 60 25175 0x40> done"#).map(|(line, ..)| line),
+            Some(4)
+        );
+        // A message from another version of the macro still matches the statement as it is.
+        assert_eq!(
+            matched(r#"Modeline 56:"1360x768" 60 85500 0x48"#)
+                .map(|(line, pattern, _)| (line, pattern)),
+            Some((3, r#"(?s)^Modeline (.*?)\s*$"#.to_string()))
+        );
+        // An unknown macro is not a string that could be put in, so the statement is as is.
+        assert_eq!(
+            matched("unknown FOO 3").map(|(line, pattern, _)| (line, pattern)),
+            Some((5, r#"(?s)^unknown (.*) (.*?)\s*$"#.to_string()))
+        );
+    }
+
+    #[test]
+    fn test_mapping_explains_message() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            temp_dir.path().join("dev.c"),
+            r#"void show(struct device *dev, const char *a, const char *b, int n)
+{
+    printk(KERN_ERR "%s: %s\n", a, b);
+    printk(KERN_INFO "New USB device found, idVendor=%04x\n", n);
+}
+"#,
+        )
+        .unwrap();
+        let matcher = matcher_for(temp_dir.path());
+        let explains = |msg: &str| {
+            let log_ref = LogRefBuilder::new().with_body(Some(msg)).build(msg);
+            matcher
+                .match_log_statement(&log_ref, &LogMatchOptions::default())
+                .filter(|mapping| mapping.src_ref.is_some())
+                .map(|mapping| (mapping.src_ref.unwrap().line_no, mapping.explains_message()))
+        };
+        // A statement that is almost all placeholders matches, but explains little.
+        assert_eq!(
+            explains("ACPI: Power Resource [C230] (off)"),
+            Some((3, false))
+        );
+        assert_eq!(
+            explains("New USB device found, idVendor=1d6b"),
+            Some((4, true))
+        );
+        // The prefix that no statement produced does not count against the statement.
+        assert_eq!(
+            explains("usb usb1: New USB device found, idVendor=1d6b"),
+            Some((4, true))
         );
     }
 

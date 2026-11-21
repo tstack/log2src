@@ -1,6 +1,7 @@
 use crate::java_symbols::MessageRef;
-use crate::source_query::{concat_parts_pattern, ConcatPart};
+use crate::source_query::{self, concat_parts_pattern, ConcatPart};
 use crate::value_kind::{self, SplitOrder, ValueKind, ANY_CAPTURE};
+use crate::wrappers;
 use crate::{pointer_extension, CodeSource, QueryResult, SourceLanguage};
 use core::fmt;
 use regex::{Captures, Regex};
@@ -1002,6 +1003,48 @@ impl Statement {
         }
     }
 
+    /// This statement, which is a C or C++ concatenation, like
+    /// `"Modeline " DRM_MODE_FMT "\n"`, with the macros that are strings for messages, which
+    /// `string_macro` gives the code of, like `"\"%s\": %d %d"` for `DRM_MODE_FMT`, in place of
+    /// the placeholders that stood for them.  Their conversions use the arguments of the call,
+    /// like the rest of the message's.  None if none of the macros are strings, or if one of
+    /// them is not known, since its placeholder would then take one of the call's arguments.
+    pub(crate) fn with_string_macros<'m>(
+        &self,
+        string_macro: &dyn Fn(&str) -> Option<&'m str>,
+        language: SourceLanguage,
+    ) -> Option<Statement> {
+        let has_string_macro = self.args.iter().any(|arg| match arg {
+            FormatArgument::Named(name) => string_macro(name).is_some(),
+            _ => false,
+        });
+        if !has_string_macro || !self.continuations.is_empty() {
+            return None;
+        }
+        let mut message = String::new();
+        expand_string_macros(&self.text, string_macro, &mut message, 0)?;
+        let MessageMatcher {
+            matcher: _,
+            args,
+            quality,
+            kinds,
+            segments,
+            plain: _,
+        } = build_matcher(false, &message, language)?;
+        Some(Statement {
+            quality,
+            arg_kinds: vec![ValueKind::Any; args.len()],
+            args,
+            kinds,
+            segments,
+            choices: vec![],
+            vars: self.vars.clone(),
+            var_kinds: self.var_kinds.clone(),
+            arg_position: self.arg_position,
+            ..self.derived()
+        })
+    }
+
     /// This statement, which is a Java concatenation, with the values of the constants among
     /// `parts` that are in `constants`, by their fully-qualified names, in place of their
     /// placeholders, see [`ConcatPart`].  The statement is returned as is if none of them are
@@ -1578,6 +1621,44 @@ impl PartialEq for Statement {
             && self.text == other.text
             && self.vars == other.vars
     }
+}
+
+/// The most string macros that one is built from in turn, which stops a runaway one, like
+/// `#define A "x" A`.
+const MAX_STRING_MACRO_DEPTH: usize = 8;
+
+/// Append the contents of the string literals in C code that is a concatenation, like
+/// `"Modeline " DRM_MODE_FMT "\n"`, to `message`, with the code of the string macros in it
+/// expanded the same way, see [`Statement::with_string_macros`].  The other macros are handled
+/// the way the concatenation was when the statement was found, see
+/// `SourceQuery::concatenated_pattern()`: a Linux kernel level in front prints nothing, and a
+/// macro after a `%`, like `PRIu64`, finishes the conversion.  None if there is anything else.
+fn expand_string_macros<'m>(
+    code: &str,
+    string_macro: &dyn Fn(&str) -> Option<&'m str>,
+    message: &mut String,
+    depth: usize,
+) -> Option<()> {
+    if depth > MAX_STRING_MACRO_DEPTH {
+        return None;
+    }
+    for token in wrappers::c_string_tokens(code)? {
+        match token {
+            wrappers::CStringToken::Str(contents) => message.push_str(contents),
+            wrappers::CStringToken::Ident(name)
+                if message.is_empty() && wrappers::is_kernel_log_level(name) => {}
+            wrappers::CStringToken::Ident(name) if source_query::is_inttypes_macro(name) => {
+                message.push('d');
+            }
+            wrappers::CStringToken::Ident(_) if source_query::ends_in_open_conversion(message) => {
+                message.push('s');
+            }
+            wrappers::CStringToken::Ident(name) => {
+                expand_string_macros(string_macro(name)?, string_macro, message, depth + 1)?;
+            }
+        }
+    }
+    Some(())
 }
 
 fn build_matcher(raw: bool, text: &str, language: SourceLanguage) -> Option<MessageMatcher> {

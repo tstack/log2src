@@ -39,6 +39,48 @@ pub enum MacroBody {
     Text(String),
     /// Another name for a macro, like the `pr_fmt` of `#define dev_fmt pr_fmt`.
     Alias(String),
+    /// String literals, and the names of other macros like this one, that a message can be
+    /// built from, like the `"\"%s\": %d %d"` of `#define DRM_MODE_FMT "\"%s\": %d %d"`, as
+    /// written in the source.  See [`c_string_tokens`].
+    Literal(String),
+}
+
+/// A piece of the C code for a message that is a concatenation, see [`c_string_tokens`].
+#[derive(Debug, PartialEq)]
+pub enum CStringToken<'a> {
+    /// The contents of a string literal, without the quotes or the encoding prefix, with the
+    /// escapes as written.
+    Str(&'a str),
+    /// The name of a macro.
+    Ident(&'a str),
+}
+
+/// Split C code that is only string literals and the names of macros, like
+/// `"Modeline " DRM_MODE_FMT "\n"`, into its pieces.  Returns None for anything else, like a
+/// call or an operator.
+pub fn c_string_tokens(code: &str) -> Option<Vec<CStringToken<'_>>> {
+    let mut retval = vec![];
+    let mut rest = code.trim_start();
+    while !rest.is_empty() {
+        let ident_len = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let (ident, after) = rest.split_at(ident_len);
+        if after.starts_with('"') && matches!(ident, "" | "L" | "u" | "U" | "u8") {
+            // A string literal, with an optional encoding prefix.
+            let contents = &after[1..];
+            let end = string_end(contents)?;
+            retval.push(CStringToken::Str(&contents[..end]));
+            rest = &contents[end + 1..];
+        } else if is_identifier(ident) {
+            retval.push(CStringToken::Ident(ident));
+            rest = after;
+        } else {
+            return None;
+        }
+        rest = rest.trim_start();
+    }
+    Some(retval)
 }
 
 /// Pieces of the C code for an argument that a message is passed in.
@@ -178,11 +220,44 @@ impl MacroWrapper {
         })
     }
 
+    /// Parse an object-like macro whose value is a string for messages, like
+    /// `#define DRM_MODE_FMT "\"%s\": %d %d"`, see [`MacroBody::Literal`].  The value has to
+    /// have a string literal, and nothing but them and the names of other macros.
+    pub fn parse_literal(
+        name: &str,
+        value: &str,
+        line_no: usize,
+        column: usize,
+    ) -> Option<MacroWrapper> {
+        // The whitespace is kept as is, since it is in the strings.
+        let (name, value) = (name.trim(), value.trim());
+        let tokens = c_string_tokens(value)?;
+        let has_literal = tokens
+            .iter()
+            .any(|token| matches!(token, CStringToken::Str(_)));
+        (is_identifier(name) && has_literal).then(|| MacroWrapper {
+            name: name.to_string(),
+            line_no,
+            column,
+            text: format!("#define {name} {value}"),
+            params: vec![],
+            body: MacroBody::Literal(value.to_string()),
+        })
+    }
+
     /// The name of the macro or function that this macro calls, if it is a call.
     pub fn callee(&self) -> Option<&str> {
         match &self.body {
             MacroBody::Call { callee, .. } => Some(callee),
-            MacroBody::Text(_) | MacroBody::Alias(_) => None,
+            MacroBody::Text(_) | MacroBody::Alias(_) | MacroBody::Literal(_) => None,
+        }
+    }
+
+    /// The C code of a string macro, see [`MacroBody::Literal`].
+    pub fn literal(&self) -> Option<&str> {
+        match &self.body {
+            MacroBody::Literal(value) => Some(value),
+            _ => None,
         }
     }
 
@@ -204,7 +279,7 @@ impl MacroWrapper {
             MacroBody::Call { callee, args } if args.len() == 1 => {
                 Some(vec![Piece::Apply(callee, pieces(&args[0])?)])
             }
-            MacroBody::Call { .. } | MacroBody::Alias(_) => None,
+            MacroBody::Call { .. } | MacroBody::Alias(_) | MacroBody::Literal(_) => None,
         }
     }
 
@@ -300,7 +375,10 @@ pub fn scan_defines(source: &str) -> Vec<MacroWrapper> {
             let value = &params_and_value[close + 1..];
             retval.extend(MacroWrapper::parse(name, &params, value, line_no, column));
         } else {
-            retval.extend(MacroWrapper::parse_alias(name, after, line_no, column));
+            retval.extend(
+                MacroWrapper::parse_alias(name, after, line_no, column)
+                    .or_else(|| MacroWrapper::parse_literal(name, after, line_no, column)),
+            );
         }
     }
     retval
@@ -727,6 +805,48 @@ mod tests {
         assert_eq!(defines[0].body, MacroBody::Text("fmt".to_string()));
         assert_eq!(defines[2].body, MacroBody::Text(r#""x: " fmt"#.to_string()));
         assert_eq!(defines[3].body, MacroBody::Alias("pr_fmt".to_string()));
+    }
+
+    #[test]
+    fn test_scan_string_macros() {
+        let found: Vec<(String, MacroBody)> = scan_defines(
+            r#"
+#define DRM_MODE_FMT    "\"%s\": %d   %d"
+#define WRAPPED "<" DRM_MODE_FMT ">"
+#define WIDE L"wide %ls"
+#define COUNT 42
+#define SUM "a" + 1
+#define NAME_ONLY OTHER
+"#,
+        )
+        .into_iter()
+        .map(|wrapper| (wrapper.name, wrapper.body))
+        .collect();
+        let literal =
+            |name: &str, value: &str| (name.to_string(), MacroBody::Literal(value.to_string()));
+        assert_eq!(
+            found,
+            vec![
+                // The whitespace in the string is kept.
+                literal("DRM_MODE_FMT", r#""\"%s\": %d   %d""#),
+                literal("WRAPPED", r#""<" DRM_MODE_FMT ">""#),
+                literal("WIDE", r#"L"wide %ls""#),
+                // Not a string, and an alias, which is not one either.
+                (
+                    "NAME_ONLY".to_string(),
+                    MacroBody::Alias("OTHER".to_string())
+                ),
+            ]
+        );
+        assert_eq!(
+            c_string_tokens(r#""Modeline " DRM_MODE_FMT "\n""#),
+            Some(vec![
+                CStringToken::Str("Modeline "),
+                CStringToken::Ident("DRM_MODE_FMT"),
+                CStringToken::Str(r"\n"),
+            ])
+        );
+        assert_eq!(c_string_tokens(r#""a" + 1"#), None);
     }
 
     #[test]
